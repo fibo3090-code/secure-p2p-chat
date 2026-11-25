@@ -58,7 +58,9 @@ impl ChatManager {
                     .get(&chat_id)
                     .filter(|e| !e.fingerprint.eq_ignore_ascii_case(&fp))
                     .map(|e| e.contact_id),
-                None => None,
+                // An address is a hint, not an identity claim: the contact
+                // keeps its key, and this session keeps its own conversation.
+                Some(FingerprintWarning::ContactAddressMismatch { .. }) | None => None,
             };
             if let Some(contact_id) = rebind {
                 self.rebind_contact_fingerprint(contact_id, &fp);
@@ -260,6 +262,7 @@ impl ChatManager {
         let relay_token = token.unwrap_or_else(generate_relay_token);
         let chat_id = Uuid::new_v4();
         let (server, session_token) = (relay_server.to_string(), relay_token.clone());
+        let password = self.connection_password.clone();
         self.spawn_session(chat_id, "Relay hosting stopped", move |ch| async move {
             run_host_session_via_relay(
                 &server,
@@ -270,6 +273,7 @@ impl ChatManager {
                 ch.file_rx,
                 ch.confirm_rx,
                 chat_id,
+                password,
             )
             .await
         });
@@ -307,6 +311,19 @@ impl ChatManager {
         existing_chat_id: Option<Uuid>,
         privkey: RsaPrivateKey,
     ) -> Result<Uuid> {
+        self.dial_candidates(targets, None, existing_chat_id, privkey)
+            .await
+    }
+
+    /// Dial the direct candidates in order, falling back to `relay`
+    /// (`(server, token)`) only when none of them accepts a connection.
+    async fn dial_candidates(
+        &mut self,
+        targets: Vec<(String, u16)>,
+        relay: Option<(String, String)>,
+        existing_chat_id: Option<Uuid>,
+        privkey: RsaPrivateKey,
+    ) -> Result<Uuid> {
         let (host, port) = targets
             .first()
             .cloned()
@@ -314,10 +331,11 @@ impl ChatManager {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         tracing::info!(chat_id = %chat_id, host = %host, port = %port, candidates = %targets.len(), "connect_to_host called");
 
-        let password = self.connection_password.clone();
+        let password = self.dial_password.clone();
         self.spawn_session(chat_id, "Connection failed", move |ch| async move {
-            run_client_session_multi(
+            run_client_session_direct_or_relay(
                 &targets,
+                relay,
                 privkey,
                 ch.to_app_tx,
                 ch.from_app_rx,
@@ -342,6 +360,7 @@ impl ChatManager {
     ) -> Result<Uuid> {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         let (server, token) = (relay_server.to_string(), token.to_string());
+        let password = self.dial_password.clone();
         self.spawn_session(chat_id, "Relay connection failed", move |ch| async move {
             run_client_session_via_relay(
                 &server,
@@ -352,6 +371,7 @@ impl ChatManager {
                 ch.file_rx,
                 ch.confirm_rx,
                 chat_id,
+                password,
             )
             .await
         });
@@ -455,9 +475,15 @@ impl ChatManager {
             .filter_map(|a| Self::parse_address(a).ok())
             .collect();
 
+        let relay = contact
+            .relay_server
+            .clone()
+            .zip(contact.relay_token.clone());
         let chat_id = if !candidates.is_empty() {
-            tracing::info!(%contact_id, candidates = candidates.len(), "Connecting to contact by address");
-            self.connect_to_host_candidates(candidates, target, privkey.clone())
+            tracing::info!(%contact_id, candidates = candidates.len(), relay = relay.is_some(), "Connecting to contact by address");
+            // The relay rides along as the fallback: a saved address goes
+            // stale when the peer changes networks (NET-12).
+            self.dial_candidates(candidates, relay, target, privkey.clone())
                 .await?
         } else if let (Some(server), Some(token)) = (&contact.relay_server, &contact.relay_token) {
             tracing::info!(%contact_id, relay = %server, "Connecting to contact via relay");

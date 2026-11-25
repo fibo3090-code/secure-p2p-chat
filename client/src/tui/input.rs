@@ -4,7 +4,6 @@
 //! `unicode-width` so wide glyphs place the terminal cursor correctly.
 
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Default)]
 pub struct EditableField {
@@ -152,20 +151,10 @@ impl EditableField {
         }
     }
 
-    /// Cursor `(row, col)` in display cells from the start of the text.
-    pub fn cursor_display(&self) -> (u16, u16) {
-        let mut row = 0u16;
-        let mut col = 0u16;
-        for &c in self.chars.iter().take(self.cursor) {
-            if c == '\n' {
-                row = row.saturating_add(1);
-                col = 0;
-            } else {
-                let w = UnicodeWidthChar::width(c).unwrap_or(0) as u16;
-                col = col.saturating_add(w);
-            }
-        }
-        (row, col)
+    /// The cursor as a char index into [`Self::display_text`]. Where that
+    /// lands on screen depends on the box width: see `ui::layout_input`.
+    pub fn cursor_index(&self) -> usize {
+        self.cursor
     }
 
     // ----- command-history support (single-line use) -----
@@ -240,6 +229,120 @@ impl EditableField {
 
 #[cfg(test)]
 mod tests {
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Type `keys` into `field`, then check what it holds and where the cursor
+    /// is (`|` marks it).
+    fn after(field: &mut EditableField, keys: &[KeyEvent]) -> String {
+        for k in keys {
+            field.handle_edit_key(k);
+        }
+        let mut shown: Vec<char> = field.text().chars().collect();
+        shown.insert(field.cursor_index(), '|');
+        shown.into_iter().collect()
+    }
+
+    /// The editing keys, through the entry point the app uses, on multi-line
+    /// text with multi-byte characters — the cursor is a *char* index, and a
+    /// byte-indexed slip here panics or splits a character.
+    #[test]
+    fn editing_keys_move_and_delete_by_character_and_by_line() {
+        let mut f = EditableField::new(true);
+        f.set_text("héllo wörld  \n界 two");
+        // set_text leaves the cursor at the end.
+        assert_eq!(after(&mut f, &[]), "héllo wörld  \n界 two|");
+        assert_eq!(
+            after(&mut f, &[ctrl('a')]),
+            "héllo wörld  \n|界 two",
+            "Ctrl+A stops at the line start"
+        );
+        assert_eq!(after(&mut f, &[ctrl('e')]), "héllo wörld  \n界 two|");
+        assert_eq!(after(&mut f, &[ctrl('w')]), "héllo wörld  \n界 |");
+        assert_eq!(
+            after(&mut f, &[ctrl('u')]),
+            "héllo wörld  \n|",
+            "Ctrl+U clears only this line"
+        );
+        assert_eq!(after(&mut f, &[key(KeyCode::Backspace)]), "héllo wörld  |");
+        // Ctrl+W takes the trailing whitespace together with the word.
+        assert_eq!(after(&mut f, &[ctrl('w')]), "héllo |");
+        assert_eq!(after(&mut f, &[key(KeyCode::Home)]), "|héllo ");
+        assert_eq!(
+            after(&mut f, &[key(KeyCode::Right), key(KeyCode::Delete)]),
+            "h|llo "
+        );
+        assert_eq!(after(&mut f, &[key(KeyCode::End)]), "hllo |");
+        // At the edges every key is a no-op, never a panic.
+        assert_eq!(
+            after(&mut f, &[key(KeyCode::Right), key(KeyCode::Delete)]),
+            "hllo |"
+        );
+        assert_eq!(
+            after(
+                &mut f,
+                &[
+                    key(KeyCode::Home),
+                    key(KeyCode::Left),
+                    key(KeyCode::Backspace),
+                    ctrl('w'),
+                    ctrl('u')
+                ]
+            ),
+            "|hllo "
+        );
+    }
+
+    /// A Ctrl chord is never typed as its letter: Ctrl+C is the quit key and
+    /// must reach the app, not become a `c` in the message.
+    #[test]
+    fn control_chords_are_not_text() {
+        let mut f = EditableField::new(true);
+        assert!(!f.handle_edit_key(&ctrl('c')));
+        assert!(
+            !f.handle_edit_key(&key(KeyCode::Enter)),
+            "Enter belongs to the caller"
+        );
+        assert!(f.text().is_empty());
+        assert!(f.handle_edit_key(&key(KeyCode::Char('c'))));
+        assert_eq!(f.text(), "c");
+    }
+
+    /// Command history: blank and repeated entries are not recorded; going
+    /// back stops at the oldest; going forward past the newest restores what
+    /// was being typed before browsing started.
+    #[test]
+    fn history_recall_keeps_the_line_being_typed() {
+        let mut f = EditableField::new(false);
+        f.history_next();
+        f.history_prev();
+        assert!(
+            f.text().is_empty(),
+            "browsing an empty history changed the line"
+        );
+        for entry in ["first", "   ", "second", "second"] {
+            f.push_history(entry);
+        }
+        f.set_text("half-typed");
+        f.history_prev();
+        assert_eq!(f.text(), "second");
+        f.history_prev();
+        assert_eq!(f.text(), "first");
+        f.history_prev();
+        assert_eq!(f.text(), "first", "went past the oldest entry");
+        f.history_next();
+        assert_eq!(f.text(), "second");
+        f.history_next();
+        assert_eq!(f.text(), "half-typed", "the line being typed was lost");
+        f.history_next();
+        assert_eq!(f.text(), "half-typed");
+    }
     use super::*;
 
     #[test]
@@ -280,8 +383,7 @@ mod tests {
         multi.newline();
         multi.insert_str("b");
         assert_eq!(multi.text(), "a\nb");
-        let (row, col) = multi.cursor_display();
-        assert_eq!((row, col), (1, 1));
+        assert_eq!(multi.cursor_index(), 3, "after the newline and the 'b'");
     }
 
     #[test]

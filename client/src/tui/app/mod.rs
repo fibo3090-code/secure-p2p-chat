@@ -1,6 +1,11 @@
-//! TUI application state: `TuiApp` owns the `ChatManager` directly (the loop is
-//! single-threaded) plus all view state. Keys go through `handle_key_event`,
-//! commands through `execute_command`, per-frame housekeeping through `tick`.
+//! TUI application state and behavior.
+//!
+//! `TuiApp` owns the `ChatManager` directly (the loop is single-threaded, so no
+//! `Arc<Mutex>` is needed) plus all view state: focus, mode, the editable input
+//! and command fields, the active overlay, scroll/unread/typing state, and the
+//! identity. Keys are routed by `handle_key_event`; commands run through
+//! `execute_command`; `tick` performs per-frame housekeeping (session events,
+//! autosave, auto-rehost, unread/typing bookkeeping).
 
 mod cmd_connect;
 mod cmd_contacts;
@@ -10,33 +15,17 @@ pub(crate) use cmd_party::PartyThread;
 
 use crate::app::chat_manager::ChatManager;
 use crate::app::party_manager::{PartyDial, PartyJoinOutcome, PartyManager};
-use crate::identity::Identity;
-use crate::logbuf::LogBuffer;
-use crate::tui::command::{
-    command_help, parse_command, parse_setting_bool, settings_keys, COMMANDS,
-};
-use crate::tui::input::EditableField;
-use crate::tui::overlays::{PasswordMode, TuiOverlay};
-use crate::types::{Config, Theme, ToastLevel};
-use anyhow::Result;
-use ratatui::widgets::ListState;
-use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::oneshot::{self, error::TryRecvError};
-use uuid::Uuid;
 
-pub use crate::tui::command::TuiCommand;
-
-/// A community join held at the verification step. The credentials stay here,
-/// off the wire, until the user accepts `fingerprint` — and the
-/// credential-bearing connection must then present exactly that key.
+/// A community join held at the verification step: the address and credentials
+/// the user typed, kept locally until they confirm the server's identity. They
+/// are not on the wire — that is the whole point of holding them.
 struct PendingPartyJoin {
     address: String,
     username: String,
     password: Option<String>,
+    /// The server fingerprint the user was shown and is about to accept. The
+    /// trust step requires the credential-bearing connection to present
+    /// exactly this key.
     fingerprint: String,
 }
 
@@ -45,11 +34,31 @@ struct PartyDialJob {
     address: String,
     username: String,
     password: Option<String>,
-    rx: oneshot::Receiver<anyhow::Result<PartyDial>>,
+    rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::app::party_manager::PartyDial>>,
 }
+use crate::identity::Identity;
+use crate::logbuf::LogBuffer;
+use crate::tui::command::{
+    command_help, parse_command, parse_setting_bool, settings_keys, COMMANDS,
+};
+use crate::tui::input::EditableField;
+use crate::tui::overlays::{PasswordMode, TuiOverlay};
+use crate::types::{Config, ToastLevel};
+use anyhow::Result;
+use ratatui::widgets::ListState;
+use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 
-/// A pending Party file download and the file's display name.
-type PendingPartyDownload = (oneshot::Receiver<Result<Vec<u8>, String>>, String);
+pub use crate::tui::command::TuiCommand;
+
+/// A pending Party file download: the byte receiver plus the file's display
+/// name (used for the saved filename and progress toasts).
+type PendingPartyDownload = (
+    tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
+    String,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiFocus {
@@ -67,51 +76,29 @@ pub enum TuiMode {
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
 const REHOST_DEBOUNCE: Duration = Duration::from_millis(1500);
 const TYPING_IDLE: Duration = Duration::from_secs(4);
-/// How long after the last keypress the user still counts as present (see
-/// `report_presence`).
+/// How long after the last keypress the terminal still counts as "the user is
+/// here", for the desktop-notification focus gate. See `report_presence`.
 const PRESENCE_IDLE: Duration = Duration::from_secs(45);
-
-/// The boolean `:set` keys, in the order of Settings rows 2..=7.
-const BOOL_SETTINGS: [&str; 6] = [
-    "notifications",
-    "typing",
-    "auto-accept",
-    "auto-host",
-    "mdns",
-    "upnp",
-];
-const THEMES: [Theme; 5] = [
-    Theme::Light,
-    Theme::Dark,
-    Theme::Midnight,
-    Theme::Forest,
-    Theme::Rose,
-];
-
-fn bool_setting<'a>(cfg: &'a mut Config, key: &str) -> Option<&'a mut bool> {
-    Some(match key {
-        "notifications" => &mut cfg.enable_notifications,
-        "typing" => &mut cfg.enable_typing_indicators,
-        "auto-accept" => &mut cfg.auto_accept_files,
-        "auto-host" => &mut cfg.auto_host_on_startup,
-        "mdns" => &mut cfg.enable_mdns,
-        "upnp" => &mut cfg.enable_upnp,
-        _ => return None,
-    })
-}
 
 pub struct TuiApp {
     pub chat_manager: ChatManager,
+    /// Connections to Party servers (Phase 1 Party tab, command-driven).
     pub party_manager: PartyManager,
-    /// The community most recently joined: the target of the `:party-*` commands.
+    /// The server most recently joined, used as the target for `:party-post`.
     current_party: Option<Uuid>,
-    /// Shown but not yet accepted; `:party-trust` confirms it.
+    /// A community server whose identity the user has been shown but not yet
+    /// accepted. Its credentials are held here — deliberately not sent — until
+    /// `:party-trust` confirms the fingerprint.
     pending_party_join: Option<PendingPartyJoin>,
     pub chat_list_state: ListState,
     pub chat_ids: Vec<Uuid>,
     pub input_field: EditableField,
     pub command_field: EditableField,
     pub password_field: EditableField,
+    /// The first entry of a new password, waiting for the confirming second.
+    /// Typed once, a typo became the password of the only key to the history
+    /// (TUI-12). Never persisted; zeroized on drop by `Zeroizing`.
+    pub(crate) new_password_first: Option<zeroize::Zeroizing<String>>,
     pub message_scroll: u16,
     pub stick_to_bottom: bool,
     pub identity_name: String,
@@ -120,12 +107,16 @@ pub struct TuiApp {
     pub mode: TuiMode,
     pub status_line: String,
     pub should_quit: bool,
+    /// Draw without colour: `NO_COLOR` is set (no-color.org). Emphasis
+    /// (bold, reverse) is kept, colour is dropped from every cell.
+    pub monochrome: bool,
     pub overlay: TuiOverlay,
     pub overlay_scroll: u16,
     /// Selected row in the Transfers overlay (index into the id-sorted list).
     pub transfer_sel: usize,
-    /// Selected community in the Party pane, then its thread (channels, then DMs).
+    /// Selected community in the Party pane.
     pub party_sel: usize,
+    /// Selected thread (a channel, then the DMs) in the selected community.
     pub party_thread_sel: usize,
     pub contact_ids: Vec<Uuid>,
     pub contacts_list_state: ListState,
@@ -137,69 +128,90 @@ pub struct TuiApp {
     identity_path: PathBuf,
     history_path: PathBuf,
     pending_command: Option<TuiCommand>,
-    /// A fingerprint prompt put away with Esc: still queued (the peer is
-    /// waiting) and answerable with `:verify`, just not re-opened over typing.
+    /// A fingerprint prompt the user put away with Esc. It stays queued (the
+    /// peer is still waiting) and `:verify` still answers it; the overlay is
+    /// just not re-opened over the user's typing.
     deferred_fingerprint: Option<Uuid>,
-    /// The one community connect/trust in flight; a second is refused.
+    /// A community connect/trust in flight. One at a time: a second
+    /// `:party-connect` while one runs is refused rather than queued.
     party_dial: Option<PartyDialJob>,
+    /// Communities whose fingerprint has been pinned this run (once each, as
+    /// soon as they reach `Joined`).
+    pinned_parties: std::collections::HashSet<Uuid>,
+    /// In-flight Party file downloads. `tick` polls them and writes finished
+    /// downloads into the download directory.
     pending_party_downloads: Vec<PendingPartyDownload>,
     /// Finished downloads being written to disk off the UI thread.
-    pending_party_saves: Vec<oneshot::Receiver<crate::tui::downloads::SaveOutcome>>,
+    pending_party_saves: Vec<tokio::sync::oneshot::Receiver<crate::tui::downloads::SaveOutcome>>,
     last_save: Option<Instant>,
-    /// `persisted_signature` at the last save; autosave skips an unchanged
-    /// state (PERF-03).
+    /// `persisted_signature` at the last successful save: autosave skips the
+    /// write when it has not moved (PERF-03).
     saved_signature: Option<u64>,
-    /// Set while a background autosave writes, so two never overlap.
-    save_in_flight: Arc<AtomicBool>,
-    /// Set by a failed background autosave so the next tick writes again.
-    autosave_failed: Arc<AtomicBool>,
+    /// Set while a background autosave is writing, so two never overlap and
+    /// the save on exit can wait for the last one.
+    save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by a background autosave whose write failed; the next tick clears
+    /// `saved_signature` so the state is written again.
+    autosave_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A background autosave was started and its outcome not yet read.
+    autosave_pending: bool,
+    /// The last save failed and the user has been told; cleared by the next
+    /// save that works, so a failure is reported once per streak (TUI-13).
+    save_failing: bool,
     last_rehost: Option<Instant>,
     typing_active: bool,
     last_typing_activity: Option<Instant>,
-    /// Last keypress: stands in for window focus (see `report_presence`).
+    /// Last keypress of any kind. Stands in for "the window has focus", which a
+    /// terminal cannot report portably — see `report_presence`.
     last_interaction: Option<Instant>,
     /// Indices into `command::COMMANDS` matching the command word being typed.
     pub command_suggestions: Vec<usize>,
+    /// Highlighted entry within `command_suggestions`.
     pub suggestion_index: usize,
     /// Optional command name to show in the help overlay.
     pub help_topic: Option<String>,
+    /// Launch options (`--host`, `--connect`…) waiting for the identity to be
+    /// unlocked: run before it, they failed on the locked key and were lost
+    /// (TUI-10).
+    pub(crate) deferred_launch: Option<crate::tui::TuiLaunchConfig>,
 }
 
 impl TuiApp {
-    /// The app over the user's own terminal-client profile.
     pub fn new(logs: LogBuffer) -> Result<Self> {
-        match directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger") {
-            Some(dirs) => Self::with_data_dir(logs, dirs.data_dir()),
-            None => {
-                let identity = Identity::new_with_plaintext("TUI_User".to_string())?;
-                Self::from_parts(logs, identity, PathBuf::from("history.json.enc"))
-            }
-        }
+        let data_dir = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger")
+            .map(|dirs| dirs.data_dir().to_path_buf());
+        Self::new_in(data_dir, logs)
     }
 
-    /// The app over the profile in `data_dir`, created if it is missing.
-    pub fn with_data_dir(logs: LogBuffer, data_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_dir).ok();
-        let (identity, _) = Identity::get_or_create(data_dir, "TUI_User")?;
-        Self::from_parts(logs, identity, data_dir.join("history.json.enc"))
-    }
-
-    /// A throwaway app for tests: a fresh, unencrypted identity, with its paths
-    /// in a temp directory that is never created. It reads nothing from disk,
-    /// and a save it was not pointed elsewhere for fails rather than landing
-    /// anywhere. `new` read the real profile, so on a machine with a
-    /// password-protected terminal identity the tests saw that identity and
-    /// loaded the user's real history.
+    /// [`TuiApp::new`] with the data directory (identity + history) chosen by
+    /// the caller. Tests pass a temp dir: through `new` they read the
+    /// developer's real `identity.json` and, on a machine with none, wrote a
+    /// `history.json.enc` under a throwaway key that the real client could
+    /// then never decrypt.
+    /// A throwaway app for tests: a fresh, unencrypted identity over a new
+    /// temp directory of its own. `new` read the real profile, so on a machine
+    /// with a password-protected terminal identity the tests saw that identity
+    /// and loaded the user's real history.
     pub fn ephemeral(logs: LogBuffer) -> Result<Self> {
         let dir = std::env::temp_dir().join(format!("p2pem-tui-ephemeral-{}", Uuid::new_v4()));
-        let identity = Identity::new_with_plaintext("TUI_User".to_string())?;
-        Self::from_parts(logs, identity, dir.join("history.json.enc"))
+        Self::new_in(Some(dir), logs)
     }
 
-    fn from_parts(logs: LogBuffer, identity: Identity, history_path: PathBuf) -> Result<Self> {
+    pub fn new_in(data_dir: Option<PathBuf>, logs: LogBuffer) -> Result<Self> {
         let mut chat_manager = ChatManager::new(Config::default());
+
+        let (history_path, identity, _is_new_identity) = if let Some(ref data_dir) = data_dir {
+            std::fs::create_dir_all(data_dir).ok();
+
+            let (identity, is_new) = Identity::get_or_create(data_dir, "TUI_User")?;
+            (data_dir.join("history.json.enc"), identity, is_new)
+        } else {
+            let identity = Identity::new_with_plaintext("TUI_User".to_string())?;
+            (PathBuf::from("history.json.enc"), identity, true)
+        };
         let identity_path = history_path.with_file_name("identity.json");
-        // Lets the manager refuse the user's own invite link as a contact.
+        // So the manager can recognise this device's own invite link and refuse
+        // to add the user to their own contacts.
         chat_manager.set_my_fingerprint(identity.fingerprint.clone());
 
         if !identity.is_locked() {
@@ -216,11 +228,13 @@ impl TuiApp {
             party_manager: PartyManager::new(),
             current_party: None,
             pending_party_join: None,
+            pinned_parties: std::collections::HashSet::new(),
             chat_list_state: ListState::default(),
             chat_ids: Vec::new(),
             input_field: EditableField::new(true),
             command_field: EditableField::new(false),
             password_field: EditableField::new(false).masked(true),
+            new_password_first: None,
             message_scroll: 0,
             stick_to_bottom: true,
             identity_name: identity.name.clone(),
@@ -243,6 +257,7 @@ impl TuiApp {
             identity_path,
             history_path,
             pending_command: None,
+            monochrome: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
             deferred_fingerprint: None,
             pending_party_downloads: Vec::new(),
             pending_party_saves: Vec::new(),
@@ -251,6 +266,8 @@ impl TuiApp {
             saved_signature: None,
             save_in_flight: Default::default(),
             autosave_failed: Default::default(),
+            autosave_pending: false,
+            save_failing: false,
             last_rehost: None,
             typing_active: false,
             last_typing_activity: None,
@@ -258,47 +275,59 @@ impl TuiApp {
             command_suggestions: Vec::new(),
             suggestion_index: 0,
             help_topic: None,
+            deferred_launch: None,
         };
         app.sync_chat_ids();
         app.refresh_status_line();
         Ok(app)
     }
 
-    /// The community the Party commands act on; toasts when there is none.
+    /// The community the Party commands act on, complaining if there is none.
+    /// Every governance command needs it, and "nothing happened" is a worse
+    /// answer than being told to join one first.
     fn require_party(&mut self) -> Option<Uuid> {
-        if self.current_party.is_none() {
-            self.toast(
-                ToastLevel::Error,
-                "No community joined. Use :party-connect <host> <username>",
-            );
+        match self.current_party {
+            Some(id) => Some(id),
+            None => {
+                self.toast(
+                    ToastLevel::Error,
+                    "No community joined. Use :party-connect <host> <username>".to_string(),
+                );
+                None
+            }
         }
-        self.current_party
     }
 
-    /// Hand finished Party downloads to a background save (sanitized,
-    /// non-clobbering name — see `tui::downloads`) and toast finished saves.
+    /// Drain finished Party file downloads: hand the bytes to a background
+    /// save (sanitized, non-clobbering name — see `tui::downloads`), then toast
+    /// each save as it completes.
     fn poll_party_downloads(&mut self) {
-        let mut done = Vec::new();
-        self.pending_party_downloads
-            .retain_mut(|(rx, name)| match rx.try_recv() {
-                Err(TryRecvError::Empty) => true,
-                outcome => {
-                    let outcome = outcome.unwrap_or_else(|_| Err("connection closed".into()));
-                    done.push((outcome, std::mem::take(name)));
-                    false
-                }
-            });
+        use tokio::sync::oneshot::error::TryRecvError;
+
         let download_dir = self.chat_manager.config.download_dir.clone();
-        for (outcome, name) in done {
+        let mut i = 0;
+        while i < self.pending_party_downloads.len() {
+            let outcome = match self.pending_party_downloads[i].0.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(result) => result,
+                Err(TryRecvError::Closed) => Err("connection closed".to_string()),
+            };
+            let (_, name) = self.pending_party_downloads.remove(i);
             match outcome {
-                // Another member chose the name: sanitize it (the server does too).
-                Ok(data) => self
-                    .pending_party_saves
-                    .push(crate::tui::downloads::spawn_save(
-                        download_dir.clone(),
-                        crate::util::sanitize_filename(&name),
-                        data,
-                    )),
+                Ok(data) => {
+                    // The name was chosen by another member: sanitize it
+                    // (defense in depth — the server sanitizes too).
+                    let safe = crate::util::sanitize_filename(&name);
+                    self.pending_party_saves
+                        .push(crate::tui::downloads::spawn_save(
+                            download_dir.clone(),
+                            safe,
+                            data,
+                        ));
+                }
                 Err(reason) => self.toast(
                     ToastLevel::Error,
                     format!("Download of '{name}' failed: {reason}"),
@@ -306,17 +335,18 @@ impl TuiApp {
             }
         }
 
-        let mut saved = Vec::new();
-        self.pending_party_saves
-            .retain_mut(|rx| match rx.try_recv() {
-                Err(TryRecvError::Empty) => true,
-                outcome => {
-                    saved.push(outcome.ok());
-                    false
+        let mut i = 0;
+        while i < self.pending_party_saves.len() {
+            let saved = match self.pending_party_saves[i].try_recv() {
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
                 }
-            });
-        for outcome in saved {
-            match outcome {
+                Ok(saved) => Some(saved),
+                Err(TryRecvError::Closed) => None,
+            };
+            self.pending_party_saves.remove(i);
+            match saved {
                 Some((_, Ok(path))) => {
                     self.toast(ToastLevel::Success, format!("Saved '{}'", path.display()))
                 }
@@ -325,7 +355,7 @@ impl TuiApp {
                 }
                 None => self.toast(
                     ToastLevel::Error,
-                    "Saving a download failed: the writer stopped",
+                    "Saving a download failed: the writer stopped".to_string(),
                 ),
             }
         }
@@ -333,9 +363,14 @@ impl TuiApp {
         self.poll_party_dial();
     }
 
-    /// The startup password overlay: unlock a locked identity, or set a
-    /// password on an unencrypted one. Kept out of `new()` so tests start
-    /// overlay-free.
+    /// At startup, greet the user with a password overlay when appropriate:
+    /// unlock a locked identity, or set a password on a new/unencrypted one.
+    /// Called by `run()` (kept out of `new()` so tests start overlay-free).
+    /// Whether the identity's key is still behind its password.
+    pub fn identity_locked(&self) -> bool {
+        self.identity.is_locked()
+    }
+
     pub fn prompt_auth_if_needed(&mut self) {
         if self.identity.is_locked() {
             self.overlay = TuiOverlay::Password {
@@ -348,7 +383,7 @@ impl TuiApp {
         }
     }
 
-    /// Kept so external callers and tests can use `TuiApp::parse_command`.
+    /// Compatibility shim so external callers/tests keep using `TuiApp::parse_command`.
     pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         parse_command(raw)
     }
@@ -379,7 +414,8 @@ impl TuiApp {
         }
 
         // Follow a selected chat that was folded into another conversation (a
-        // reconnect to a known peer) rather than whatever now sits at its index.
+        // reconnect to a known peer), rather than landing on whichever chat now
+        // sits at its old position.
         if let Some(selected) =
             selected_chat_id.map(|id| self.chat_manager.resolve_display_chat_id(id))
         {
@@ -389,11 +425,11 @@ impl TuiApp {
             }
         }
 
-        if self
+        let invalid_selection = self
             .chat_list_state
             .selected()
-            .is_none_or(|idx| idx >= self.chat_ids.len())
-        {
+            .is_none_or(|idx| idx >= self.chat_ids.len());
+        if invalid_selection {
             self.chat_list_state.select(Some(0));
         }
     }
@@ -416,12 +452,15 @@ impl TuiApp {
     pub fn tick(&mut self) {
         self.chat_manager.poll_session_events();
         self.party_manager.poll_events();
+        self.pin_joined_parties();
         self.poll_party_downloads();
         self.chat_manager.cleanup_expired_toasts();
 
-        // Show the oldest pending verification. Peeked, never taken: it stays
-        // queued until answered (`confirm_fingerprint` removes it), so closing
-        // the overlay cannot discard a prompt a peer is blocked on.
+        // Surface the oldest pending fingerprint verification as an overlay.
+        // Peeked, not taken: the prompt stays queued until the user answers it
+        // (`confirm_fingerprint` removes it), so closing the overlay or a redraw
+        // can't quietly discard a verification a peer is still blocked on. Any
+        // further peers waiting behind it get their turn on a later tick.
         if !self.overlay.is_open() {
             if let Some(pending) = self
                 .chat_manager
@@ -448,9 +487,21 @@ impl TuiApp {
         self.refresh_status_line();
     }
 
-    /// Read state is persisted (`Chat::read_count`), so what arrived while the
-    /// app was closed is still unread on the next launch.
+    /// Reading a conversation is a *persisted* fact (`Chat::read_count`, saved
+    /// inside the encrypted history), not per-session bookkeeping — so a message
+    /// that arrived while the app was closed is still unread on the next launch.
     fn update_unread(&mut self) {
+        // Only while someone is at the terminal. Marking every tick made a
+        // message that arrived while the user was away read the moment it
+        // landed — and persisted as read: the bug the read mark exists to
+        // prevent (TUI-18). The next keypress brings them back, and the next
+        // tick marks it.
+        let present = self
+            .last_interaction
+            .is_some_and(|t| t.elapsed() < PRESENCE_IDLE);
+        if !present {
+            return;
+        }
         if let Some(selected) = self.selected_chat_id() {
             self.chat_manager.mark_chat_read(selected);
         }
@@ -462,10 +513,17 @@ impl TuiApp {
             .is_some_and(|c| c.unread_count() > 0)
     }
 
-    /// Tell `ChatManager` what the user can see, so no notification fires for
-    /// the conversation on screen. A terminal cannot report focus portably, so
-    /// "focused" means a keypress within [`PRESENCE_IDLE`]; idle falls back to
-    /// notifying, the safer direction to fail.
+    /// Tell `ChatManager` what the user can see, so a desktop notification does
+    /// not fire for the conversation they are reading right now.
+    ///
+    /// A terminal cannot reliably report window focus — crossterm's focus
+    /// events need terminal support that is far from universal, and enabling
+    /// them can emit stray escape sequences on terminals that lack it. So
+    /// "focused" is approximated by *recent interaction*: if the user pressed a
+    /// key within [`PRESENCE_IDLE`], they are at the terminal. Once they go
+    /// idle, presence drops and every conversation notifies again — which is
+    /// the correct direction to fail, because the cost of a missed notification
+    /// is higher than the cost of an extra one.
     fn report_presence(&mut self) {
         let active = self
             .last_interaction
@@ -474,18 +532,29 @@ impl TuiApp {
             .set_ui_presence(active, self.selected_chat_id());
     }
 
-    /// Periodic save. Skips an unchanged state and encrypts + writes on the
-    /// blocking pool; only the snapshot is taken on the UI loop (PERF-03).
+    /// Periodic save. It used to rewrite (clone, serialize, encrypt, fsync)
+    /// the whole history every 30 s whether or not anything had changed, on
+    /// the UI loop — tens of MB per tick for a long history, and a frozen
+    /// interface while it ran (PERF-03). Now it skips an unchanged state and
+    /// does the encrypt + write on the blocking pool; only the snapshot is
+    /// taken here.
     fn autosave(&mut self) {
-        if self.autosave_failed.swap(false, Ordering::SeqCst) {
-            self.saved_signature = None;
+        use std::sync::atomic::Ordering;
+        if self.autosave_pending && !self.save_in_flight.load(Ordering::SeqCst) {
+            self.autosave_pending = false;
+            let failed = self.autosave_failed.swap(false, Ordering::SeqCst);
+            if failed {
+                self.saved_signature = None;
+            }
+            self.record_save_outcome(!failed);
         }
         if self.chat_manager.history_key.is_none() || self.chat_manager.chats.is_empty() {
             return;
         }
         let due = self
             .last_save
-            .is_none_or(|t| t.elapsed() >= AUTOSAVE_INTERVAL);
+            .map(|t| t.elapsed() >= AUTOSAVE_INTERVAL)
+            .unwrap_or(true);
         if !due || self.save_in_flight.load(Ordering::SeqCst) {
             return;
         }
@@ -504,17 +573,25 @@ impl TuiApp {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // No runtime (unit tests): save inline.
             match history.save_encrypted(&self.history_path, &key) {
-                Ok(()) => self.saved_signature = Some(sig),
-                Err(e) => tracing::warn!("TUI history save failed: {}", e),
+                Ok(()) => {
+                    self.saved_signature = Some(sig);
+                    self.record_save_outcome(true);
+                }
+                Err(e) => {
+                    tracing::warn!("TUI history save failed: {}", e);
+                    self.record_save_outcome(false);
+                }
             }
             return;
         };
         self.save_in_flight.store(true, Ordering::SeqCst);
+        self.autosave_pending = true;
         let in_flight = self.save_in_flight.clone();
         let path = self.history_path.clone();
-        // Optimistic; a failed write sets `failed` so the next tick retries.
+        // Recorded optimistically; a failed write clears it below so the next
+        // tick tries again.
         self.saved_signature = Some(sig);
-        let failed = Arc::new(AtomicBool::new(false));
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.autosave_failed = failed.clone();
         handle.spawn_blocking(move || {
             if let Err(e) = history.save_encrypted(&path, &key) {
@@ -526,35 +603,72 @@ impl TuiApp {
     }
 
     fn save_history_now(&mut self) {
+        use std::sync::atomic::Ordering;
         if self.chat_manager.history_key.is_none() {
             return;
         }
-        // Let a background autosave finish first so it cannot land over this one.
+        // Let a background autosave finish first, so it cannot land after
+        // (and over) this one.
         let deadline = Instant::now() + Duration::from_secs(10);
         while self.save_in_flight.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         match self.chat_manager.save_history(&self.history_path) {
-            Ok(()) => self.saved_signature = Some(self.chat_manager.persisted_signature()),
-            Err(e) => tracing::warn!("TUI history save failed: {}", e),
+            Ok(()) => {
+                self.saved_signature = Some(self.chat_manager.persisted_signature());
+                self.record_save_outcome(true);
+            }
+            Err(e) => {
+                tracing::warn!("TUI history save failed: {}", e);
+                self.record_save_outcome(false);
+            }
         }
     }
 
-    /// Not gated on `auto_host_on_startup` (that is about launch);
-    /// `check_rehost_needed` already requires hosting and an unlocked
-    /// conversation, so `:stophost` and `:lock` stop it.
+    /// Tell the user when history stops reaching the disk — once per streak
+    /// of failures, not every 30 s. A save that works ends the streak.
+    fn record_save_outcome(&mut self, ok: bool) {
+        if ok {
+            self.save_failing = false;
+        } else if !self.save_failing {
+            self.save_failing = true;
+            self.toast(
+                ToastLevel::Error,
+                "History could not be saved to disk — recent messages will be lost on exit \
+                 until this is fixed (Ctrl+L copies the log with the reason)"
+                    .to_string(),
+            );
+        }
+    }
+
     fn auto_rehost(&mut self) {
-        if !self.chat_manager.check_rehost_needed()
-            || self
-                .last_rehost
-                .is_some_and(|t| t.elapsed() < REHOST_DEBOUNCE)
-            || !self.is_unlocked()
-        {
+        // Deliberately NOT gated on `auto_host_on_startup`: that setting decides
+        // whether hosting begins at launch, not whether hosting the user asked
+        // for survives its first peer. `check_rehost_needed()` already requires
+        // `is_hosting` and an unlocked conversation, so `:stophost` and the lock
+        // remain the way to stop.
+        if !self.chat_manager.check_rehost_needed() {
+            return;
+        }
+        let due = self
+            .last_rehost
+            .map(|t| t.elapsed() >= REHOST_DEBOUNCE)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        if !self.is_unlocked() {
+            return;
+        }
+        // One pending-command slot: a command the user just submitted runs
+        // first, and the rehost waits a turn rather than replacing it (TUI-27).
+        if self.pending_command.is_some() {
             return;
         }
         self.last_rehost = Some(Instant::now());
-        // Rebind the port in use, not the default: moving would invalidate the
-        // address the user already shared.
+        // Rebind the port actually in use, not the settings default — the user
+        // may have hosted on another one, and rehosting elsewhere silently
+        // invalidates the address they already shared.
         let port = self
             .chat_manager
             .hosting_port
@@ -568,7 +682,8 @@ impl TuiApp {
             self.status_line = "🔒 Identity locked — :unlock <password> to continue".to_string();
             return;
         }
-        // Saving is blocked while this holds, so it outranks everything else.
+        // Saving is blocked while this holds, so it outranks everything else
+        // on the status line until the user deals with it.
         if self.chat_manager.history_load_error().is_some() {
             self.status_line = "⚠ History unreadable — nothing is being saved. \
                  Restore the file, or :history-reset to keep it aside and start fresh"
@@ -576,13 +691,22 @@ impl TuiApp {
             return;
         }
 
+        let sessions = self.chat_manager.sessions_len();
         let chat_label = match self.selected_chat_id() {
             Some(id) => {
-                let chat = self.chat_manager.get_chat(id);
-                let title = chat.map_or("—", |c| c.title.as_str());
+                let title = self
+                    .chat_manager
+                    .get_chat(id)
+                    .map(|c| c.title.clone())
+                    .unwrap_or_else(|| "—".to_string());
                 let state = if self.chat_manager.is_connected(&id) {
                     "connected"
-                } else if chat.is_some_and(|c| c.is_host_placeholder) {
+                } else if self
+                    .chat_manager
+                    .get_chat(id)
+                    .map(|c| c.is_host_placeholder)
+                    .unwrap_or(false)
+                {
                     "hosting"
                 } else {
                     "offline"
@@ -592,21 +716,26 @@ impl TuiApp {
             None => "no chat selected".to_string(),
         };
 
-        let hint = match (self.mode, self.focus) {
-            (TuiMode::Command, _) if self.command_suggestions.is_empty() => {
-                "Enter run · Esc cancel · ↑/↓ history"
+        let hint = match self.mode {
+            TuiMode::Command => {
+                if self.command_suggestions.is_empty() {
+                    "Enter run · Esc cancel · ↑/↓ history".to_string()
+                } else {
+                    "Tab complete · ↑/↓ pick · Enter run · Esc cancel".to_string()
+                }
             }
-            (TuiMode::Command, _) => "Tab complete · ↑/↓ pick · Enter run · Esc cancel",
-            (TuiMode::Normal, TuiFocus::Input) => "Enter send · Ctrl+J newline · : commands",
-            (TuiMode::Normal, _) => "Tab focus · : commands · :help",
+            TuiMode::Normal => match self.focus {
+                TuiFocus::Input => "Enter send · Ctrl+J newline · : commands".to_string(),
+                _ => "Tab focus · : commands · :help".to_string(),
+            },
         };
 
-        self.status_line = format!(
-            "{}  │  sessions:{}  │  {}",
-            chat_label,
-            self.chat_manager.sessions_len(),
-            hint
-        );
+        self.status_line = format!("{}  │  sessions:{}  │  {}", chat_label, sessions, hint);
+    }
+
+    /// A command was submitted and has not run yet.
+    pub fn has_pending_command(&self) -> bool {
+        self.pending_command.is_some()
     }
 
     pub fn take_pending_command(&mut self) -> Option<TuiCommand> {
@@ -619,8 +748,11 @@ impl TuiApp {
         self.update_command_suggestions();
     }
 
-    /// Recompute autocomplete matches. Only while typing a non-empty first
-    /// word, so ↑ on an empty `:` prompt still recalls history.
+    /// Recompute the command autocomplete matches from the current buffer.
+    ///
+    /// Suggestions appear only while typing the first word (the command name)
+    /// and only after at least one character, so pressing ↑ on an empty `:`
+    /// prompt still recalls history.
     fn update_command_suggestions(&mut self) {
         let text = self.command_field.text();
         let token = text.trim_start();
@@ -644,8 +776,8 @@ impl TuiApp {
     /// Replace the command word with the highlighted suggestion (+trailing space).
     fn accept_suggestion(&mut self) {
         if let Some(&cmd_idx) = self.command_suggestions.get(self.suggestion_index) {
-            self.command_field
-                .set_text(&format!("{} ", COMMANDS[cmd_idx].0));
+            let name = COMMANDS[cmd_idx].0;
+            self.command_field.set_text(&format!("{} ", name));
             self.update_command_suggestions();
         }
     }
@@ -659,12 +791,16 @@ impl TuiApp {
 
     pub fn submit_command(&mut self) {
         let raw = self.command_field.text();
-        self.command_field.push_history(&raw);
+        self.command_field
+            .push_history(&crate::tui::command::history_entry(&raw));
         match parse_command(&raw) {
             Ok(cmd) => self.pending_command = Some(cmd),
             Err(e) => self.toast(ToastLevel::Error, e),
         }
-        self.cancel_command_mode();
+        self.mode = TuiMode::Normal;
+        self.command_field.clear();
+        self.command_suggestions.clear();
+        self.suggestion_index = 0;
     }
 
     pub fn cycle_focus(&mut self) {
@@ -681,9 +817,10 @@ impl TuiApp {
 
     // ---------------------------------------------------------------- keys
 
-    /// A bracketed paste is text, never keys: overlays ignore it (it cannot
-    /// answer a prompt), and in command mode it is joined onto one line so it
-    /// cannot submit the command.
+    /// A bracketed paste: inserted as text into whatever is being edited, never
+    /// replayed as keys. A paste cannot answer a prompt or confirm a dialog
+    /// (overlays ignore it), and in command mode it stays on one line so it
+    /// cannot submit the command or start another.
     pub fn handle_paste(&mut self, text: &str) {
         self.last_interaction = Some(Instant::now());
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -691,7 +828,8 @@ impl TuiApp {
             return;
         }
         if self.mode == TuiMode::Command {
-            self.command_field.insert_str(&text.replace('\n', " "));
+            let line = text.split('\n').collect::<Vec<_>>().join(" ");
+            self.command_field.insert_str(&line);
             self.update_command_suggestions();
             return;
         }
@@ -701,35 +839,65 @@ impl TuiApp {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
+        // Any keystroke means the user is at the terminal; `report_presence`
+        // uses this to gate desktop notifications.
         self.last_interaction = Some(Instant::now());
+        // Ctrl+C is how people leave a terminal program, and raw mode turns
+        // SIGINT into this key: ask to quit from anywhere, and let a second
+        // one confirm (TUI-25).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if matches!(self.overlay, TuiOverlay::ConfirmQuit) {
+                self.save_history_now();
+                self.should_quit = true;
+            } else {
+                if self.mode == TuiMode::Command {
+                    self.cancel_command_mode();
+                }
+                self.overlay = TuiOverlay::ConfirmQuit;
+            }
+            return;
+        }
         if self.overlay.is_open() {
             self.handle_overlay_key(key);
-        } else if self.mode == TuiMode::Command {
-            self.handle_command_key(key);
-        } else {
-            self.handle_normal_key(key);
+            return;
         }
+        if self.mode == TuiMode::Command {
+            self.handle_command_key(key);
+            return;
+        }
+        self.handle_normal_key(key);
     }
 
     fn handle_command_key(&mut self, key: KeyEvent) {
-        let n = self.command_suggestions.len();
+        let has_suggestions = !self.command_suggestions.is_empty();
         match key.code {
             KeyCode::Esc => self.cancel_command_mode(),
             KeyCode::Enter => self.submit_command(),
-            KeyCode::Tab if n > 0 => self.accept_suggestion(),
-            // ↑/↓ move the suggestion highlight when the menu shows, else
-            // recall command history.
-            KeyCode::Up if n > 0 => self.suggestion_index = (self.suggestion_index + n - 1) % n,
-            KeyCode::Down if n > 0 => self.suggestion_index = (self.suggestion_index + 1) % n,
+            KeyCode::Tab => {
+                if has_suggestions {
+                    self.accept_suggestion();
+                }
+            }
+            // When the suggestion menu is showing, ↑/↓ move the highlight;
+            // otherwise they recall command history.
             KeyCode::Up => {
-                self.command_field.history_prev();
-                self.update_command_suggestions();
+                if has_suggestions {
+                    let n = self.command_suggestions.len();
+                    self.suggestion_index = (self.suggestion_index + n - 1) % n;
+                } else {
+                    self.command_field.history_prev();
+                    self.update_command_suggestions();
+                }
             }
             KeyCode::Down => {
-                self.command_field.history_next();
-                self.update_command_suggestions();
+                if has_suggestions {
+                    let n = self.command_suggestions.len();
+                    self.suggestion_index = (self.suggestion_index + 1) % n;
+                } else {
+                    self.command_field.history_next();
+                    self.update_command_suggestions();
+                }
             }
-            KeyCode::Tab => {}
             _ => {
                 if self.command_field.handle_edit_key(&key) {
                     self.update_command_suggestions();
@@ -771,41 +939,51 @@ impl TuiApp {
             return;
         }
 
-        let in_list = self.focus == TuiFocus::ChatList;
+        // ChatList / MessageView focus.
         match key.code {
             KeyCode::Char(':') => self.enter_command_mode(),
             KeyCode::Char('q') => self.overlay = TuiOverlay::ConfirmQuit,
             KeyCode::Char('?') => self.show_help(None),
             KeyCode::Esc => self.focus = TuiFocus::ChatList,
-            KeyCode::Down if in_list => self.next_chat(),
-            KeyCode::Up if in_list => self.previous_chat(),
-            KeyCode::Down | KeyCode::PageDown => self.scroll_down(),
-            KeyCode::Up | KeyCode::PageUp => self.scroll_up(),
+            KeyCode::Down => match self.focus {
+                TuiFocus::ChatList => self.next_chat(),
+                _ => self.scroll_down(),
+            },
+            KeyCode::Up => match self.focus {
+                TuiFocus::ChatList => self.previous_chat(),
+                _ => self.scroll_up(),
+            },
+            KeyCode::PageDown => self.scroll_down(),
+            KeyCode::PageUp => self.scroll_up(),
             _ => {}
         }
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let close_key = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
         match self.overlay.clone() {
             TuiOverlay::Password { mode } => self.handle_password_key(key, mode),
-            // Opens on its own, under whatever the user is typing, so plain
-            // keys answer nothing: `y`/Enter used to trust an unverified key
-            // mid-sentence (audit TUI-01). Esc only puts it away (still queued).
-            TuiOverlay::FingerprintVerify { chat_id, .. } => match key.code {
-                KeyCode::Char('y') if ctrl => self.resolve_fingerprint(chat_id, true),
-                KeyCode::Char('n') if ctrl => self.resolve_fingerprint(chat_id, false),
-                KeyCode::Esc => {
-                    self.deferred_fingerprint = Some(chat_id);
-                    self.overlay = TuiOverlay::None;
-                    self.toast(
-                        ToastLevel::Warning,
-                        "Verification still pending — :verify accept|reject when ready",
-                    );
+            // This overlay opens on its own, under whatever the user is typing.
+            // Plain keys therefore answer nothing: `y`/Enter used to accept, so
+            // typing "hey" + Enter while a peer connected trusted an unverified
+            // key (audit TUI-01). Answering takes a chord nobody types by
+            // accident; Esc only puts the prompt away (it stays queued).
+            TuiOverlay::FingerprintVerify { chat_id, .. } => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Char('y') if ctrl => self.resolve_fingerprint(chat_id, true),
+                    KeyCode::Char('n') if ctrl => self.resolve_fingerprint(chat_id, false),
+                    KeyCode::Esc => {
+                        self.deferred_fingerprint = Some(chat_id);
+                        self.overlay = TuiOverlay::None;
+                        self.toast(
+                            ToastLevel::Warning,
+                            "Verification still pending — :verify accept|reject when ready"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             TuiOverlay::ConfirmQuit => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.save_history_now();
@@ -813,26 +991,36 @@ impl TuiApp {
                 }
                 _ => self.overlay = TuiOverlay::None,
             },
-            TuiOverlay::ConfirmClearHistory => {
-                self.overlay = TuiOverlay::None;
+            TuiOverlay::ConfirmDeleteChat { chat_id } => {
                 if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+                    self.chat_manager.delete_chat(chat_id);
+                    self.save_history_now();
+                    self.toast(ToastLevel::Info, "Conversation deleted".to_string());
+                }
+                self.overlay = TuiOverlay::None;
+            }
+            TuiOverlay::ConfirmClearHistory => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
                     let path = self.history_path.clone();
                     self.chat_manager.clear_history(&path);
-                    self.toast(ToastLevel::Info, "History cleared");
+                    self.toast(ToastLevel::Info, "History cleared".to_string());
+                    self.overlay = TuiOverlay::None;
                 }
-            }
+                _ => self.overlay = TuiOverlay::None,
+            },
             TuiOverlay::ConfirmWipe => {
-                self.overlay = TuiOverlay::None;
-                if key.code == KeyCode::Char('y') && ctrl {
+                if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.overlay = TuiOverlay::None;
                     self.wipe_now();
                 } else {
-                    self.toast(ToastLevel::Info, "Nothing was deleted");
+                    self.overlay = TuiOverlay::None;
+                    self.toast(ToastLevel::Info, "Nothing was deleted".to_string());
                 }
             }
             TuiOverlay::Contacts => match key.code {
                 KeyCode::Esc => self.overlay = TuiOverlay::None,
-                KeyCode::Down => self.contacts_select(true),
-                KeyCode::Up => self.contacts_select(false),
+                KeyCode::Down => self.contacts_select_next(),
+                KeyCode::Up => self.contacts_select_prev(),
                 KeyCode::Enter => self.connect_selected_contact(),
                 _ => {}
             },
@@ -843,26 +1031,25 @@ impl TuiApp {
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_setting(),
                 _ => {}
             },
-            TuiOverlay::Help => {
-                let s = &mut self.overlay_scroll;
-                match key.code {
-                    _ if close_key => self.overlay = TuiOverlay::None,
-                    KeyCode::Down => *s = s.saturating_add(1),
-                    KeyCode::Up => *s = s.saturating_sub(1),
-                    KeyCode::PageDown => *s = s.saturating_add(10),
-                    KeyCode::PageUp => *s = s.saturating_sub(10),
-                    _ => {}
-                }
-            }
+            TuiOverlay::Help => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = TuiOverlay::None,
+                KeyCode::Down => self.overlay_scroll = self.overlay_scroll.saturating_add(1),
+                KeyCode::Up => self.overlay_scroll = self.overlay_scroll.saturating_sub(1),
+                KeyCode::PageDown => self.overlay_scroll = self.overlay_scroll.saturating_add(10),
+                KeyCode::PageUp => self.overlay_scroll = self.overlay_scroll.saturating_sub(10),
+                _ => {}
+            },
+            // Plain informational overlays: any of Esc/Enter/q closes.
             TuiOverlay::Invite { .. } | TuiOverlay::Identity => {
-                if close_key || key.code == KeyCode::Enter {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.overlay = TuiOverlay::None;
                 }
             }
+            // Transfers overlay supports selecting and cancelling a transfer.
             TuiOverlay::Transfers => {
                 let count = self.chat_manager.active_transfers_sorted().len();
                 match key.code {
-                    _ if close_key => self.overlay = TuiOverlay::None,
+                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = TuiOverlay::None,
                     KeyCode::Down | KeyCode::Char('j') if count > 0 => {
                         self.transfer_sel = (self.transfer_sel + 1).min(count - 1);
                     }
@@ -873,11 +1060,13 @@ impl TuiApp {
                     _ => {}
                 }
             }
-            // ←/→ switch community; ↑/↓ pick the thread shown (and posted to).
+            // Communities pane: switch between the servers you have joined.
+            // ←/→ switch community, ↑/↓ pick the thread whose messages are
+            // shown (and that :party-post writes to).
             TuiOverlay::Party => {
                 let count = self.party_manager.server_ids().len();
                 match key.code {
-                    _ if close_key => self.overlay = TuiOverlay::None,
+                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = TuiOverlay::None,
                     KeyCode::Right | KeyCode::Char('l') if count > 0 => {
                         self.party_sel = (self.party_sel + 1).min(count - 1);
                         self.party_thread_sel = 0;
@@ -908,9 +1097,11 @@ impl TuiApp {
 
     fn handle_password_key(&mut self, key: KeyEvent, mode: PasswordMode) {
         match key.code {
-            // The first-run prompt cannot be dismissed: no identity or history
-            // is saved without a password, so dismissing it meant a new
-            // identity every launch (audit TUI-04 / JOURNEY-02). Ctrl+Q quits.
+            // The first-run prompt cannot be dismissed. `Identity::save`
+            // refuses a plaintext key, so an identity without a password is
+            // never written: dismissing the prompt meant a brand-new identity
+            // on every launch, and the old history overwritten by the next
+            // one's autosave (audit TUI-04 / JOURNEY-02). Ctrl+Q quits instead.
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.password_field.clear();
                 self.should_quit = true;
@@ -918,12 +1109,14 @@ impl TuiApp {
             KeyCode::Esc if mode == PasswordMode::Set && !self.identity.is_encrypted() => {
                 self.toast(
                     ToastLevel::Warning,
-                    "A password is needed before anything can be saved (Ctrl+Q quits)",
+                    "A password is needed before anything can be saved (Ctrl+Q quits)".to_string(),
                 );
             }
-            // Unlocking can be put off; nothing is saved while locked.
             KeyCode::Esc => {
+                // Unlocking can be put off: closing the prompt leaves the app
+                // locked, and nothing is saved while it is.
                 self.password_field.clear();
+                self.new_password_first = None;
                 self.overlay = TuiOverlay::None;
             }
             KeyCode::Enter => {
@@ -931,7 +1124,7 @@ impl TuiApp {
                 self.password_field.clear();
                 match mode {
                     PasswordMode::Unlock => self.try_unlock(&pw),
-                    PasswordMode::Set => self.try_set_password(&pw),
+                    PasswordMode::Set => self.enter_new_password(pw),
                 }
             }
             _ => {
@@ -943,30 +1136,28 @@ impl TuiApp {
     // ---------------------------------------------------------------- scrolling
 
     pub fn next_chat(&mut self) {
-        if let Some(i) = self.chat_list_state.selected() {
-            self.select_chat_index(if i + 1 < self.chat_ids.len() {
-                i + 1
-            } else {
-                0
-            });
-        } else {
-            self.select_chat_index(0);
-        }
-    }
-
-    pub fn previous_chat(&mut self) {
-        let i = match self.chat_list_state.selected() {
-            Some(0) => self.chat_ids.len().wrapping_sub(1),
-            Some(i) => i - 1,
-            None => 0,
-        };
-        self.select_chat_index(i);
-    }
-
-    fn select_chat_index(&mut self, i: usize) {
         if self.chat_ids.is_empty() {
             return;
         }
+        let i = match self.chat_list_state.selected() {
+            Some(i) if i + 1 < self.chat_ids.len() => i + 1,
+            Some(_) => 0,
+            None => 0,
+        };
+        self.chat_list_state.select(Some(i));
+        self.message_scroll = 0;
+        self.stick_to_bottom = true;
+    }
+
+    pub fn previous_chat(&mut self) {
+        if self.chat_ids.is_empty() {
+            return;
+        }
+        let i = match self.chat_list_state.selected() {
+            Some(0) => self.chat_ids.len() - 1,
+            Some(i) => i - 1,
+            None => 0,
+        };
         self.chat_list_state.select(Some(i));
         self.message_scroll = 0;
         self.stick_to_bottom = true;
@@ -978,8 +1169,8 @@ impl TuiApp {
     }
 
     pub fn scroll_down(&mut self) {
-        // Re-stick is decided during render once the content height is known.
         self.message_scroll = self.message_scroll.saturating_add(1);
+        // Re-stick is decided during render once the content height is known.
     }
 
     // ---------------------------------------------------------------- typing
@@ -1008,11 +1199,14 @@ impl TuiApp {
     }
 
     fn maybe_send_typing_stop(&mut self) {
-        if self
-            .last_typing_activity
-            .is_none_or(|t| t.elapsed() >= TYPING_IDLE)
-        {
-            self.stop_typing();
+        if self.typing_active {
+            let idle = self
+                .last_typing_activity
+                .map(|t| t.elapsed() >= TYPING_IDLE)
+                .unwrap_or(true);
+            if idle {
+                self.stop_typing();
+            }
         }
     }
 
@@ -1020,7 +1214,8 @@ impl TuiApp {
         let Some(chat_id) = self.selected_chat_id() else {
             return;
         };
-        let trimmed = self.input_field.text().trim().to_string();
+        let text = self.input_field.text();
+        let trimmed = text.trim().to_string();
         if trimmed.is_empty() {
             return;
         }
@@ -1041,20 +1236,22 @@ impl TuiApp {
 
     fn require_unlocked(&mut self) -> bool {
         if self.is_unlocked() {
-            return true;
+            true
+        } else {
+            self.toast(
+                ToastLevel::Warning,
+                "Identity is locked. Unlock with :unlock <password>.".to_string(),
+            );
+            self.overlay = TuiOverlay::Password {
+                mode: PasswordMode::Unlock,
+            };
+            false
         }
-        self.toast(
-            ToastLevel::Warning,
-            "Identity is locked. Unlock with :unlock <password>.",
-        );
-        self.overlay = TuiOverlay::Password {
-            mode: PasswordMode::Unlock,
-        };
-        false
     }
 
-    /// The private key if unlocked; otherwise prompts for the password (or
-    /// toasts why the key is unreadable) and returns `None`.
+    /// The private key, if the identity is unlocked. Prompts for the password
+    /// (or toasts why the key is unreadable) otherwise, so a command can just
+    /// `let Some(key) = self.unlocked_private_key() else { return };`.
     fn unlocked_private_key(&mut self) -> Option<rsa::PrivateKey> {
         if !self.require_unlocked() {
             return None;
@@ -1081,10 +1278,12 @@ impl TuiApp {
         self.message_scroll = 0;
     }
 
-    /// Resolve a contact given as a 1-based index or a case-insensitive name.
+    /// Resolve a contact target given as a 1-based index or a (case-insensitive) name.
     fn resolve_contact(&self, target: &str) -> Option<Uuid> {
-        if let Ok(idx @ 1..) = target.parse::<usize>() {
-            return self.contact_ids.get(idx - 1).copied();
+        if let Ok(idx) = target.parse::<usize>() {
+            if idx >= 1 {
+                return self.contact_ids.get(idx - 1).copied();
+            }
         }
         let lower = target.to_ascii_lowercase();
         self.chat_manager
@@ -1095,149 +1294,182 @@ impl TuiApp {
     }
 
     pub async fn execute_command(&mut self, cmd: TuiCommand) {
-        use TuiCommand as C;
         match cmd {
-            C::Host(port_override) => self.cmd_host(port_override).await,
-            C::Connect { host, port } => self.cmd_connect(host, port).await,
-            C::HostRelay { relay, token } => self.cmd_host_relay(relay, token).await,
-            C::ConnectRelay { relay, token } => self.cmd_connect_relay(relay, token).await,
-            C::ConnectionPassword(pw) => self.cmd_connection_password(pw),
-            C::Lock(on) => self.cmd_lock(on),
-            C::Disconnect | C::DeleteChat => self.disconnect_selected(),
-            C::StopHost => self.chat_manager.stop_hosting(),
+            TuiCommand::Host(port_override) => self.cmd_host(port_override).await,
+            TuiCommand::Connect { host, port } => self.cmd_connect(host, port).await,
+            TuiCommand::HostRelay { relay, token } => self.cmd_host_relay(relay, token).await,
+            TuiCommand::ConnectRelay { relay, token } => self.cmd_connect_relay(relay, token).await,
+            TuiCommand::ConnectionPassword(pw) => self.cmd_connection_password(pw),
+            TuiCommand::Lock(on) => self.cmd_lock(on),
+            TuiCommand::Disconnect => self.disconnect_selected(),
+            TuiCommand::StopHost => {
+                self.chat_manager.stop_hosting();
+            }
 
-            C::Contacts => {
+            TuiCommand::Contacts => {
                 self.sync_contact_ids();
                 self.overlay = TuiOverlay::Contacts;
             }
-            C::ContactAdd {
+            TuiCommand::ContactAdd {
                 name,
                 address,
                 fingerprint,
             } => self.cmd_contact_add(name, address, fingerprint),
-            C::ContactConnect(target) => self.cmd_contact_connect(target).await,
-            C::ContactRemove(target) => self.cmd_contact_remove(target),
-            C::ContactRename { target, new_name } => self.cmd_contact_rename(target, new_name),
-            C::Invite(addr) => self.cmd_invite(addr),
-            C::InviteRelay(relay) => {
-                self.pending_command = Some(C::HostRelay { relay, token: None });
+            TuiCommand::ContactConnect(target) => self.cmd_contact_connect(target).await,
+            TuiCommand::ContactRemove(target) => self.cmd_contact_remove(target),
+            TuiCommand::ContactRename { target, new_name } => {
+                self.cmd_contact_rename(target, new_name)
             }
-            C::Import(link) => self.cmd_import(link),
-            C::Send(path) => self.cmd_send(path).await,
-            C::PartyConnect {
+            TuiCommand::Invite(addr) => self.cmd_invite(addr),
+            TuiCommand::InviteRelay(relay) => {
+                self.pending_command = Some(TuiCommand::HostRelay { relay, token: None });
+            }
+            TuiCommand::Import(link) => self.cmd_import(link),
+            TuiCommand::Send(path) => self.cmd_send(path).await,
+            TuiCommand::PartyConnect {
                 address,
                 username,
                 password,
             } => self.cmd_party_connect(address, username, password).await,
-            C::PartyTrust => self.cmd_party_trust().await,
-            C::PartyPost(text) => self.cmd_party_post(text),
-            C::PartyDm { target, text } => self.cmd_party_dm(target, text),
-            C::PartyCreateChannel(name) => self.cmd_party_create_channel(name),
-            C::PartySendFile(path) => self.cmd_party_send_file(path),
-            C::PartyDownload(query) => self.cmd_party_download(query),
-            C::PartyStatus => self.cmd_party_status(),
-            C::PartyPane => self.cmd_party_pane(),
-            C::PartyFiles => self.cmd_party_files(),
-            C::PartyAudit => self.cmd_party_audit(),
-            C::PartyDeleteFile(query) => self.cmd_party_delete_file(query),
-            C::PartyRole { username, role } => self.cmd_party_role(username, role),
-            C::PartyChannelAccess {
+            TuiCommand::PartyTrust => self.cmd_party_trust().await,
+            TuiCommand::PartyPost(text) => self.cmd_party_post(text),
+            TuiCommand::PartyDm { target, text } => self.cmd_party_dm(target, text),
+            TuiCommand::PartyCreateChannel(name) => self.cmd_party_create_channel(name),
+            TuiCommand::PartySendFile(path) => self.cmd_party_send_file(path),
+            TuiCommand::PartyDownload(query) => self.cmd_party_download(query),
+            TuiCommand::PartyStatus => self.cmd_party_status(),
+            TuiCommand::PartyPane => self.cmd_party_pane(),
+            TuiCommand::PartyFiles => self.cmd_party_files(),
+            TuiCommand::PartyAudit => self.cmd_party_audit(),
+            TuiCommand::PartyDeleteFile(query) => self.cmd_party_delete_file(query),
+            TuiCommand::PartyRole { username, role } => self.cmd_party_role(username, role),
+            TuiCommand::PartyChannelAccess {
                 channel,
                 kind,
                 members,
             } => self.cmd_party_channel_access(channel, kind, members),
-            C::PartyDeleteChannel(channel) => self.cmd_party_delete_channel(channel),
-            C::Transfers => self.overlay = TuiOverlay::Transfers,
-            C::AcceptFile => self.cmd_resolve_file_offer(true),
-            C::DeclineFile => self.cmd_resolve_file_offer(false),
-            C::Name(name) => self.cmd_name(name),
-            C::Backup(dest) => self.cmd_backup(dest),
-            C::Rename(title) => self.cmd_rename(title),
-            C::ClearHistory => self.overlay = TuiOverlay::ConfirmClearHistory,
-            C::HistoryReset => self.cmd_history_reset(),
-            C::Wipe { password } => self.cmd_wipe(&password),
+            TuiCommand::PartyDeleteChannel(channel) => self.cmd_party_delete_channel(channel),
+            TuiCommand::Transfers => self.overlay = TuiOverlay::Transfers,
+            TuiCommand::AcceptFile => self.cmd_resolve_file_offer(true),
+            TuiCommand::DeclineFile => self.cmd_resolve_file_offer(false),
+            TuiCommand::Name(name) => self.cmd_name(name),
+            TuiCommand::Backup(dest) => self.cmd_backup(dest),
+            TuiCommand::Rename(title) => self.cmd_rename(title),
+            TuiCommand::DeleteChat => self.delete_selected(),
+            TuiCommand::ClearHistory => self.overlay = TuiOverlay::ConfirmClearHistory,
+            TuiCommand::HistoryReset => self.cmd_history_reset(),
+            TuiCommand::Wipe { password } => self.cmd_wipe(&password),
 
-            C::Identity => {
+            TuiCommand::Identity => {
                 Self::copy_to_clipboard(&self.identity.fingerprint);
                 self.overlay = TuiOverlay::Identity;
             }
-            C::Verify(accept) => self.verify_pending(accept),
-            C::Unlock(pw) => self.cmd_unlock(pw),
-            C::SetPassword(pw) => self.try_set_password(&pw),
-            C::ChangePassword { current, new } => self.try_change_password(&current, &new),
+            TuiCommand::Verify(accept) => self.verify_pending(accept),
+            TuiCommand::Unlock(pw) => self.cmd_unlock(pw),
+            TuiCommand::SetPassword(pw) => self.try_set_password(&pw),
+            TuiCommand::ChangePassword { current, new } => self.try_change_password(&current, &new),
 
-            C::Settings => {
+            TuiCommand::Settings => {
                 self.settings_list_state.select(Some(0));
                 self.overlay = TuiOverlay::Settings;
             }
-            C::Set { key, value } => self.apply_setting(&key, &value),
+            TuiCommand::Set { key, value } => self.apply_setting(&key, &value),
 
-            C::Diagnostics => self.export_diagnostics_bundle(),
-            C::Logs => self.copy_logs(),
-            C::Help(topic) => self.show_help(topic),
-            C::Quit => self.overlay = TuiOverlay::ConfirmQuit,
-            C::ForceQuit => self.should_quit = true,
+            TuiCommand::Diagnostics => self.export_diagnostics_bundle(),
+            TuiCommand::Logs => self.copy_logs(),
+            TuiCommand::Help(topic) => self.show_help(topic),
+            TuiCommand::Quit => self.overlay = TuiOverlay::ConfirmQuit,
+            TuiCommand::ForceQuit => self.should_quit = true,
         }
         self.refresh_status_line();
     }
 
     fn disconnect_selected(&mut self) {
-        let Some(chat_id) = self.selected_chat_id() else {
-            self.toast(ToastLevel::Warning, "No chat selected");
-            return;
-        };
-        let is_placeholder = self
-            .chat_manager
-            .get_chat(chat_id)
-            .is_some_and(|c| c.is_host_placeholder);
-        if is_placeholder {
-            self.chat_manager.stop_hosting();
-        } else {
-            self.chat_manager.delete_chat(chat_id);
+        match self.selected_chat_id() {
+            Some(chat_id) => {
+                let is_placeholder = self
+                    .chat_manager
+                    .get_chat(chat_id)
+                    .map(|c| c.is_host_placeholder)
+                    .unwrap_or(false);
+                if is_placeholder {
+                    self.chat_manager.stop_hosting();
+                    self.save_history_now();
+                } else if self.chat_manager.disconnect_chat(chat_id) {
+                    // The session only: the conversation and its history stay
+                    // (TUI-15). `:delete` is what removes them.
+                    self.toast(
+                        ToastLevel::Info,
+                        "Disconnected — the conversation is kept".to_string(),
+                    );
+                } else {
+                    self.toast(ToastLevel::Info, "Not connected".to_string());
+                }
+            }
+            None => self.toast(ToastLevel::Warning, "No chat selected".to_string()),
         }
-        self.save_history_now();
+    }
+
+    /// `:delete`: asks first — the conversation's history goes with it.
+    fn delete_selected(&mut self) {
+        match self.selected_chat_id() {
+            Some(chat_id) => self.overlay = TuiOverlay::ConfirmDeleteChat { chat_id },
+            None => self.toast(ToastLevel::Warning, "No chat selected".to_string()),
+        }
     }
 
     fn show_help(&mut self, topic: Option<String>) {
         let topic = topic.map(|t| t.trim().trim_start_matches(':').to_ascii_lowercase());
-        if let Some(name) = topic.as_ref().filter(|n| command_help(n).is_none()) {
-            self.toast(
-                ToastLevel::Error,
-                format!("No help for '{}'. Try :help", name),
-            );
-            return;
+        if let Some(ref name) = topic {
+            if command_help(name).is_none() {
+                self.toast(
+                    ToastLevel::Error,
+                    format!("No help for '{}'. Try :help", name),
+                );
+                return;
+            }
         }
         self.help_topic = topic;
         self.overlay = TuiOverlay::Help;
         self.overlay_scroll = 0;
     }
 
-    /// Cancel the highlighted transfer in the Transfers overlay if it is still
-    /// in flight (id-sorted, so the index matches the render).
+    // ---------------------------------------------------------------- transfers
+
+    /// Cancel the transfer highlighted in the Transfers overlay, if it is still
+    /// in flight (id-sorted so the index matches the render).
     fn cancel_selected_transfer(&mut self) {
-        use crate::types::TransferStatus::{InProgress, Pending};
         let transfers = self.chat_manager.active_transfers_sorted();
-        if let Some(t) = transfers.get(self.transfer_sel) {
-            if matches!(t.status, Pending | InProgress) {
-                self.chat_manager.cancel_transfer(t.id);
-            }
+        let Some(t) = transfers.get(self.transfer_sel) else {
+            return;
+        };
+        if matches!(
+            t.status,
+            crate::types::TransferStatus::Pending | crate::types::TransferStatus::InProgress
+        ) {
+            self.chat_manager.cancel_transfer(t.id);
         }
     }
 
     // ---------------------------------------------------------------- fingerprint
 
     fn verify_pending(&mut self, accept: bool) {
-        // The head of the queue, whether or not its overlay is showing.
-        let target = match self.overlay {
+        // The head of the queue, whether or not its overlay is showing: Esc
+        // puts the overlay away without answering.
+        let target = match self.overlay.clone() {
             TuiOverlay::FingerprintVerify { chat_id, .. } => Some(chat_id),
             _ => self
                 .chat_manager
                 .pending_fingerprint()
                 .map(|p| p.session_id),
         };
-        match target {
-            Some(chat_id) => self.resolve_fingerprint(chat_id, accept),
-            None => self.toast(ToastLevel::Info, "No fingerprint verification pending"),
+        if let Some(chat_id) = target {
+            self.resolve_fingerprint(chat_id, accept);
+        } else {
+            self.toast(
+                ToastLevel::Info,
+                "No fingerprint verification pending".to_string(),
+            );
         }
     }
 
@@ -1245,14 +1477,15 @@ impl TuiApp {
         if self.deferred_fingerprint == Some(chat_id) {
             self.deferred_fingerprint = None;
         }
-        // `confirm_fingerprint` stores the fingerprint on the right
-        // conversation itself (on the host, `chat_id` names the session).
+        // `confirm_fingerprint` stores an accepted fingerprint on the right
+        // conversation itself (on the host that is not `chat_id`, which names
+        // the session).
         if accept {
             let _ = self.chat_manager.confirm_fingerprint(chat_id, true);
-            self.toast(ToastLevel::Success, "Fingerprint accepted");
+            self.toast(ToastLevel::Success, "Fingerprint accepted".to_string());
         } else {
             let _ = self.chat_manager.reject_fingerprint(chat_id);
-            self.toast(ToastLevel::Warning, "Fingerprint rejected");
+            self.toast(ToastLevel::Warning, "Fingerprint rejected".to_string());
         }
         self.overlay = TuiOverlay::None;
         self.save_history_now();
@@ -1261,24 +1494,75 @@ impl TuiApp {
     // ---------------------------------------------------------------- password
 
     fn try_unlock(&mut self, password: &str) {
-        if self.identity.decrypt(password).is_err() {
-            self.toast(ToastLevel::Error, "Wrong password");
-            return;
+        match self.identity.decrypt(password) {
+            Ok(()) => {
+                if let Ok(key) = self.identity.history_key() {
+                    self.chat_manager.set_history_key(key);
+                    let _ = self
+                        .chat_manager
+                        .load_history_auto(&self.history_path, &key);
+                }
+                self.overlay = TuiOverlay::None;
+                self.toast(ToastLevel::Success, "Identity unlocked".to_string());
+                self.host_on_startup_if_configured();
+            }
+            // Only a wrong password is worth retyping; anything else is a
+            // damaged file (TAURI-20).
+            Err(e) if e.is::<crate::identity::WrongPassword>() => {
+                self.toast(ToastLevel::Error, "Wrong password".to_string())
+            }
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("Your identity file is damaged and cannot be opened ({e}); restore it from a backup"),
+            ),
         }
-        if let Ok(key) = self.identity.history_key() {
-            self.chat_manager.set_history_key(key);
-            let _ = self
-                .chat_manager
-                .load_history_auto(&self.history_path, &key);
-        }
-        self.overlay = TuiOverlay::None;
-        self.toast(ToastLevel::Success, "Identity unlocked");
     }
 
-    /// Mirrors the floor `Identity::encrypt` enforces, for a clearer message.
-    fn password_too_short(&mut self, password: &str) -> bool {
-        let short = password.chars().count() < crate::MIN_PASSWORD_LEN;
-        if short {
+    /// Honour `auto_host_on_startup` once the identity is open and the saved
+    /// settings are loaded, as the desktop does (TUI-19). A launch flag or a
+    /// listener already running wins: this never replaces either.
+    fn host_on_startup_if_configured(&mut self) {
+        if self.chat_manager.config.auto_host_on_startup
+            && !self.chat_manager.is_hosting
+            && self.pending_command.is_none()
+            && self.deferred_launch.is_none()
+        {
+            let port = self.chat_manager.config.listen_port;
+            self.pending_command = Some(TuiCommand::Host(Some(port)));
+            tracing::info!(port, "hosting on start-up (auto-host)");
+        }
+    }
+
+    /// A new password is typed twice and must match (TUI-12): the first entry
+    /// is checked against the floor and held; the second sets it or starts over.
+    fn enter_new_password(&mut self, password: String) {
+        match self.new_password_first.take() {
+            None => {
+                if password.chars().count() < crate::MIN_PASSWORD_LEN {
+                    self.toast(
+                        ToastLevel::Error,
+                        format!(
+                            "Password must be at least {} characters",
+                            crate::MIN_PASSWORD_LEN
+                        ),
+                    );
+                    return;
+                }
+                self.new_password_first = Some(zeroize::Zeroizing::new(password));
+                self.toast(ToastLevel::Info, "Type it again to confirm".to_string());
+            }
+            Some(first) if *first == password => self.try_set_password(&password),
+            Some(_) => self.toast(
+                ToastLevel::Error,
+                "The two passwords did not match — nothing was set. Type a new one.".to_string(),
+            ),
+        }
+    }
+
+    fn try_set_password(&mut self, password: &str) {
+        // Mirrors the floor `Identity::encrypt` enforces, so the user gets a
+        // clear message here instead of a generic failure from the core.
+        if password.chars().count() < crate::MIN_PASSWORD_LEN {
             self.toast(
                 ToastLevel::Error,
                 format!(
@@ -1286,90 +1570,119 @@ impl TuiApp {
                     crate::MIN_PASSWORD_LEN
                 ),
             );
-        }
-        short
-    }
-
-    fn try_set_password(&mut self, password: &str) {
-        if self.password_too_short(password) {
             return;
         }
-        // Only for an identity with no password: re-encrypting a protected
-        // one here skipped the current-password check (audit TUI-03).
+        // Setting a password is for an identity that has none. Re-encrypting
+        // an already-protected identity here skipped the current-password
+        // check entirely — anyone at an unlocked terminal could replace the
+        // password (audit TUI-03). That is `:change-password`'s job.
         if self.identity.is_encrypted() {
             self.toast(
                 ToastLevel::Error,
-                "This identity already has a password — use :change-password <current> <new>",
+                "This identity already has a password — use :change-password <current> <new>"
+                    .to_string(),
             );
             return;
         }
-        let result = self.identity.migrate_legacy_plaintext(password);
-        self.finish_password_update(result, password, "Password set");
+        // `protect` keeps the key in memory, so no second Argon2 run is needed
+        // to stay unlocked (PERF-12).
+        let result = self.identity.protect(password);
+        // First setup is the start-up of a new identity: the same point an
+        // unlock is for an existing one. A password *change* is not.
+        if self.finish_password_update(result, "Password set") {
+            self.host_on_startup_if_configured();
+        }
     }
 
     fn try_change_password(&mut self, current: &str, new: &str) {
-        if self.password_too_short(new) {
+        if new.chars().count() < crate::MIN_PASSWORD_LEN {
+            self.toast(
+                ToastLevel::Error,
+                format!(
+                    "Password must be at least {} characters",
+                    crate::MIN_PASSWORD_LEN
+                ),
+            );
             return;
         }
         let result = self.identity.change_password(current, new);
-        self.finish_password_update(result, new, "Password changed");
+        self.finish_password_update(result, "Password changed");
     }
 
-    /// Save the re-wrapped identity and re-derive the history key from it;
-    /// success is reported only if every step worked.
-    fn finish_password_update(&mut self, result: anyhow::Result<()>, password: &str, done: &str) {
+    /// Save the re-wrapped identity and re-derive the history key from it.
+    /// Success is reported only when every step worked: "Password set" used
+    /// to be shown even when the identity could not be reloaded afterwards.
+    fn finish_password_update(&mut self, result: anyhow::Result<()>, done: &str) -> bool {
         let outcome = result
             .and_then(|()| self.identity.save(&self.identity_path))
             .and_then(|()| {
-                // encrypt() cleared the plaintext the key derives from: reload.
-                let mut reloaded = Identity::load(&self.identity_path)?;
-                reloaded.decrypt(password)?;
-                let key = reloaded.history_key()?;
-                Ok((reloaded, key))
+                // Both `protect` and `change_password` leave the identity
+                // unlocked, so the key is in hand. The file is reloaded only to
+                // prove it reads back — re-decrypting it as well cost another
+                // full Argon2 run (PERF-12).
+                let reloaded = Identity::load(&self.identity_path)?;
+                anyhow::ensure!(
+                    reloaded.fingerprint == self.identity.fingerprint && reloaded.is_encrypted(),
+                    "the saved identity does not match the one in use"
+                );
+                self.identity.history_key()
             });
         match outcome {
-            Ok((reloaded, key)) => {
+            Ok(key) => {
                 self.chat_manager.set_history_key(key);
                 let _ = self
                     .chat_manager
                     .load_history_auto(&self.history_path, &key);
-                self.identity = reloaded;
                 self.overlay = TuiOverlay::None;
-                self.toast(ToastLevel::Success, done);
+                self.toast(ToastLevel::Success, done.to_string());
+                true
             }
-            Err(e) => self.toast(ToastLevel::Error, format!("Password not updated: {e}")),
+            Err(e) => {
+                self.toast(ToastLevel::Error, format!("Password not updated: {e}"));
+                false
+            }
         }
     }
 
     // ---------------------------------------------------------------- contacts overlay
 
-    /// Move the contact selection one row, wrapping at either end.
-    fn contacts_select(&mut self, down: bool) {
-        let len = self.contact_ids.len();
-        if len == 0 {
+    fn contacts_select_next(&mut self) {
+        if self.contact_ids.is_empty() {
             return;
         }
-        let i = match (self.contacts_list_state.selected(), down) {
-            (None, true) => 0,
-            (Some(i), true) => (i + 1) % len,
-            (None | Some(0), false) => len - 1,
-            (Some(i), false) => i - 1,
+        let i = self
+            .contacts_list_state
+            .selected()
+            .map(|i| (i + 1) % self.contact_ids.len())
+            .unwrap_or(0);
+        self.contacts_list_state.select(Some(i));
+    }
+
+    fn contacts_select_prev(&mut self) {
+        if self.contact_ids.is_empty() {
+            return;
+        }
+        let i = match self.contacts_list_state.selected() {
+            Some(0) | None => self.contact_ids.len() - 1,
+            Some(i) => i - 1,
         };
         self.contacts_list_state.select(Some(i));
     }
 
     fn connect_selected_contact(&mut self) {
-        let selected = self.contacts_list_state.selected();
-        if let Some(idx) = selected.filter(|&i| i < self.contact_ids.len()) {
-            // A 1-based index string, for the shared command path.
-            self.pending_command = Some(TuiCommand::ContactConnect((idx + 1).to_string()));
+        if let Some(idx) = self.contacts_list_state.selected() {
+            if let Some(&id) = self.contact_ids.get(idx) {
+                // Resolve to a 1-based index string for the shared command path.
+                self.pending_command = Some(TuiCommand::ContactConnect((idx + 1).to_string()));
+                let _ = id;
+            }
         }
     }
 
     // ---------------------------------------------------------------- settings overlay
 
     fn settings_select(&mut self, delta: i32) {
-        let len = 9i32; // number of settings rows rendered
+        let len = 7i32; // number of settings rows rendered
         let cur = self.settings_list_state.selected().unwrap_or(0) as i32;
         let next = (cur + delta).rem_euclid(len) as usize;
         self.settings_list_state.select(Some(next));
@@ -1379,19 +1692,16 @@ impl TuiApp {
         let idx = self.settings_list_state.selected().unwrap_or(0);
         let cfg = &mut self.chat_manager.config;
         match idx {
-            // Rows 0 (download-dir) and 1 (listen-port) are text: use :set.
-            2..=7 => {
-                let b = bool_setting(cfg, BOOL_SETTINGS[idx - 2]).expect("a bool setting");
-                *b = !*b;
-            }
-            8 => {
-                let i = THEMES.iter().position(|t| *t == cfg.theme).unwrap_or(0);
-                cfg.theme = THEMES[(i + 1) % THEMES.len()];
-            }
+            // 0 download-dir, 1 listen-port are text-only (use :set)
+            2 => cfg.enable_notifications = !cfg.enable_notifications,
+            3 => cfg.enable_typing_indicators = !cfg.enable_typing_indicators,
+            4 => cfg.auto_accept_files = !cfg.auto_accept_files,
+            5 => cfg.auto_host_on_startup = !cfg.auto_host_on_startup,
+            6 => cfg.enable_upnp = !cfg.enable_upnp,
             _ => {
                 self.toast(
                     ToastLevel::Info,
-                    "Use :set download-dir <path> / :set listen-port <n>",
+                    "Use :set download-dir <path> / :set listen-port <n>".to_string(),
                 );
                 return;
             }
@@ -1413,30 +1723,55 @@ impl TuiApp {
                 }
                 Err(_) => Err("listen-port must be a number".to_string()),
             },
-            "theme" => {
-                let lower = value.to_ascii_lowercase();
-                match THEMES
-                    .iter()
-                    .find(|t| format!("{t:?}").to_ascii_lowercase() == lower)
-                {
-                    Some(&theme) => {
-                        cfg.theme = theme;
-                        Ok(format!("theme = {theme:?}"))
-                    }
-                    None => Err("theme: light|dark|midnight|forest|rose".to_string()),
+            "notifications" => parse_setting_bool(value).map(|b| {
+                cfg.enable_notifications = b;
+                format!("notifications = {}", b)
+            }),
+            "notification-content" => {
+                use crate::types::NotificationContent as N;
+                match value.to_ascii_lowercase().as_str() {
+                    "full" => Ok(N::Full),
+                    "sender" | "sender-only" => Ok(N::SenderOnly),
+                    "hidden" | "none" => Ok(N::Hidden),
+                    _ => Err("notification-content is full, sender or hidden".to_string()),
                 }
+                .map(|n| {
+                    cfg.notification_content = n;
+                    format!("notification-content = {value}")
+                })
             }
-            _ => match bool_setting(cfg, key) {
-                Some(slot) => parse_setting_bool(value).map(|b| {
-                    *slot = b;
-                    format!("{key} = {b}")
-                }),
-                None => Err(format!(
-                    "Unknown setting '{}'. Keys: {}",
-                    key,
-                    settings_keys().join(", ")
-                )),
-            },
+            "typing" => parse_setting_bool(value).map(|b| {
+                cfg.enable_typing_indicators = b;
+                format!("typing = {}", b)
+            }),
+            "auto-accept" => parse_setting_bool(value).map(|b| {
+                cfg.auto_accept_files = b;
+                format!("auto-accept = {}", b)
+            }),
+            "auto-host" => parse_setting_bool(value).map(|b| {
+                cfg.auto_host_on_startup = b;
+                format!("auto-host = {}", b)
+            }),
+            "upnp" => parse_setting_bool(value).map(|b| {
+                cfg.enable_upnp = b;
+                format!("upnp = {}", b)
+            }),
+            // Real settings of the desktop app that this client has no use
+            // for: it never browses the LAN or applies a theme, and its
+            // settings live in its own data folder (TUI-19).
+            "mdns" | "theme" => Err(format!(
+                "'{key}' is a setting of the desktop app; the terminal client has no {}",
+                if key == "mdns" {
+                    "LAN discovery"
+                } else {
+                    "themes"
+                }
+            )),
+            _ => Err(format!(
+                "Unknown setting '{}'. Keys: {}",
+                key,
+                settings_keys().join(", ")
+            )),
         };
         match result {
             Ok(msg) => {
@@ -1456,10 +1791,10 @@ impl TuiApp {
     }
 
     pub fn copy_logs(&mut self) {
-        let log_text = crate::support::format_event_logs(&self.logs);
+        let log_text = crate::support::shareable_event_logs(&self.logs);
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => match clipboard.set_text(log_text) {
-                Ok(()) => self.toast(ToastLevel::Success, "Logs copied to clipboard"),
+                Ok(()) => self.toast(ToastLevel::Success, "Logs copied to clipboard".to_string()),
                 Err(e) => self.toast(ToastLevel::Error, format!("Failed to copy logs: {}", e)),
             },
             Err(e) => self.toast(ToastLevel::Error, format!("Clipboard error: {}", e)),
@@ -1513,10 +1848,17 @@ impl TuiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::overlays::TuiOverlay;
+    use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
-    fn app() -> TuiApp {
-        TuiApp::ephemeral(LogBuffer::new()).unwrap()
+    /// An app over a throwaway data directory, never the developer's own.
+    /// Hold the returned directory for as long as the app: dropping it deletes
+    /// the identity and history the app is using.
+    fn app() -> (TuiApp, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("data dir");
+        let app = TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app");
+        (app, dir)
     }
 
     fn key(c: char) -> KeyEvent {
@@ -1527,45 +1869,21 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    fn code(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
-
-    /// An app showing a fingerprint prompt for a fresh chat, optionally also
-    /// queued in the manager (the overlay normally opens from the queue).
-    fn prompting_app(queued: bool) -> (TuiApp, Uuid, mpsc::UnboundedReceiver<bool>) {
-        let mut app = app();
-        let chat_id = Uuid::new_v4();
-        app.chat_manager
-            .create_local_chat_for_test(chat_id, "Peer".into());
-        let (tx, rx) = mpsc::unbounded_channel();
-        app.chat_manager
-            .add_fingerprint_confirm_sender_for_test(chat_id, tx);
-        if queued {
-            app.chat_manager
-                .queue_fingerprint_prompt_for_test(crate::app::PendingFingerprint {
-                    fingerprint: "deadbeef".into(),
-                    peer_name: "Peer".into(),
-                    sas: String::new(),
-                    session_id: chat_id,
-                    warning: None,
-                });
-        }
-        app.overlay = TuiOverlay::FingerprintVerify {
+    fn queued_prompt(session_id: Uuid) -> crate::app::PendingFingerprint {
+        crate::app::PendingFingerprint {
             fingerprint: "deadbeef".into(),
             peer_name: "Peer".into(),
             sas: String::new(),
-            chat_id,
+            session_id,
             warning: None,
-        };
-        (app, chat_id, rx)
+        }
     }
 
     /// CRYPTO-04: the overlay must carry the prompt's warning, or a key that
     /// is not the invite's looks exactly like a first contact.
     #[test]
     fn the_fingerprint_overlay_carries_an_invite_mismatch_warning() {
-        let mut app = app();
+        let (mut app, _data) = app();
         let chat_id = Uuid::new_v4();
         app.chat_manager
             .create_local_chat_for_test(chat_id, "Peer".into());
@@ -1576,11 +1894,8 @@ mod tests {
         };
         app.chat_manager
             .queue_fingerprint_prompt_for_test(crate::app::PendingFingerprint {
-                fingerprint: "deadbeef".into(),
-                peer_name: "Peer".into(),
-                sas: String::new(),
-                session_id: chat_id,
                 warning: Some(warning.clone()),
+                ..queued_prompt(chat_id)
             });
 
         app.tick();
@@ -1598,8 +1913,27 @@ mod tests {
 
     #[test]
     fn fingerprint_accept_confirms_and_stores() {
-        let (mut app, chat_id, mut rx) = prompting_app(true);
+        let (mut app, _data) = app();
+        let chat_id = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat_id, "Peer".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.chat_manager
+            .add_fingerprint_confirm_sender_for_test(chat_id, tx);
+        // The overlay is always opened from the manager's queued prompt.
+        app.chat_manager
+            .queue_fingerprint_prompt_for_test(queued_prompt(chat_id));
+        app.overlay = TuiOverlay::FingerprintVerify {
+            fingerprint: "deadbeef".into(),
+            peer_name: "Peer".into(),
+            sas: String::new(),
+            chat_id,
+            warning: None,
+        };
+
+        // Ctrl+Y accepts.
         app.handle_key_event(ctrl('y'));
+
         assert!(rx.try_recv().unwrap());
         assert_eq!(app.overlay, TuiOverlay::None);
         assert_eq!(
@@ -1610,27 +1944,59 @@ mod tests {
 
     #[test]
     fn fingerprint_reject_declines_and_removes_chat() {
-        let (mut app, chat_id, mut rx) = prompting_app(false);
+        let (mut app, _data) = app();
+        let chat_id = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat_id, "Peer".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.chat_manager
+            .add_fingerprint_confirm_sender_for_test(chat_id, tx);
+        app.overlay = TuiOverlay::FingerprintVerify {
+            fingerprint: "deadbeef".into(),
+            peer_name: "Peer".into(),
+            sas: String::new(),
+            chat_id,
+            warning: None,
+        };
+
         app.handle_key_event(ctrl('n'));
+
         assert!(!rx.try_recv().unwrap());
         assert_eq!(app.overlay, TuiOverlay::None);
         assert!(app.chat_manager.get_chat(chat_id).is_none());
     }
 
-    /// TUI-01: plain keys must not answer the prompt — "hey" + Enter used to
-    /// trust the peer.
+    /// TUI-01: the prompt opens under whatever the user is typing, so plain
+    /// keys must answer nothing — "hey" + Enter used to trust the peer.
     #[test]
     fn typing_into_the_fingerprint_prompt_does_not_answer_it() {
-        let (mut app, chat_id, mut rx) = prompting_app(true);
+        let (mut app, _data) = app();
+        let chat_id = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat_id, "Peer".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.chat_manager
+            .add_fingerprint_confirm_sender_for_test(chat_id, tx);
+        app.chat_manager
+            .queue_fingerprint_prompt_for_test(queued_prompt(chat_id));
+        app.overlay = TuiOverlay::FingerprintVerify {
+            fingerprint: "deadbeef".into(),
+            peer_name: "Peer".into(),
+            sas: String::new(),
+            chat_id,
+            warning: None,
+        };
+
         for c in ['h', 'e', 'y', 'n'] {
             app.handle_key_event(key(c));
         }
-        app.handle_key_event(code(KeyCode::Enter));
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(rx.try_recv().is_err(), "a plain key answered the prompt");
         assert!(matches!(app.overlay, TuiOverlay::FingerprintVerify { .. }));
 
-        // Esc puts it away unanswered; it stays queued and is not re-opened.
-        app.handle_key_event(code(KeyCode::Esc));
+        // Esc puts the prompt away without answering; it stays queued and
+        // the tick does not immediately pop it back up.
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.overlay, TuiOverlay::None);
         assert!(rx.try_recv().is_err());
         assert!(app.chat_manager.pending_fingerprint().is_some());
@@ -1639,17 +2005,19 @@ mod tests {
         assert!(app.chat_manager.get_chat(chat_id).is_some());
     }
 
-    /// TUI-03: a pasted newline is not Enter.
+    /// TUI-03: a pasted newline is not Enter. Pasting a block that happened
+    /// to contain ":clear-history\n" used to run it.
     #[test]
     fn a_paste_is_text_never_keystrokes() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.handle_paste(":clear-history\ny\n");
         assert_eq!(app.overlay, TuiOverlay::None);
         assert_eq!(app.mode, TuiMode::Normal);
         assert_eq!(app.input_field.text(), ":clear-history\ny\n");
 
-        // In command mode a multi-line paste becomes one line, not executed.
-        let mut app = self::app();
+        // In command mode a multi-line paste collapses to one line and is
+        // still not executed.
+        let (mut app, _data) = self::app();
         app.enter_command_mode();
         app.handle_paste("quit\nnow");
         assert_eq!(app.mode, TuiMode::Command);
@@ -1657,37 +2025,546 @@ mod tests {
         assert_eq!(app.command_field.text(), "quit now");
     }
 
-    /// The test app never touches a real profile: a fresh, unencrypted
-    /// identity, and paths in a directory that does not exist. `with_data_dir`
-    /// is what reads a profile, and it reads the one it is given.
-    #[test]
-    fn the_test_app_does_not_read_a_real_profile() {
-        let app = app();
-        assert!(!app.identity.is_encrypted());
-        assert!(app.chat_manager.history_load_error.is_none());
-        assert!(!app.history_path.parent().unwrap().exists());
+    /// TUI-16: with two communities joined, choosing one in the pane did not
+    /// change which one `:party-post` and the rest acted on — they went to
+    /// whichever was joined last. The community on screen is the one written to.
+    #[tokio::test]
+    async fn posting_goes_to_the_community_on_screen() {
+        use messenger_core::party::PartyRequest;
+        let (mut app, _data) = app();
+        let (_a, _, mut a_out, _a_keep) = app.party_manager.add_joined_server_for_test("a:1");
+        let (_b, _, mut b_out, _b_keep) = app.party_manager.add_joined_server_for_test("b:1");
+        let ids = app.party_manager.server_ids();
+        app.current_party = Some(ids[0]);
+        app.execute_command(TuiCommand::PartyPane).await;
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut identity = Identity::new_with_plaintext("Saved".into()).unwrap();
-        identity.encrypt(&format!("pw-{}", Uuid::new_v4())).unwrap();
-        identity.save(&dir.path().join("identity.json")).unwrap();
-        let app = TuiApp::with_data_dir(LogBuffer::new(), dir.path()).unwrap();
-        assert!(app.identity.is_encrypted());
-        assert_eq!(app.identity_path, dir.path().join("identity.json"));
-        assert_eq!(app.history_path, dir.path().join("history.json.enc"));
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.current_party,
+            Some(ids[1]),
+            "the pane moved, the target did not"
+        );
+        app.execute_command(TuiCommand::PartyPost("for the second".into()))
+            .await;
+
+        let (first, second) = if ids[1] == _b {
+            (&mut a_out, &mut b_out)
+        } else {
+            (&mut b_out, &mut a_out)
+        };
+        let posted = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<PartyRequest>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| matches!(r, PartyRequest::PostMessage { ref text, .. } if text == "for the second"))
+        };
+        assert!(
+            posted(second),
+            "the post did not reach the community on screen"
+        );
+        assert!(!posted(first), "the post went to the other community");
     }
 
-    /// TUI-04 / JOURNEY-02: the first-run password prompt cannot be dismissed.
+    /// The governance commands, typed as a user types them, against a joined
+    /// community: each names its target by what is on screen (a username, a
+    /// `#channel`, part of a file name) and must send the request for *that*
+    /// id — or, when nothing matches, say so and send nothing.
+    #[tokio::test]
+    async fn governance_commands_send_the_request_for_what_they_name() {
+        use messenger_core::party::{
+            ChannelKind, FileEntry, FilePermissions, MemberInfo, PartyRequest, Role,
+        };
+        let (mut app, _data) = app();
+        let (server, general, mut out, _keep) = app.party_manager.add_joined_server_for_test("a:1");
+        app.current_party = Some(server);
+        let bob = Uuid::new_v4();
+        let carol = Uuid::new_v4();
+        let conn = app.party_manager.server_mut_for_test(server).unwrap();
+        for (id, name) in [(bob, "Bob"), (carol, "carol")] {
+            conn.members.push(MemberInfo {
+                id,
+                username: name.into(),
+                online: true,
+                role: Role::Member,
+            });
+        }
+        conn.files.push(FileEntry {
+            hash: "deadbeef".repeat(8),
+            name: "Minutes.pdf".into(),
+            size: 10,
+            mime: "application/pdf".into(),
+            uploader: bob,
+            uploader_name: "Bob".into(),
+            location: general,
+            location_name: "#general".into(),
+            is_dm: false,
+            shared_at: 0,
+            can_delete: true,
+            perms: FilePermissions::default(),
+        });
+
+        let run = |line: &'static str| {
+            let cmd = TuiApp::parse_command(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+            (cmd, line)
+        };
+        let mut sent = Vec::new();
+        for (cmd, _) in [
+            run("party-role bob ADMIN"),
+            run("party-channel-access #General private carol nobody"),
+            run("party-delete-file minutes"),
+            run("party-delete-channel #general"),
+            run("party-files"),
+            run("party-audit"),
+        ] {
+            app.execute_command(cmd).await;
+            sent.extend(std::iter::from_fn(|| out.try_recv().ok()));
+        }
+        let expected = vec![
+            PartyRequest::SetRole {
+                member: bob,
+                role: Role::Admin,
+            },
+            // A name that matches no member is dropped, not sent as a guess.
+            PartyRequest::SetChannelAccess {
+                channel: general,
+                kind: ChannelKind::Private,
+                members: vec![carol],
+            },
+            PartyRequest::DeleteFile {
+                hash: "deadbeef".repeat(8),
+                channel: general,
+            },
+            PartyRequest::DeleteChannel { channel: general },
+            PartyRequest::ListFiles,
+            PartyRequest::FetchQuota,
+            PartyRequest::FetchAuditLog { limit: 50 },
+        ];
+        assert_eq!(format!("{sent:?}"), format!("{expected:?}"));
+
+        // Nothing matches: a toast that names the problem, and no request.
+        for (line, says) in [
+            ("party-role mallory admin", "No member called 'mallory'"),
+            ("party-role bob owner", "Unknown role 'owner'"),
+            (
+                "party-channel-access #nowhere public",
+                "No channel called '#nowhere'",
+            ),
+            (
+                "party-channel-access #general secret",
+                "Unknown kind 'secret'",
+            ),
+            (
+                "party-delete-file budget",
+                "No shared file matches 'budget'",
+            ),
+            (
+                "party-delete-channel #nowhere",
+                "No channel called '#nowhere'",
+            ),
+        ] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+            assert!(
+                last_toast(&app).contains(says),
+                "{line}: {}",
+                last_toast(&app)
+            );
+            assert!(out.try_recv().is_err(), "{line} sent a request anyway");
+        }
+
+        // With no community joined, every one of them says how to join one.
+        app.current_party = None;
+        for line in [
+            "party-files",
+            "party-audit",
+            "party-delete-file x",
+            "party-role bob admin",
+            "party-channel-access #general public",
+            "party-delete-channel #general",
+        ] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+            assert!(
+                last_toast(&app).contains(":party-connect"),
+                "{line}: {}",
+                last_toast(&app)
+            );
+        }
+        assert!(out.try_recv().is_err());
+    }
+
+    /// The everyday community commands, typed: a DM by `#N` or by name (any
+    /// case), a channel created, a file shared into the first channel with its
+    /// own name and type, and moving the pane's selection onto a DM thread
+    /// fetches that thread's history. What names nothing says so and sends
+    /// nothing.
+    #[tokio::test]
+    async fn messaging_commands_reach_the_member_channel_and_thread_they_name() {
+        use messenger_core::party::{MemberInfo, PartyRequest, Role};
+        let (mut app, data) = app();
+        let (server, general, mut out, _keep) = app.party_manager.add_joined_server_for_test("a:1");
+        app.current_party = Some(server);
+        let bob = Uuid::new_v4();
+        app.party_manager
+            .server_mut_for_test(server)
+            .unwrap()
+            .members
+            .push(MemberInfo {
+                id: bob,
+                username: "Bob".into(),
+                online: true,
+                role: Role::Member,
+            });
+        let shared = data.path().join("notes.txt");
+        std::fs::write(&shared, b"agenda").unwrap();
+        let drain = |out: &mut tokio::sync::mpsc::UnboundedReceiver<PartyRequest>| {
+            std::iter::from_fn(|| out.try_recv().ok()).collect::<Vec<_>>()
+        };
+
+        for line in ["party-dm #1 by number", "party-dm bob by name"] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+        }
+        app.execute_command(TuiApp::parse_command("party-create-channel ops").unwrap())
+            .await;
+        assert!(last_toast(&app).contains("Creating channel 'ops'"));
+        app.execute_command(TuiCommand::PartySendFile(shared.display().to_string()))
+            .await;
+        assert!(
+            last_toast(&app).contains("Sharing 'notes.txt'"),
+            "{}",
+            last_toast(&app)
+        );
+        let sent = drain(&mut out);
+        assert!(
+            matches!(&sent[..], [
+                PartyRequest::SendDm { to: a, text: t1 },
+                PartyRequest::SendDm { to: b, text: t2 },
+                PartyRequest::CreateChannel { name },
+                PartyRequest::PostFile { channel, name: file, mime, data },
+            ] if *a == bob && *b == bob && t1 == "by number" && t2 == "by name"
+                && name == "ops" && *channel == general && file == "notes.txt"
+                && mime == "text/plain" && data == b"agenda"),
+            "{sent:?}"
+        );
+
+        for (line, says) in [
+            ("party-dm #2 nobody there", "No member '#2'"),
+            ("party-dm mallory hi", "No member 'mallory'"),
+        ] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+            assert!(
+                last_toast(&app).contains(says),
+                "{line}: {}",
+                last_toast(&app)
+            );
+        }
+        app.execute_command(TuiCommand::PartySendFile("/no/such/file.txt".into()))
+            .await;
+        assert!(
+            last_toast(&app).starts_with("Could not share"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(
+            drain(&mut out).is_empty(),
+            "a refused command sent something"
+        );
+
+        // Pane: #general, then the DM thread with Bob. Moving onto it asks
+        // for its history; moving back to the channel asks for nothing.
+        app.execute_command(TuiCommand::PartyPane).await;
+        // Opening the pane refreshes the Drive listing; that is not the thread.
+        let _ = drain(&mut out);
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let opened = drain(&mut out);
+        assert!(
+            matches!(&opened[..], [PartyRequest::FetchDmHistory { with, .. }] if *with == bob),
+            "opening the DM thread did not fetch it: {opened:?}"
+        );
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(drain(&mut out).is_empty());
+    }
+
+    /// TUI-17: the TUI pinned no community, so every join was a first contact
+    /// and `:party-trust` became a reflex. A join that completes pins the
+    /// server's fingerprint; a later join to that address is held to it — a
+    /// different key is refused with nothing sent and no prompt to wave through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_joined_community_is_pinned_and_held_to_its_key() {
+        use crate::app::saved_parties::{load_saved_parties, save_saved_parties, SavedParty};
+        use messenger_server::state::PartyState;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            PartyState::load("Pinned", None, server_dir.path()).unwrap(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let key = crate::core::generate_rsa_keypair(crate::RSA_KEY_BITS).unwrap();
+        tokio::spawn(messenger_server::run_accept_loop(
+            listener,
+            state.clone(),
+            Arc::new(key),
+            Arc::new(messenger_server::hub::Hub::new()),
+        ));
+        let (mut app, _data) = app();
+        let parties = app.parties_path();
+        let tick_until = |label: &'static str| {
+            move |app: &mut TuiApp, done: &dyn Fn(&TuiApp) -> bool| {
+                let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                while !done(app) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "[{label}] timed out: {}",
+                        last_toast(app)
+                    );
+                    app.tick();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+
+        // A pin that is not this server's key: refused, nothing sent.
+        save_saved_parties(
+            &parties,
+            &[SavedParty {
+                address: address.clone(),
+                username: "tui".into(),
+                name: String::new(),
+                fingerprint: "00".repeat(32),
+            }],
+        );
+        app.execute_command(TuiCommand::PartyConnect {
+            address: address.clone(),
+            username: "tui".into(),
+            password: None,
+        })
+        .await;
+        tick_until("refused")(&mut app, &|a| a.party_dial.is_none());
+        assert!(
+            last_toast(&app).contains("SECURITY"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(
+            app.pending_party_join.is_none(),
+            "offered to trust a key that does not match the pin"
+        );
+        assert!(
+            state.lock().await.members().is_empty(),
+            "credentials sent to the wrong key"
+        );
+
+        // No pin: the two-step join, and the pin is written once joined.
+        std::fs::remove_file(&parties).unwrap();
+        app.execute_command(TuiCommand::PartyConnect {
+            address: address.clone(),
+            username: "tui".into(),
+            password: None,
+        })
+        .await;
+        tick_until("verify")(&mut app, &|a| a.pending_party_join.is_some());
+        app.execute_command(TuiCommand::PartyTrust).await;
+        tick_until("pinned")(&mut app, &|a| {
+            load_saved_parties(&a.parties_path()).is_ok_and(|l| !l.is_empty())
+        });
+        let saved = load_saved_parties(&parties).unwrap();
+        let sid = app.current_party.unwrap();
+        assert_eq!(
+            saved[0].fingerprint,
+            app.party_manager.server(sid).unwrap().server_fingerprint
+        );
+    }
+
+    /// TUI-15: `:delete` removes a conversation's history for good, so it
+    /// asks first; anything but `y`/Enter keeps it.
+    #[tokio::test]
+    async fn deleting_a_conversation_asks_first() {
+        let (mut app, _data) = app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        app.tick();
+        app.execute_command(TuiCommand::DeleteChat).await;
+        assert_eq!(app.overlay, TuiOverlay::ConfirmDeleteChat { chat_id: chat });
+        app.handle_key_event(key('n'));
+        assert!(
+            app.chat_manager.chats.contains_key(&chat),
+            "deleted without a yes"
+        );
+        assert_eq!(app.overlay, TuiOverlay::None);
+
+        app.execute_command(TuiCommand::DeleteChat).await;
+        app.handle_key_event(key('y'));
+        assert!(!app.chat_manager.chats.contains_key(&chat));
+
+        // `:disconnect` on a conversation with no session deletes nothing.
+        let other = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(other, "Other".into());
+        app.tick();
+        app.execute_command(TuiCommand::Disconnect).await;
+        assert!(
+            app.chat_manager.chats.contains_key(&other),
+            ":disconnect deleted a conversation"
+        );
+    }
+
+    /// TUI-18: the open conversation was marked read on every tick, so a
+    /// message that arrived while the user was away was read — and saved as
+    /// read — before anyone saw it. Away, it stays unread; back, it is read.
     #[test]
-    fn the_first_run_password_prompt_cannot_be_dismissed() {
-        let mut app = app();
+    fn a_message_that_arrives_while_away_stays_unread() {
+        let (mut app, _data) = app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        app.tick();
+        assert_eq!(app.selected_chat_id(), Some(chat));
+        app.chat_manager.get_chat_mut(chat).unwrap().messages.push(
+            messenger_core::types::Message {
+                id: Uuid::new_v4(),
+                from_me: false,
+                content: messenger_core::types::MessageContent::Text { text: "hi".into() },
+                timestamp: chrono::Utc::now(),
+                delivered: false,
+            },
+        );
+
+        app.last_interaction = Some(Instant::now() - PRESENCE_IDLE - Duration::from_secs(1));
+        app.tick();
+        assert_eq!(
+            app.chat_manager.unread_count(chat),
+            1,
+            "read while nobody was there"
+        );
+
+        app.last_interaction = Some(Instant::now());
+        app.tick();
+        assert_eq!(app.chat_manager.unread_count(chat), 0);
+    }
+
+    /// TUI-23: after `:host 9000`, `:invite` embedded the *configured* port
+    /// (12345), so the link it copied pointed where nobody was listening. It
+    /// uses the port actually hosted.
+    #[tokio::test]
+    async fn an_invite_names_the_port_being_hosted() {
+        let (mut app, _data) = app();
+        if crate::util::primary_local_ipv4().is_none() {
+            return; // no LAN address to embed on this machine
+        }
+        app.chat_manager.config.listen_port = 12345;
+        app.chat_manager.hosting_port = Some(40999);
+        app.execute_command(TuiCommand::Invite(None)).await;
+        let TuiOverlay::Invite { link } = &app.overlay else {
+            panic!("no invite: {}", last_toast(&app));
+        };
+        let contact = app.chat_manager.parse_invite_link(link).unwrap();
+        let addrs = format!("{:?} {:?}", contact.address, contact.addresses);
+        assert!(addrs.contains(":40999"), "{addrs}");
+        assert!(!addrs.contains(":12345"), "{addrs}");
+    }
+
+    /// TUI-12: a new password was typed once, so a typo became the password
+    /// of the only key to the history. It is typed twice; a mismatch sets
+    /// nothing, and one below the floor is refused at the first entry.
+    #[test]
+    fn a_new_password_must_be_typed_twice() {
+        let (mut app, _data) = app();
         assert!(!app.identity.is_encrypted());
-        let set = TuiOverlay::Password {
+        app.overlay = TuiOverlay::Password {
             mode: PasswordMode::Set,
         };
-        app.overlay = set.clone();
-        app.handle_key_event(code(KeyCode::Esc));
-        assert_eq!(app.overlay, set);
+        let enter = |app: &mut TuiApp, text: &str| {
+            for c in text.chars() {
+                app.handle_key_event(key(c));
+            }
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+
+        enter(&mut app, "short");
+        assert!(
+            last_toast(&app).contains("at least"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(app.new_password_first.is_none());
+
+        enter(&mut app, "first long password");
+        enter(&mut app, "first long passwerd");
+        assert!(
+            !app.identity.is_encrypted(),
+            "a mistyped confirmation set the password"
+        );
+        assert!(
+            last_toast(&app).contains("did not match"),
+            "{}",
+            last_toast(&app)
+        );
+
+        enter(&mut app, "the real password");
+        enter(&mut app, "the real password");
+        assert!(app.identity.is_encrypted(), "{}", last_toast(&app));
+        assert!(app.new_password_first.is_none());
+    }
+
+    /// TUI-03: `:set-password` re-encrypted an identity that already had a
+    /// password without asking for it, so anyone at an unlocked terminal
+    /// could replace it. It is refused now; `:change-password` needs the
+    /// current one.
+    #[tokio::test]
+    async fn set_password_will_not_replace_a_password_it_was_not_given() {
+        let (mut app, _data) = app();
+        let current = format!("pw-{}", Uuid::new_v4());
+        let intruder = format!("pw-{}", Uuid::new_v4());
+        app.identity.encrypt(&current).unwrap();
+        app.identity.save(&app.identity_path).unwrap();
+
+        app.execute_command(TuiCommand::SetPassword(intruder.clone()))
+            .await;
+        assert!(
+            last_toast(&app).contains(":change-password"),
+            "{}",
+            last_toast(&app)
+        );
+        let on_disk = Identity::load(&app.identity_path).unwrap();
+        assert!(
+            on_disk.clone().decrypt(&current).is_ok(),
+            "the password was changed"
+        );
+        assert!(on_disk.clone().decrypt(&intruder).is_err());
+
+        // The way that is allowed: knowing the current one.
+        app.execute_command(TuiCommand::ChangePassword {
+            current: intruder.clone(),
+            new: format!("pw-{}", Uuid::new_v4()),
+        })
+        .await;
+        assert!(Identity::load(&app.identity_path)
+            .unwrap()
+            .decrypt(&current)
+            .is_ok());
+    }
+
+    /// TUI-04 / JOURNEY-02: the first-run password prompt cannot be waved
+    /// away, because nothing — not the identity, not the history — can be
+    /// saved without it.
+    #[test]
+    fn the_first_run_password_prompt_cannot_be_dismissed() {
+        let (mut app, _data) = app();
+        assert!(!app.identity.is_encrypted());
+        app.overlay = TuiOverlay::Password {
+            mode: PasswordMode::Set,
+        };
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.overlay,
+            TuiOverlay::Password {
+                mode: PasswordMode::Set
+            }
+        );
         assert!(!app.should_quit);
         app.handle_key_event(ctrl('q'));
         assert!(app.should_quit);
@@ -1695,12 +2572,634 @@ mod tests {
 
     /// JOURNEY-03: `:wipe` checks the password, asks once more (Ctrl+Y only),
     /// then deletes everything and quits.
+    fn last_toast(app: &TuiApp) -> String {
+        app.chat_manager
+            .toasts
+            .last()
+            .map(|t| t.message.clone())
+            .unwrap_or_default()
+    }
+
+    /// The contact commands act on the contact the user named — by list
+    /// position or by name, case-insensitively — and refuse an address no
+    /// socket could dial rather than saving a contact that can never connect.
+    #[tokio::test]
+    async fn contact_commands_add_rename_and_remove_what_was_named() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::ContactAdd {
+            name: "Bad".into(),
+            address: "not-an-address".into(),
+            fingerprint: None,
+        })
+        .await;
+        assert!(
+            app.chat_manager.contacts.is_empty(),
+            "an undialable contact was saved"
+        );
+        assert!(last_toast(&app).contains("Bad address"));
+
+        app.execute_command(TuiCommand::ContactAdd {
+            name: "Alice".into(),
+            address: "10.0.0.2:12345".into(),
+            fingerprint: None,
+        })
+        .await;
+        app.execute_command(TuiCommand::ContactRename {
+            target: "ALICE".into(),
+            new_name: "A".repeat(80),
+        })
+        .await;
+        let name = &app.chat_manager.contacts.values().next().unwrap().name;
+        assert_eq!(
+            name.chars().count(),
+            50,
+            "a rename is capped at 50 characters"
+        );
+
+        app.execute_command(TuiCommand::ContactRemove("2".into()))
+            .await;
+        assert_eq!(
+            app.chat_manager.contacts.len(),
+            1,
+            "removed by an index that does not exist"
+        );
+        assert!(last_toast(&app).contains("No contact"));
+        app.execute_command(TuiCommand::ContactRemove("1".into()))
+            .await;
+        assert!(app.chat_manager.contacts.is_empty());
+    }
+
+    /// `:import` adds a contact from someone else's invite and refuses the
+    /// user's own — that would add the user to their own contacts.
+    #[tokio::test]
+    async fn import_takes_a_peers_invite_and_refuses_your_own() {
+        let (mut app, _data) = app();
+        let mine = app
+            .identity
+            .generate_signed_invite_link_with_addresses(vec!["10.0.0.1:12345".into()], None, None)
+            .unwrap();
+        app.execute_command(TuiCommand::Import(mine)).await;
+        assert!(
+            app.chat_manager.contacts.is_empty(),
+            "the user's own invite was imported"
+        );
+
+        let peer = Identity::new_with_plaintext("Peer".into()).unwrap();
+        let theirs = peer
+            .generate_signed_invite_link_with_addresses(vec!["10.0.0.9:12345".into()], None, None)
+            .unwrap();
+        app.execute_command(TuiCommand::Import(theirs)).await;
+        let contact = app.chat_manager.contacts.values().next().expect("imported");
+        assert_eq!(
+            contact.fingerprint.as_deref(),
+            Some(peer.fingerprint.as_str())
+        );
+        assert_eq!(contact.trust_state, crate::types::TrustState::Unverified);
+
+        app.execute_command(TuiCommand::Import("garbage".into()))
+            .await;
+        assert_eq!(app.chat_manager.contacts.len(), 1);
+        assert!(last_toast(&app).contains("Import failed"));
+    }
+
+    /// `:backup` never copies a plaintext identity — the copy would be the raw
+    /// private key — and copies an encrypted one byte for byte.
+    #[tokio::test]
+    async fn backup_refuses_a_plaintext_identity_and_copies_an_encrypted_one() {
+        let (mut app, data) = app();
+        let dest = data.path().join("backup.json");
+        assert!(!app.identity.is_encrypted());
+        app.execute_command(TuiCommand::Backup(dest.display().to_string()))
+            .await;
+        assert!(!dest.exists(), "a plaintext private key was exported");
+
+        let password = format!("pw-{}", Uuid::new_v4());
+        app.identity.encrypt(&password).unwrap();
+        app.identity.save(&app.identity_path).unwrap();
+        app.execute_command(TuiCommand::Backup(dest.display().to_string()))
+            .await;
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&app.identity_path).unwrap()
+        );
+    }
+
+    /// `:name` validates, and a valid name is written to the identity file —
+    /// not only to the copy the overlay renders.
+    #[tokio::test]
+    async fn name_is_validated_and_persisted() {
+        let (mut app, _data) = app();
+        // A saved identity always has a password: `save` refuses a plaintext key.
+        app.identity
+            .encrypt(&format!("pw-{}", Uuid::new_v4()))
+            .unwrap();
+        app.identity.save(&app.identity_path).unwrap();
+        let before = app.identity.name.clone();
+        app.execute_command(TuiCommand::Name("   ".into())).await;
+        assert_eq!(app.identity.name, before);
+        assert!(last_toast(&app).contains("Invalid name"));
+
+        app.execute_command(TuiCommand::Name("Zoë".into())).await;
+        assert_eq!(app.identity_name, "Zoë");
+        assert_eq!(Identity::load(&app.identity_path).unwrap().name, "Zoë");
+    }
+
+    /// `:accept`/`:decline` act on the offer in the selected conversation
+    /// first, and say so when there is none.
+    #[tokio::test]
+    async fn file_offer_commands_prefer_the_selected_conversation() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::AcceptFile).await;
+        assert!(last_toast(&app).contains("No incoming file"));
+
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b] {
+            app.chat_manager
+                .create_local_chat_for_test(id, "Peer".into());
+        }
+        let offer_a = app
+            .chat_manager
+            .start_receiving_file(a, "a.bin", 10)
+            .unwrap();
+        let offer_b = app
+            .chat_manager
+            .start_receiving_file(b, "b.bin", 10)
+            .unwrap();
+        app.sync_chat_ids();
+        app.select_chat(b);
+        app.execute_command(TuiCommand::DeclineFile).await;
+        let held = |id: Uuid| {
+            app.chat_manager
+                .active_transfers_snapshot()
+                .iter()
+                .any(|t| t.id == id && t.status == crate::types::TransferStatus::AwaitingAcceptance)
+        };
+        assert!(held(offer_a), "the offer in another chat was declined");
+        assert!(!held(offer_b), "the selected chat's offer is still held");
+    }
+
+    /// Commands that need a selected conversation say so instead of acting
+    /// on some other one; `:history-reset` with a healthy history does nothing.
+    #[tokio::test]
+    async fn chat_commands_without_a_selection_or_a_problem_do_nothing() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::Rename("New".into())).await;
+        assert!(last_toast(&app).contains("No chat selected"));
+        app.execute_command(TuiCommand::Send("/etc/hostname".into()))
+            .await;
+        assert!(last_toast(&app).contains("No chat selected"));
+        app.execute_command(TuiCommand::HistoryReset).await;
+        assert!(last_toast(&app).contains("nothing to reset"));
+        assert!(!app.history_path.with_extension("unreadable").exists());
+    }
+
+    /// The connection commands between two terminal clients, as users type
+    /// them: `:host` on an OS-chosen port (the toast must name the port that
+    /// was bound, not the 0 that was asked for), `:connect`, both safety-code
+    /// prompts answered with Ctrl+Y, a message typed and sent; then the same
+    /// through a relay with `:host-relay` / `:connect-relay`; and the
+    /// `:connection-password` / `:lock` switches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_connection_commands_work_end_to_end() {
+        async fn tick_both(
+            a: &mut TuiApp,
+            b: &mut TuiApp,
+            label: &str,
+            mut done: impl FnMut(&TuiApp, &TuiApp) -> bool,
+        ) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                a.tick();
+                b.tick();
+                if done(a, b) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "[{label}] timed out");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        let prompted = |a: &TuiApp| matches!(a.overlay, TuiOverlay::FingerprintVerify { .. });
+        let texts = |a: &TuiApp| -> Vec<String> {
+            a.chat_manager
+                .chats
+                .values()
+                .flat_map(|c| c.messages.iter())
+                .filter_map(|m| match &m.content {
+                    crate::types::MessageContent::Text { text } if !m.from_me => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let (mut host, _host_data) = app();
+        let (mut client, _client_data) = app();
+        host.chat_manager.config.enable_typing_indicators = false;
+        client.chat_manager.config.enable_typing_indicators = false;
+
+        // Direct.
+        host.execute_command(TuiCommand::Host(Some(0))).await;
+        let port = host.chat_manager.hosting_port.expect("hosting");
+        assert!(
+            last_toast(&host).contains(&format!(":{port}")),
+            "the toast must name the bound port: {}",
+            last_toast(&host)
+        );
+        client
+            .execute_command(TuiCommand::Connect {
+                host: "127.0.0.1".into(),
+                port,
+            })
+            .await;
+        tick_both(&mut host, &mut client, "both prompted", |h, c| {
+            prompted(h) && prompted(c)
+        })
+        .await;
+        host.handle_key_event(ctrl('y'));
+        client.handle_key_event(ctrl('y'));
+        let chat = client
+            .selected_chat_id()
+            .expect("the dialled chat is selected");
+        tick_both(&mut host, &mut client, "connected", |_, c| {
+            c.chat_manager.is_connected(&chat)
+        })
+        .await;
+        client.focus = TuiFocus::Input;
+        for ch in "hi host".chars() {
+            client.handle_key_event(key(ch));
+        }
+        client.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        tick_both(&mut host, &mut client, "message", |h, _| {
+            texts(h) == ["hi host"]
+        })
+        .await;
+
+        // Through a relay.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = listener.local_addr().unwrap().to_string();
+        tokio::spawn(crate::network::serve_relay(
+            listener,
+            std::time::Duration::from_secs(60),
+        ));
+        let (mut rhost, _d1) = app();
+        let (mut rclient, _d2) = app();
+        rhost
+            .execute_command(TuiCommand::HostRelay {
+                relay: relay.clone(),
+                token: None,
+            })
+            .await;
+        let token = match &rhost.overlay {
+            TuiOverlay::Invite { link } => {
+                assert!(link.starts_with("chat-p2p://invite/"), "{link}");
+                last_toast(&rhost)
+                    .split("token ")
+                    .nth(1)
+                    .map(|t| t.trim_end_matches(')').to_string())
+                    .expect("the toast names the token")
+            }
+            other => panic!("no invite shown: {other:?}"),
+        };
+        rhost.overlay = TuiOverlay::None;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        rclient
+            .execute_command(TuiCommand::ConnectRelay {
+                relay: relay.clone(),
+                token,
+            })
+            .await;
+        tick_both(&mut rhost, &mut rclient, "relay prompts", |h, c| {
+            prompted(h) && prompted(c)
+        })
+        .await;
+
+        // The switches.
+        let (mut app, _d) = app();
+        app.execute_command(TuiCommand::ConnectionPassword(Some(
+            "pw-long-enough".into(),
+        )))
+        .await;
+        assert!(app.chat_manager.has_connection_password());
+        app.execute_command(TuiCommand::ConnectionPassword(None))
+            .await;
+        assert!(!app.chat_manager.has_connection_password());
+        app.execute_command(TuiCommand::Host(Some(0))).await;
+        app.execute_command(TuiCommand::Lock(true)).await;
+        assert!(app.chat_manager.is_conversation_locked());
+        assert!(!app.chat_manager.is_hosting, "locking must stop hosting");
+        app.execute_command(TuiCommand::Lock(false)).await;
+        assert!(!app.chat_manager.is_conversation_locked());
+    }
+
+    /// A diagnostics bundle goes to whoever the user sends it to. It carries
+    /// what support needs — versions, paths, counts, settings — and none of
+    /// what the app holds in trust: no message text, no peer fingerprint, no
+    /// connection password, no private key, and only a prefix of the user's
+    /// own fingerprint. It lands in the app's own data directory.
+    #[tokio::test]
+    async fn the_diagnostics_bundle_carries_no_secrets() {
+        let (mut app, data) = app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        let peer_fp = "cd".repeat(32);
+        let chat_ref = app.chat_manager.get_chat_mut(chat).unwrap();
+        chat_ref.peer_fingerprint = Some(peer_fp.clone());
+        chat_ref.messages.push(crate::types::Message {
+            id: Uuid::new_v4(),
+            from_me: false,
+            content: crate::types::MessageContent::Text {
+                text: "the secret text".into(),
+            },
+            timestamp: chrono::Utc::now(),
+            delivered: true,
+        });
+        app.chat_manager
+            .set_connection_password(Some("hunter2-connection-secret".into()));
+        let private_key = {
+            use rsa::pkcs8::EncodePrivateKey;
+            app.identity
+                .private_key()
+                .unwrap()
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+                .to_string()
+        };
+
+        app.execute_command(TuiCommand::Diagnostics).await;
+        let bundles: Vec<_> = std::fs::read_dir(data.path().join("diagnostics"))
+            .expect("the bundle is in the app's own data directory")
+            .flatten()
+            .collect();
+        assert_eq!(bundles.len(), 1);
+        let mut everything = String::new();
+        for file in std::fs::read_dir(bundles[0].path()).unwrap().flatten() {
+            everything.push_str(&std::fs::read_to_string(file.path()).unwrap());
+        }
+        let report: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundles[0].path().join("diagnostics.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["chats"], 1);
+        assert_eq!(
+            report["identity_fingerprint_prefix"]
+                .as_str()
+                .unwrap()
+                .len(),
+            16
+        );
+        for (i, secret) in [
+            "the secret text",
+            peer_fp.as_str(),
+            app.identity.fingerprint.as_str(),
+            "hunter2-connection-secret",
+            "PRIVATE KEY",
+            private_key.lines().nth(1).unwrap(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Which one, never the value: a failure must not print a secret.
+            assert!(
+                !everything.contains(secret),
+                "the bundle leaked secret #{}",
+                i + 1
+            );
+        }
+    }
+
+    /// The Communities commands end to end, as a terminal user drives them:
+    /// a real community server in process, the real command executors, and
+    /// `tick` as the UI loop. The user joins as the owner (claim token in the
+    /// password field) so governance runs rather than only being refused; a
+    /// second member joins through the library to be the target of a DM and a
+    /// role change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_party_commands_work_end_to_end() {
+        use messenger_core::party::{MessagePayload, Role};
+        use messenger_server::state::PartyState;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let state = PartyState::load("TUI Community", None, server_dir.path()).unwrap();
+        let claim = state.owner_claim_token().unwrap().to_owned();
+        let state = Arc::new(Mutex::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let key = crate::core::generate_rsa_keypair(crate::RSA_KEY_BITS).unwrap();
+        tokio::spawn(messenger_server::run_accept_loop(
+            listener,
+            state.clone(),
+            Arc::new(key),
+            Arc::new(messenger_server::hub::Hub::new()),
+        ));
+
+        let (mut app, data) = app();
+        app.chat_manager.config.download_dir = data.path().join("downloads");
+        std::fs::create_dir_all(&app.chat_manager.config.download_dir).unwrap();
+        async fn tick_until(app: &mut TuiApp, label: &str, mut done: impl FnMut(&TuiApp) -> bool) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                app.tick();
+                if done(app) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "[{label}] timed out");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        let members = |state: &Arc<Mutex<PartyState>>| {
+            let state = state.clone();
+            async move { state.lock().await.members() }
+        };
+
+        // Commands that need a community say so before one is joined.
+        app.execute_command(TuiCommand::PartyPost("early".into()))
+            .await;
+        assert!(last_toast(&app).contains("No Party server joined"));
+        app.execute_command(TuiCommand::PartyTrust).await;
+        assert!(last_toast(&app).contains("No community server is waiting"));
+
+        // Step one: the fingerprint, and nothing sent.
+        app.execute_command(TuiCommand::PartyConnect {
+            address: address.clone(),
+            username: "tui".into(),
+            password: Some(claim),
+        })
+        .await;
+        tick_until(&mut app, "verify prompt", |a| {
+            a.pending_party_join.is_some()
+        })
+        .await;
+        assert!(last_toast(&app).contains("Nothing has been sent yet"));
+        assert!(
+            members(&state).await.is_empty(),
+            "credentials moved before :party-trust"
+        );
+
+        // Step two: join with exactly the verified fingerprint.
+        app.execute_command(TuiCommand::PartyTrust).await;
+        tick_until(&mut app, "joined", |a| {
+            a.current_party
+                .and_then(|id| a.party_manager.server(id))
+                .is_some_and(|s| s.member_id.is_some() && !s.channels.is_empty())
+        })
+        .await;
+        let sid = app.current_party.unwrap();
+        assert_eq!(app.party_manager.my_role(sid), Some(Role::Owner));
+
+        // A second member, for the DM and the role change.
+        let mut other = crate::app::party_manager::PartyManager::new();
+        let other_key = crate::core::generate_rsa_keypair(crate::RSA_KEY_BITS).unwrap();
+        let fp = app
+            .party_manager
+            .server(sid)
+            .unwrap()
+            .server_fingerprint
+            .clone();
+        other
+            .connect_and_join(&address, "nova", None, &other_key, Some(&fp))
+            .await
+            .unwrap();
+        tick_until(&mut app, "nova listed", |a| {
+            a.party_manager
+                .server(sid)
+                .is_some_and(|s| s.members.len() == 2)
+        })
+        .await;
+
+        app.execute_command(TuiCommand::PartyCreateChannel("ops".into()))
+            .await;
+        tick_until(&mut app, "channel", |a| {
+            a.party_manager
+                .server(sid)
+                .is_some_and(|s| s.channels.iter().any(|c| c.name == "ops"))
+        })
+        .await;
+
+        app.execute_command(TuiCommand::PartyPost("hello from the terminal".into()))
+            .await;
+        app.execute_command(TuiCommand::PartyDm {
+            target: "nova".into(),
+            text: "psst".into(),
+        })
+        .await;
+        app.execute_command(TuiCommand::PartyDm {
+            target: "nobody".into(),
+            text: "x".into(),
+        })
+        .await;
+        assert!(last_toast(&app).contains("No member 'nobody'"));
+
+        let shared = data.path().join("notes.txt");
+        std::fs::write(&shared, b"shared through the TUI").unwrap();
+        app.execute_command(TuiCommand::PartySendFile(shared.display().to_string()))
+            .await;
+        tick_until(&mut app, "post, DM and file stored", |a| {
+            let s = a.party_manager.server(sid).unwrap();
+            let confirmed = |f: &dyn Fn(&MessagePayload) -> bool| {
+                s.messages
+                    .values()
+                    .flatten()
+                    .any(|e| e.seq != 0 && f(&e.payload))
+            };
+            confirmed(&|p| matches!(p, MessagePayload::Text(t) if t == "hello from the terminal"))
+                && confirmed(&|p| matches!(p, MessagePayload::File(f) if f.name == "notes.txt"))
+        })
+        .await;
+        let nova = app
+            .party_manager
+            .server(sid)
+            .unwrap()
+            .members
+            .iter()
+            .find(|m| m.username == "nova")
+            .map(|m| m.id)
+            .unwrap();
+        tick_until(&mut app, "dm stored", |a| {
+            a.party_manager
+                .dm_messages(sid, nova)
+                .iter()
+                .any(|e| e.seq != 0)
+        })
+        .await;
+
+        // Download it back into the download directory.
+        app.execute_command(TuiCommand::PartyDownload("notes".into()))
+            .await;
+        let saved = app.chat_manager.config.download_dir.join("notes.txt");
+        tick_until(&mut app, "download saved", |_| saved.exists()).await;
+        assert_eq!(std::fs::read(&saved).unwrap(), b"shared through the TUI");
+        app.execute_command(TuiCommand::PartyDownload("no-such-file".into()))
+            .await;
+        assert!(last_toast(&app).contains("No shared file matches"));
+
+        // Governance, as the owner.
+        app.execute_command(TuiCommand::PartyRole {
+            username: "nova".into(),
+            role: "admin".into(),
+        })
+        .await;
+        let nova_role = || {
+            let state = state.clone();
+            async move { state.lock().await.role_of(nova) }
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while nova_role().await != Role::Admin {
+            assert!(Instant::now() < deadline, "the role change never landed");
+            app.tick();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        app.execute_command(TuiCommand::PartyRole {
+            username: "nova".into(),
+            role: "king".into(),
+        })
+        .await;
+        assert!(last_toast(&app).contains("Unknown role"));
+        app.execute_command(TuiCommand::PartyDeleteChannel("ops".into()))
+            .await;
+        tick_until(&mut app, "channel deleted", |a| {
+            a.party_manager
+                .server(sid)
+                .is_some_and(|s| !s.channels.iter().any(|c| c.name == "ops"))
+        })
+        .await;
+        app.execute_command(TuiCommand::PartyDeleteChannel("ops".into()))
+            .await;
+        assert!(last_toast(&app).contains("No channel called"));
+
+        app.execute_command(TuiCommand::PartyStatus).await;
+        assert!(last_toast(&app).contains(&address), "{}", last_toast(&app));
+        app.execute_command(TuiCommand::PartyPane).await;
+        assert_eq!(app.overlay, TuiOverlay::Party);
+
+        // TUI-07: the pane shows what was said — the TUI used to be able to
+        // post but never displayed a message — and says, on screen, who else
+        // can read it.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+        terminal.draw(|f| crate::tui::ui::ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let shown: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(shown.contains("hello from the terminal"), "{shown}");
+        assert!(shown.contains("operator can read messages"), "{shown}");
+        drop(other);
+    }
+
     #[tokio::test]
     async fn wipe_checks_the_password_confirms_then_deletes_everything() {
         let dir = tempfile::tempdir().unwrap();
+        // Generated, not written out: the test needs a right and a wrong one.
         let password = format!("pw-{}", Uuid::new_v4());
         let wrong = format!("pw-{}", Uuid::new_v4());
-        let mut app = app();
+        let (mut app, _data) = app();
         app.history_path = dir.path().join("history.json.enc");
         app.identity_path = dir.path().join("identity.json");
         let mut identity = Identity::new_with_plaintext("T".into()).unwrap();
@@ -1708,21 +3207,50 @@ mod tests {
         identity.save(&app.identity_path).unwrap();
         app.identity = identity;
         std::fs::write(&app.history_path, b"h").unwrap();
-        let wipe = |password: &String| TuiCommand::Wipe {
-            password: password.clone(),
-        };
 
-        app.execute_command(wipe(&wrong)).await;
+        // No password set: there is nothing to check one against, so nothing
+        // may be deleted on the strength of whatever was typed.
+        let plain = std::mem::replace(
+            &mut app.identity,
+            Identity::new_with_plaintext("T".into()).unwrap(),
+        );
+        app.execute_command(TuiCommand::Wipe {
+            password: password.clone(),
+        })
+        .await;
+        assert!(
+            last_toast(&app).contains("Set a password first"),
+            "{}",
+            last_toast(&app)
+        );
+        assert_eq!(app.overlay, TuiOverlay::None);
+        app.identity = plain;
+
+        app.execute_command(TuiCommand::Wipe {
+            password: wrong.clone(),
+        })
+        .await;
+        assert!(
+            last_toast(&app).contains("Wrong password"),
+            "{}",
+            last_toast(&app)
+        );
         assert_eq!(app.overlay, TuiOverlay::None);
         assert!(app.identity_path.exists());
 
-        app.execute_command(wipe(&password)).await;
+        app.execute_command(TuiCommand::Wipe {
+            password: password.clone(),
+        })
+        .await;
         assert_eq!(app.overlay, TuiOverlay::ConfirmWipe);
         app.handle_key_event(key('y')); // plain y cancels
         assert_eq!(app.overlay, TuiOverlay::None);
         assert!(app.identity_path.exists() && !app.should_quit);
 
-        app.execute_command(wipe(&password)).await;
+        app.execute_command(TuiCommand::Wipe {
+            password: password.clone(),
+        })
+        .await;
         app.handle_key_event(ctrl('y'));
         assert!(app.should_quit);
         assert!(!app.identity_path.exists());
@@ -1734,12 +3262,38 @@ mod tests {
         );
     }
 
-    /// PERF-03: an unchanged history is not written again.
+    /// `:send` needs a conversation, and a file that cannot be sent says why
+    /// instead of failing quietly.
+    #[tokio::test]
+    async fn send_names_what_is_missing() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::Send("/nowhere/at/all.bin".into()))
+            .await;
+        assert_eq!(last_toast(&app), "No chat selected");
+
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "Peer".into());
+        app.sync_chat_ids();
+        app.execute_command(TuiCommand::Send("/nowhere/at/all.bin".into()))
+            .await;
+        assert!(
+            last_toast(&app).starts_with("Send file failed:"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(app.chat_manager.active_transfers_snapshot().is_empty());
+    }
+
+    /// PERF-03: autosave rewrote the whole history every 30 s even when
+    /// nothing had changed. An unchanged state is not written again.
     #[test]
     fn autosave_skips_an_unchanged_history() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = app();
+        let (mut app, _data) = app();
         app.history_path = dir.path().join("history.json.enc");
+        // `TuiApp::new` reads the machine's real data dir; whatever it found
+        // there is not this test's business.
+        app.chat_manager.history_load_error = None;
         let key: [u8; 32] = rand::random();
         app.chat_manager.set_history_key(key);
         app.chat_manager
@@ -1750,6 +3304,7 @@ mod tests {
         assert!(app.history_path.exists(), "the first save is written");
         std::fs::remove_file(&app.history_path).unwrap();
 
+        // Due again, nothing changed: no write.
         app.last_save = None;
         app.autosave();
         assert!(
@@ -1757,6 +3312,7 @@ mod tests {
             "an unchanged history was rewritten"
         );
 
+        // A change is written.
         app.chat_manager
             .create_local_chat_for_test(Uuid::new_v4(), "B".into());
         app.last_save = None;
@@ -1764,32 +3320,373 @@ mod tests {
         assert!(app.history_path.exists());
     }
 
+    /// TUI-19: the TUI offered an `auto-host` setting and never hosted on
+    /// start-up — only the desktop honoured it. Unlocking now starts hosting
+    /// on the configured port when it is on, and does nothing when it is off.
+    #[test]
+    fn unlocking_hosts_on_startup_when_the_setting_is_on() {
+        for on in [true, false] {
+            let (mut app, _data) = app();
+            app.history_path = _data.path().join("none.json.enc");
+            let password = format!("pw-{}", Uuid::new_v4());
+            app.identity.encrypt(&password).unwrap();
+            assert!(app.identity.is_locked());
+            app.chat_manager.config.auto_host_on_startup = on;
+            app.chat_manager.config.listen_port = 45678;
+            app.try_unlock(&password);
+            assert!(!app.identity.is_locked());
+            let queued = app.take_pending_command();
+            if on {
+                assert!(
+                    matches!(queued, Some(TuiCommand::Host(Some(45678)))),
+                    "auto-host did not start hosting: {queued:?}"
+                );
+            } else {
+                assert!(queued.is_none(), "hosted with the setting off: {queued:?}");
+            }
+        }
+    }
+
+    /// `:history-reset` is the way out of "history could not be read": the
+    /// unreadable file is renamed aside — byte for byte, never deleted — and
+    /// saving, which was refused while the load error stood, works again.
+    #[tokio::test]
+    async fn history_reset_keeps_the_unreadable_file_and_saving_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _data) = app();
+        app.history_path = dir.path().join("history.json.enc");
+        std::fs::write(&app.history_path, b"not a history").unwrap();
+        let key: [u8; 32] = rand::random();
+        app.chat_manager.set_history_key(key);
+        let _ = app.chat_manager.load_history_auto(&app.history_path, &key);
+        assert!(app.chat_manager.history_load_error().is_some());
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "After".into());
+
+        app.execute_command(TuiCommand::HistoryReset).await;
+
+        assert!(
+            last_toast(&app).contains("Old history kept as"),
+            "{}",
+            last_toast(&app)
+        );
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("unreadable"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the unreadable history was not kept");
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"not a history");
+        let mut reader = crate::app::ChatManager::default();
+        assert!(reader.load_history_auto(&app.history_path, &key).unwrap());
+        assert!(reader.chats.contains_key(&chat), "saving did not resume");
+    }
+
+    /// `:contact-connect` names the contact by number or name, refuses an
+    /// unknown or blocked one with the reason, and otherwise dials and opens
+    /// the conversation it lands in.
+    #[tokio::test]
+    async fn contact_connect_dials_the_named_contact() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::ContactConnect("nobody".into()))
+            .await;
+        assert!(last_toast(&app).contains("No contact 'nobody'"));
+
+        let blocked =
+            app.chat_manager
+                .add_contact("Mallory".into(), Some("127.0.0.1:1".into()), None, None);
+        app.chat_manager.block_contact(blocked).unwrap();
+        app.execute_command(TuiCommand::ContactConnect("Mallory".into()))
+            .await;
+        assert!(last_toast(&app).contains("blocked"), "{}", last_toast(&app));
+
+        // Something listening, so the dial is accepted.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        app.chat_manager
+            .add_contact("Bob".into(), Some(format!("127.0.0.1:{port}")), None, None);
+        app.execute_command(TuiCommand::ContactConnect("bob".into()))
+            .await;
+        assert!(
+            last_toast(&app).contains("Connecting to contact"),
+            "{}",
+            last_toast(&app)
+        );
+        let selected = app.selected_chat_id().expect("no conversation opened");
+        assert_eq!(
+            app.chat_manager
+                .contact_to_chat
+                .values()
+                .find(|c| **c == selected),
+            Some(&selected)
+        );
+    }
+
+    /// `:accept` and `:decline` act on a held file offer; with none waiting
+    /// they say so. `:send` needs a selected chat with a live session.
+    #[tokio::test]
+    async fn file_commands_act_on_the_offer_and_the_selected_chat() {
+        use crate::core::ProtocolMessage;
+        use crate::types::{MessageContent, SessionEvent};
+        let downloads = tempfile::tempdir().unwrap();
+        let (mut app, _data) = app();
+        app.chat_manager.config.download_dir = downloads.path().to_path_buf();
+        app.chat_manager.config.auto_accept_files = false;
+        app.execute_command(TuiCommand::AcceptFile).await;
+        assert!(last_toast(&app).contains("No incoming file"));
+
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        for msg in [
+            ProtocolMessage::FileMeta {
+                filename: "held.txt".into(),
+                size: 4,
+                seq: 1,
+            },
+            ProtocolMessage::FileChunk {
+                chunk: b"data".to_vec(),
+                seq: 2,
+            },
+            ProtocolMessage::FileEnd { seq: 3 },
+        ] {
+            app.chat_manager
+                .inject_session_event(chat, SessionEvent::MessageReceived(msg));
+        }
+        app.execute_command(TuiCommand::AcceptFile).await;
+        // Finalizing runs off the manager; it lands on a later poll.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let landed = loop {
+            app.chat_manager.poll_session_events();
+            let found =
+                app.chat_manager.chats[&chat]
+                    .messages
+                    .iter()
+                    .find_map(|m| match &m.content {
+                        MessageContent::File { path: Some(p), .. } => Some(p.clone()),
+                        _ => None,
+                    });
+            if let Some(p) = found {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "the accepted file never landed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(std::fs::read(landed).unwrap(), b"data");
+
+        app.chat_manager.toasts.clear();
+        app.select_chat(chat);
+        app.execute_command(TuiCommand::Send("/no/such/file".into()))
+            .await;
+        assert!(
+            last_toast(&app).contains("Send file failed"),
+            "{}",
+            last_toast(&app)
+        );
+    }
+
+    /// TUI-25: raw mode swallows SIGINT and no key handled Ctrl+C, so the
+    /// universal way out of a terminal program did nothing at all. It asks to
+    /// quit from anywhere — the composer included, where it used to be lost —
+    /// and a second Ctrl+C confirms, saving like `y` does.
+    #[test]
+    fn ctrl_c_asks_to_quit_and_a_second_one_quits() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let (mut second, _data2) = app();
+        let (mut first, _data) = app();
+        first.focus = TuiFocus::Input;
+        first.input_field.set_text("half a sentence");
+        first.handle_key_event(ctrl_c);
+        assert!(
+            matches!(first.overlay, TuiOverlay::ConfirmQuit),
+            "Ctrl+C did nothing"
+        );
+        assert_eq!(first.input_field.text(), "half a sentence");
+        assert!(!first.should_quit);
+        first.handle_key_event(ctrl_c);
+        assert!(first.should_quit, "the second Ctrl+C did not quit");
+
+        // From command mode too.
+        second.enter_command_mode();
+        second.handle_key_event(ctrl_c);
+        assert!(matches!(second.overlay, TuiOverlay::ConfirmQuit));
+    }
+
+    /// TUI-27: auto-rehost wrote its `Host` into the single pending-command
+    /// slot whatever was there, so a command the user had just submitted —
+    /// queued for the next loop turn — was silently replaced. It waits a turn
+    /// instead.
+    #[test]
+    fn auto_rehost_never_replaces_a_submitted_command() {
+        let (mut app, _data) = app();
+        app.chat_manager.is_hosting = true;
+        app.chat_manager.hosting_port = Some(45679);
+        assert!(app.chat_manager.check_rehost_needed());
+        app.pending_command = Some(TuiCommand::Help(None));
+        app.last_rehost = None;
+        app.auto_rehost();
+        assert!(
+            matches!(app.take_pending_command(), Some(TuiCommand::Help(None))),
+            "the user's command was replaced"
+        );
+        // With the slot free, it rehosts as before.
+        app.last_rehost = None;
+        app.auto_rehost();
+        assert!(matches!(
+            app.take_pending_command(),
+            Some(TuiCommand::Host(Some(45679)))
+        ));
+    }
+
+    /// TUI-19: `mdns` and `theme` were offered and did nothing — the TUI
+    /// never browses the LAN or applies a theme, and its settings live in its
+    /// own data folder, so they do not reach the desktop app either. They are
+    /// refused with the reason; `upnp`, which works, is now listed.
+    #[tokio::test]
+    async fn settings_the_terminal_ignores_are_not_offered() {
+        let (mut app, _data) = app();
+        let before = (
+            app.chat_manager.config.enable_mdns,
+            app.chat_manager.config.theme,
+        );
+        for (key, value) in [("mdns", "on"), ("theme", "light")] {
+            app.execute_command(TuiCommand::Set {
+                key: key.into(),
+                value: value.into(),
+            })
+            .await;
+            assert!(
+                last_toast(&app).contains("desktop app"),
+                ":set {key} said {:?}",
+                last_toast(&app)
+            );
+        }
+        assert_eq!(
+            (
+                app.chat_manager.config.enable_mdns,
+                app.chat_manager.config.theme
+            ),
+            before
+        );
+        let keys = crate::tui::command::settings_keys();
+        assert!(!keys.contains(&"mdns") && !keys.contains(&"theme"));
+        assert!(
+            keys.contains(&"upnp"),
+            "a working setting is missing: {keys:?}"
+        );
+        app.execute_command(TuiCommand::Set {
+            key: "upnp".into(),
+            value: "on".into(),
+        })
+        .await;
+        assert!(app.chat_manager.config.enable_upnp);
+    }
+
+    /// TUI-13: a failing autosave (disk full, permissions) was a log line no
+    /// one could see, so the user went on believing history was being kept.
+    /// The first failure of a streak says so; the ones after it in the same
+    /// streak do not repeat it every 30 s; a save that works ends the streak.
+    #[test]
+    fn a_failing_autosave_is_reported_once_per_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _data) = app();
+        // A directory where the file should be: every write fails.
+        let blocked = dir.path().join("history.json.enc");
+        std::fs::create_dir(&blocked).unwrap();
+        app.history_path = blocked.clone();
+        app.chat_manager.history_load_error = None;
+        app.chat_manager.set_history_key(rand::random());
+        app.chat_manager.toasts.clear();
+        let failures = |app: &TuiApp| {
+            app.chat_manager
+                .toasts
+                .iter()
+                .filter(|t| t.message.contains("could not be saved"))
+                .count()
+        };
+
+        for round in 0..3 {
+            app.chat_manager
+                .create_local_chat_for_test(Uuid::new_v4(), format!("chat {round}"));
+            app.last_save = None;
+            app.autosave();
+        }
+        assert_eq!(failures(&app), 1, "{:?}", app.chat_manager.toasts);
+
+        // The disk recovers: the streak ends quietly…
+        std::fs::remove_dir(&blocked).unwrap();
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "ok".into());
+        app.last_save = None;
+        app.autosave();
+        assert!(blocked.is_file());
+        assert_eq!(failures(&app), 1);
+
+        // …so the next failure is news again.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "again".into());
+        app.last_save = None;
+        app.autosave();
+        assert_eq!(failures(&app), 2);
+    }
+
     #[tokio::test]
     async fn set_command_toggles_config() {
-        let mut app = app();
-        let set = |key: &str, value: &str| TuiCommand::Set {
-            key: key.into(),
-            value: value.into(),
-        };
+        let (mut app, _data) = app();
         assert!(app.chat_manager.config.enable_notifications);
-        app.execute_command(set("notifications", "off")).await;
+        app.execute_command(TuiCommand::Set {
+            key: "notifications".into(),
+            value: "off".into(),
+        })
+        .await;
         assert!(!app.chat_manager.config.enable_notifications);
-        app.execute_command(set("listen-port", "4242")).await;
+
+        app.execute_command(TuiCommand::Set {
+            key: "listen-port".into(),
+            value: "4242".into(),
+        })
+        .await;
         assert_eq!(app.chat_manager.config.listen_port, 4242);
+
+        // PRIV-06: what a notification shows, settable from the TUI too.
+        use crate::types::NotificationContent;
+        for (typed, want) in [
+            ("hidden", NotificationContent::Hidden),
+            ("full", NotificationContent::Full),
+        ] {
+            app.execute_command(TuiCommand::Set {
+                key: "notification-content".into(),
+                value: typed.into(),
+            })
+            .await;
+            assert_eq!(app.chat_manager.config.notification_content, want);
+        }
+        app.execute_command(TuiCommand::Set {
+            key: "notification-content".into(),
+            value: "loud".into(),
+        })
+        .await;
+        assert_eq!(
+            app.chat_manager.config.notification_content,
+            NotificationContent::Full
+        );
     }
 
     #[tokio::test]
     async fn contacts_overlay_opens_and_closes() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.execute_command(TuiCommand::Contacts).await;
         assert_eq!(app.overlay, TuiOverlay::Contacts);
-        app.handle_key_event(code(KeyCode::Esc));
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.overlay, TuiOverlay::None);
     }
 
     #[tokio::test]
     async fn contact_add_then_resolve_by_index_and_name() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.execute_command(TuiCommand::ContactAdd {
             name: "Alice".into(),
             address: "127.0.0.1:9000".into(),
@@ -1804,21 +3701,26 @@ mod tests {
 
     #[test]
     fn unread_marks_unselected_chats() {
-        let mut app = app();
-        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut app, _data) = app();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
         app.chat_manager.create_local_chat_for_test(a, "A".into());
         app.chat_manager.create_local_chat_for_test(b, "B".into());
         app.sync_chat_ids();
+        // Select A.
         let a_idx = app.chat_ids.iter().position(|id| *id == a).unwrap();
         app.chat_list_state.select(Some(a_idx));
         app.tick();
         // A message arrives in B (not selected).
-        let hi = crate::types::MessageContent::Text { text: "hi".into() };
-        app.chat_manager
-            .get_chat_mut(b)
-            .unwrap()
-            .messages
-            .push(crate::types::Message::received(hi, chrono::Utc::now()));
+        if let Some(chat) = app.chat_manager.get_chat_mut(b) {
+            chat.messages.push(crate::types::Message {
+                id: Uuid::new_v4(),
+                from_me: false,
+                content: crate::types::MessageContent::Text { text: "hi".into() },
+                timestamp: chrono::Utc::now(),
+                delivered: false,
+            });
+        }
         app.update_unread();
         assert!(app.is_unread(&b));
         assert!(!app.is_unread(&a));
@@ -1826,7 +3728,7 @@ mod tests {
 
     #[test]
     fn command_autocomplete_matches_and_completes() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.enter_command_mode();
         // Empty buffer => no suggestions (so Up recalls history instead).
         assert!(app.command_suggestions.is_empty());
@@ -1838,8 +3740,8 @@ mod tests {
             assert!(COMMANDS[i].0.starts_with("co"));
         }
 
-        // Tab completes the highlighted command + a space, hiding the menu.
-        app.handle_key_event(code(KeyCode::Tab));
+        // Tab completes to the highlighted command + trailing space, hiding the menu.
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let text = app.command_field.text();
         assert!(text.ends_with(' '), "completed text was {:?}", text);
         assert!(app.command_suggestions.is_empty());
@@ -1847,23 +3749,24 @@ mod tests {
 
     #[test]
     fn command_autocomplete_arrows_cycle_selection() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.enter_command_mode();
         app.handle_key_event(key('c'));
         let n = app.command_suggestions.len();
         assert!(n >= 2);
         assert_eq!(app.suggestion_index, 0);
-        app.handle_key_event(code(KeyCode::Down));
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.suggestion_index, 1);
-        app.handle_key_event(code(KeyCode::Up));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.suggestion_index, 0);
-        app.handle_key_event(code(KeyCode::Up)); // wraps
+        // Wrap upwards.
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.suggestion_index, n - 1);
     }
 
     #[tokio::test]
     async fn quit_command_requires_confirmation() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.execute_command(TuiCommand::Quit).await;
         assert_eq!(app.overlay, TuiOverlay::ConfirmQuit);
         assert!(!app.should_quit);

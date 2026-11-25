@@ -83,6 +83,9 @@ Controls:
 - signed invite links in current UI flows
 - invalid invite addresses are sanitized during import
 - explicit fingerprint verification workflow
+- dialling a contact checks the key that answers against the one its invite
+  named, and warns on a mismatch (an invite is still not verification: a
+  match gets the normal safety-code prompt)
 
 ### Party server (Administered tier)
 
@@ -192,6 +195,9 @@ Limitation:
 - no invite revocation before the 30-day expiry (signed invites are rejected at import once older than `INVITE_MAX_AGE_SECS`; legacy unsigned v1 links carry no timestamp and never expire)
 - no hardware-backed identity support
 - no post-quantum protection
+- no rollback protection for the history file: anyone able to write the data
+  directory can put back an older `history.json.enc`, which loads normally and
+  restores revoked trust and lifted blocks (audit CRYPTO-09, open)
 
 ## Planning References
 

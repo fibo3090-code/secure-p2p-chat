@@ -219,8 +219,13 @@ pub(crate) async fn get_conversation(
     ensure_ready(&state)?;
     let uuid = parse_id(&id)?;
     let mgr = state.manager.lock().await;
+    // A fingerprint prompt names its *session*. On the listener side that is
+    // the listener's id, whose placeholder is gone by the time the dialog
+    // looks it up; the conversation it serves is found through the
+    // session-to-chat mapping. Without this the dialog's "key changed" check
+    // never ran for an incoming peer.
     let chat = mgr
-        .get_chat(uuid)
+        .get_chat(mgr.resolve_display_chat_id(uuid))
         .ok_or_else(|| "No such conversation".to_string())?;
     let mut value = serde_json::to_value(chat).map_err(|e| e.to_string())?;
     if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -270,8 +275,13 @@ pub(crate) async fn send_file<R: tauri::Runtime>(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let uuid = parse_id(&id)?;
-    let picked =
-        crate::native_file_dialog(window, |d| d.set_title("Send a file").pick_file()).await?;
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Open {
+            title: "Send a file",
+        },
+    )
+    .await?;
     let Some(path) = picked else {
         return Ok(()); // user cancelled
     };
@@ -349,7 +359,22 @@ async fn file_message_path(
 }
 
 /// Open a file with the OS default app, or reveal it in the file manager.
+/// In the bridge tests the request is recorded (`tests::opened`) instead. Same
+/// gate as the `tests` module itself, which is off on Windows (see
+/// Cargo.toml): a plain `cfg(test)` here named a module that does not exist
+/// there, and the Windows test build did not compile.
 fn open_path_os(path: &Path, reveal: bool) -> std::io::Result<()> {
+    #[cfg(all(test, not(windows)))]
+    {
+        crate::tests::opened::record(path, reveal);
+        Ok(())
+    }
+    #[cfg(not(all(test, not(windows))))]
+    launch_with_os(path, reveal)
+}
+
+#[cfg_attr(all(test, not(windows)), allow(dead_code))]
+fn launch_with_os(path: &Path, reveal: bool) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -383,23 +408,159 @@ fn open_path_os(path: &Path, reveal: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Extensions whose "open" means "run this code", checked on every platform
-/// (a false warning costs a dialog; a miss costs the machine). Only the final
-/// extension counts, which catches `holiday.jpg.exe`. Grouped: Windows
-/// executables/installers/script hosts, cross-platform runtimes, Unix launchers.
-const RISKY_EXTENSIONS: &str = "exe com scr pif bat cmd msi msp msc cpl hta vbs vbe jse wsf wsh \
-    ps1 psm1 reg lnk url scf inf chm application gadget \
-    jar js py pl rb php \
-    sh bash zsh command desktop run appimage app pkg deb rpm";
+/// Extensions whose "open" action is really "run this code".
+///
+/// Checked on every platform rather than per-OS: a `.desktop` file is inert on
+/// Windows and a `.exe` is inert on Linux, but warning about the wrong one costs
+/// a dialog while missing the right one costs the machine. The list covers the
+/// launchers that need no interpreter of their own — the classic double
+/// extension (`holiday.jpg.exe`) lands here because only the final one counts.
+const RISKY_EXTENSIONS: &[&str] = &[
+    // Windows executables, installers and script hosts
+    "exe",
+    "com",
+    "scr",
+    "pif",
+    "bat",
+    "cmd",
+    "msi",
+    "msp",
+    "msc",
+    "cpl",
+    "hta",
+    "vbs",
+    "vbe",
+    "jse",
+    "wsf",
+    "wsh",
+    "ps1",
+    "psm1",
+    "reg",
+    "lnk",
+    "url",
+    "scf",
+    "inf",
+    "chm",
+    "application",
+    "gadget", // Cross-platform runtimes / scripts
+    "jar",
+    "js",
+    "py",
+    "pl",
+    "rb",
+    "php", // Unix shells and launchers
+    "sh",
+    "bash",
+    "zsh",
+    "command",
+    "desktop",
+    "run",
+    "appimage",
+    "app",
+    "pkg",
+    "deb",
+    "rpm",
+    // Windows launchers, installers, add-ins and scriptlets (TAURI-06)
+    "appref-ms",
+    "settingcontent-ms",
+    "library-ms",
+    "search-ms",
+    "diagcab",
+    "appinstaller",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "xll",
+    "wsc",
+    "sct",
+    "vb",
+    "ws",
+    "ps1xml",
+    "psc1",
+    "jnlp",
+    "website",
+    "mde",
+    "cab",
+    // Disk images: mounting one presents its contents without the download's
+    // protections
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
+    "dmg",
+    // Macro-enabled Office documents
+    "docm",
+    "dotm",
+    "xlsm",
+    "xltm",
+    "xlam",
+    "pptm",
+    "potm",
+    "ppam",
+    "sldm",
+    // Opens in a browser with a `file://` origin, script and all
+    "html",
+    "htm",
+    "xhtml",
+    "xht",
+    "shtml",
+    "mht",
+    "mhtml",
+    "svg",
+    "svgz",
+    // macOS launchers and scripts
+    "terminal",
+    "tool",
+    "scpt",
+    "applescript",
+    "workflow",
+    "webloc",
+    "inetloc",
+    "fileloc",
+    "mpkg",
+];
 
-/// Why opening `path` would execute a peer's file (the extension, or
-/// "executable"), or `None` for ordinary content.
-fn execution_risk(path: &Path) -> Option<String> {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let lower = ext.to_ascii_lowercase();
-        if RISKY_EXTENSIONS.split_whitespace().any(|e| e == lower) {
-            return Some(lower);
-        }
+/// Received content that opens on a click without asking: types whose default
+/// handler displays or plays them. Everything else — documents, archives,
+/// anything unnamed — gets a confirmation first, because the list of things
+/// that run code when opened is open-ended and a deny-list is always missing
+/// one (TAURI-06). Mirrored in `desktop/src/lib/bridge.js`, checked by
+/// `bridge.test.js`.
+const INERT_EXTENSIONS: &[&str] = &[
+    // Raster images (SVG is not one: it can carry script)
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif",
+    // Documents that only display. Not csv: its default handler is usually a
+    // spreadsheet, where a cell like `=cmd|...` is formula/DDE injection.
+    "pdf", "txt", "md", "log", // Audio
+    "mp3", "wav", "ogg", "oga", "flac", "m4a", "aac", "opus", // Video
+    "mp4", "m4v", "mov", "mkv", "webm", "avi",
+];
+
+/// Why opening `path` needs the user's say-so, or `None` when it is content
+/// known to be inert.
+///
+/// `kind` names the extension (empty when there is none), or "executable" for
+/// a Unix file with an exec bit, so the warning can say what it is about.
+/// `runs` is true when the OS would *execute* it, rather than merely hand it
+/// to an application that might.
+#[derive(Debug, PartialEq)]
+struct OpenRisk {
+    kind: String,
+    runs: bool,
+}
+
+fn execution_risk(path: &Path) -> Option<OpenRisk> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if RISKY_EXTENSIONS.contains(&ext.as_str()) {
+        return Some(OpenRisk {
+            kind: ext,
+            runs: true,
+        });
     }
     // On Unix the executable bit decides, extension or not.
     #[cfg(unix)]
@@ -407,11 +568,22 @@ fn execution_risk(path: &Path) -> Option<String> {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                return Some("executable".to_string());
+                return Some(OpenRisk {
+                    kind: "executable".to_string(),
+                    runs: true,
+                });
             }
         }
     }
-    None
+    if INERT_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    // Not known to run, not known to be safe. With no extension at all,
+    // `xdg-open` sniffs the content — a PE file can reach Wine.
+    Some(OpenRisk {
+        kind: ext,
+        runs: false,
+    })
 }
 
 /// Outcome of [`open_file`]: opened, or held back because the file would
@@ -419,8 +591,12 @@ fn execution_risk(path: &Path) -> Option<String> {
 #[derive(Serialize)]
 pub(crate) struct OpenOutcome {
     opened: bool,
-    /// The risky extension (or "executable"), when `opened` is false.
+    /// The extension that held the open back (empty when the file has none,
+    /// "executable" for an exec bit), when `opened` is false.
     blocked: Option<String>,
+    /// The OS would execute it, as opposed to it being a type not known to be
+    /// inert. The two get different warnings: a .docx is not a program.
+    runs: bool,
     /// The file's name, for the confirmation prompt.
     filename: Option<String>,
 }
@@ -443,10 +619,11 @@ pub(crate) async fn open_file(
         return Err(format!("File no longer exists on disk: {}", path.display()));
     }
     if !reveal && !from_me && !confirm.unwrap_or(false) {
-        if let Some(kind) = execution_risk(&path) {
+        if let Some(risk) = execution_risk(&path) {
             return Ok(OpenOutcome {
                 opened: false,
-                blocked: Some(kind),
+                blocked: Some(risk.kind),
+                runs: risk.runs,
                 filename: path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -458,6 +635,7 @@ pub(crate) async fn open_file(
     Ok(OpenOutcome {
         opened: true,
         blocked: None,
+        runs: false,
         filename: None,
     })
 }

@@ -10,7 +10,12 @@ impl TuiApp {
             return;
         };
         match self.chat_manager.start_host(port, privkey).await {
-            Ok(_) => self.toast(ToastLevel::Success, format!("Hosting on :{}", port)),
+            // The port actually bound, which is not the requested one for
+            // `:host 0`: a toast saying ":0" gives the user nothing to share.
+            Ok(_) => {
+                let bound = self.chat_manager.hosting_port.unwrap_or(port);
+                self.toast(ToastLevel::Success, format!("Hosting on :{}", bound))
+            }
             Err(e) => self.toast(ToastLevel::Error, format!("Failed to host: {}", e)),
         }
     }

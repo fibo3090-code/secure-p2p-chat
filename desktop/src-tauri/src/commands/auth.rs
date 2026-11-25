@@ -52,6 +52,27 @@ fn ensure_identity_loaded(state: &Bridge) -> Result<(), String> {
     }
 }
 
+/// Serialises the commands that run Argon2 over the identity (`unlock`,
+/// `set_password`, `change_password`). They derive on a *copy*, off the
+/// identity mutex (TAURI-07: holding it for the ~1 s of Argon2 froze every
+/// command that reads the identity, and the poll loop behind them), so without
+/// this two of them could each finish against the same starting state — two
+/// setups writing different passwords, or two unlocks both reloading history.
+static AUTH_OP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What to tell the user when `decrypt` fails: only a wrong password asks for
+/// the password again; anything else is a damaged file (TAURI-20).
+fn unlock_error(e: &anyhow::Error) -> String {
+    if e.is::<messenger_core::identity::WrongPassword>() {
+        "Wrong password".to_string()
+    } else {
+        format!(
+            "Your identity file is damaged and cannot be opened ({e}). Restore it from a \
+             backup (Settings → Identity backup) — retyping the password will not help."
+        )
+    }
+}
+
 /// Unlock an existing, password-protected identity and load history.
 #[tauri::command]
 pub(crate) async fn unlock(
@@ -59,14 +80,25 @@ pub(crate) async fn unlock(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_identity_loaded(&state)?;
-    let key = {
-        let mut id = lock_or_recover(&state.identity);
-        id.decrypt(&password)
-            .map_err(|_| "Wrong password".to_string())?;
-        let key = id.history_key().map_err(|e| e.to_string())?;
-        state.password_setup_done();
-        key
-    };
+    let _auth = AUTH_OP.lock().await;
+    // Already unlocked: nothing to do. Running the body again re-ran Argon2
+    // and reloaded the history file over the live state — `apply_history`
+    // replaces, so everything not yet saved (saves are coalesced) was dropped
+    // while its sessions stayed open. A double-submitted form was enough.
+    if !crate::lock_identity(&state.identity).is_locked() && !state.needs_password_setup() {
+        return Ok(());
+    }
+    let candidate = crate::lock_identity(&state.identity).clone();
+    let (candidate, key) = tokio::task::spawn_blocking(move || {
+        let mut candidate = candidate;
+        candidate.decrypt(&password).map_err(|e| unlock_error(&e))?;
+        let key = candidate.history_key().map_err(|e| e.to_string())?;
+        Ok::<_, String>((candidate, key))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *crate::lock_identity(&state.identity) = candidate;
+    state.password_setup_done();
     let mut mgr = state.manager.lock().await;
     mgr.set_history_key(key);
     if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
@@ -106,19 +138,33 @@ pub(crate) async fn set_password(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_identity_loaded(&state)?;
-    let key = {
-        let mut id = lock_or_recover(&state.identity);
-        // `encrypt` enforces the length floor with a user-facing message.
-        id.encrypt(&password).map_err(|e| e.to_string())?;
-        id.save(&state.identity_path).map_err(|e| e.to_string())?;
-        // Stay unlocked for this session.
-        id.decrypt(&password).map_err(|e| e.to_string())?;
+    // First setup only. Once a password exists the plaintext key is in memory
+    // while unlocked, so `encrypt` would happily re-wrap `identity.json` under
+    // whatever the caller sent — no current password asked. Anything able to
+    // invoke a command could lock the owner out of their identity and history.
+    let _auth = AUTH_OP.lock().await;
+    if !state.needs_password_setup() {
+        return Err("A password is already set — use Change password instead".to_string());
+    }
+    let path = state.identity_path.clone();
+    let candidate = crate::lock_identity(&state.identity).clone();
+    let (candidate, key) = tokio::task::spawn_blocking(move || {
+        let mut id = candidate;
+        // `protect` is `encrypt` (which enforces the length floor, with a
+        // user-facing message to pass straight to the screen) keeping the key
+        // in memory, so this session stays unlocked on one Argon2 run, not two.
+        id.protect(&password).map_err(|e| e.to_string())?;
+        id.save(&path).map_err(|e| e.to_string())?;
         let key = id.history_key().map_err(|e| e.to_string())?;
-        state.password_setup_done();
-        key
-    };
-    // Load existing history like `unlock`, or the next save could overwrite it
-    // with empty state.
+        Ok::<_, String>((id, key))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *crate::lock_identity(&state.identity) = candidate;
+    state.password_setup_done();
+    // Load any existing history the same way `unlock` does. Without this, the
+    // first post-setup session starts from an empty manager and the next save
+    // could overwrite an existing `history.json.enc` with empty state.
     let mut mgr = state.manager.lock().await;
     mgr.set_history_key(key);
     if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
@@ -139,6 +185,7 @@ pub(crate) async fn change_password(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
+    let _auth = AUTH_OP.lock().await;
     let path = state.identity_path.clone();
     // Argon2 runs twice (~1s of CPU): keep it off the async runtime.
     let mut candidate = lock_or_recover(&state.identity).clone();
@@ -162,12 +209,17 @@ pub(crate) fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
 
 /// Change the identity's display name (used in invite links and the UI) and
 /// persist it. The key material and fingerprint are untouched.
+///
+/// Takes `AUTH_OP` like the password commands: `change_password` re-wraps a
+/// copy and swaps it in at the end, so a rename landing in between was put
+/// back, in memory and on disk (TAURI-17).
 #[tauri::command]
-pub(crate) fn set_display_name(
+pub(crate) async fn set_display_name(
     name: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<AuthStatus, String> {
     ensure_ready(&state)?;
+    let _auth = AUTH_OP.lock().await;
     {
         let mut id = lock_or_recover(&state.identity);
         id.set_name(&name).map_err(|e| e.to_string())?;
@@ -279,25 +331,60 @@ pub(crate) async fn export_identity<R: tauri::Runtime>(
     if !source.exists() {
         return Err("No identity file to back up yet".to_string());
     }
-    let picked = crate::native_file_dialog(window, |d| {
-        d.set_title("Save identity backup")
-            .set_file_name("p2pem-identity-backup.json")
-            .save_file()
-    })
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Save {
+            title: "Save identity backup",
+            file_name: "p2pem-identity-backup.json".to_string(),
+        },
+    )
     .await?;
     let Some(dest) = picked else {
         return Ok(None); // cancelled
     };
-    tokio::fs::copy(&source, &dest)
+    backup_identity_to(&state, &dest).await?;
+    Ok(Some(dest.display().to_string()))
+}
+
+/// Copy the (encrypted) identity file to `dest` and record that a backup
+/// exists, persisting that. The half of [`export_identity`] behind its save
+/// dialog, split out so it is testable without one.
+pub(crate) async fn backup_identity_to(
+    state: &Bridge,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    // Never onto the source. The dialog opens wherever the user points it, and
+    // copying a file onto itself truncates it on Linux — destroying the only
+    // key to the history and then recording "backed up" (TAURI-31). Compared
+    // canonically, so `./identity.json` or a symlink cannot slip past; the
+    // destination need not exist yet, so its directory is what is resolved.
+    let canonical = |p: &std::path::Path| -> Option<std::path::PathBuf> {
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty())?;
+        Some(std::fs::canonicalize(dir).ok()?.join(p.file_name()?))
+    };
+    let source = std::fs::canonicalize(&state.identity_path).ok();
+    let target = std::fs::canonicalize(dest).ok().or_else(|| canonical(dest));
+    if source.is_some() && source == target {
+        return Err("Choose somewhere other than the identity file itself for the backup".into());
+    }
+    tokio::fs::copy(&state.identity_path, dest)
         .await
         .map_err(|e| format!("Backup failed: {e}"))?;
-    // Record the backup so the app can stop (or start) nagging.
+    // A backup that cannot be read back is not one: only record it if it
+    // parses as an identity (a short write on a full disk returns Ok too).
+    if let Err(e) = messenger_core::identity::Identity::load(dest) {
+        return Err(format!(
+            "The backup could not be read back ({e}); it was not recorded"
+        ));
+    }
+    // Record that a backup exists so the app can stop nagging — and, more
+    // importantly, so it *can* nag when one never happened.
     {
         let mut mgr = state.manager.lock().await;
         mgr.config.identity_backed_up_at = Some(chrono::Utc::now().to_rfc3339());
     }
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
-    Ok(Some(dest.display().to_string()))
+    Ok(())
 }
 
 /// Export a support bundle (metadata + config, never key material) to
@@ -340,10 +427,11 @@ pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Resul
         .parent()
         .map(|d| d.join("diagnostics"))
         .ok_or_else(|| "no data directory".to_string())?;
-    let logs = "Desktop bridge logs go to stdout (run with `tauri dev` or check the OS console); \
-                no in-app log buffer is captured in this bundle.\n";
+    // The recent log, from the in-process buffer: a release build has no
+    // console to read it from (QUAL-07). `export_diagnostics_bundle` scrubs it.
+    let logs = p2pem_classic::support::format_event_logs(crate::app_logs());
     let bundle = tokio::task::spawn_blocking(move || {
-        p2pem_classic::support::export_diagnostics_bundle(&base_dir, &report, logs)
+        p2pem_classic::support::export_diagnostics_bundle(&base_dir, &report, &logs)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -376,6 +464,7 @@ pub(crate) struct SettingsDto {
     auto_accept_files: bool,
     auto_connect: bool,
     enable_mdns: bool,
+    notification_content: messenger_core::types::NotificationContent,
     /// RFC 3339 time of the last identity backup; read-only (set by `export_identity`).
     identity_backed_up_at: Option<String>,
 }
@@ -390,6 +479,9 @@ pub(crate) struct SettingsUpdate {
     auto_accept_files: bool,
     auto_connect: bool,
     enable_mdns: bool,
+    /// Optional so a client that predates the setting can still save.
+    #[serde(default)]
+    notification_content: Option<messenger_core::types::NotificationContent>,
 }
 
 #[tauri::command]
@@ -406,6 +498,7 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
         auto_accept_files: mgr.config.auto_accept_files,
         auto_connect: mgr.config.auto_connect,
         enable_mdns: mgr.config.enable_mdns,
+        notification_content: mgr.config.notification_content,
         identity_backed_up_at: mgr.config.identity_backed_up_at.clone(),
     })
 }
@@ -431,6 +524,16 @@ pub(crate) async fn update_settings(
         mgr.config.auto_accept_files = settings.auto_accept_files;
         mgr.config.auto_connect = settings.auto_connect;
         mgr.config.enable_mdns = settings.enable_mdns;
+        if let Some(content) = settings.notification_content {
+            mgr.config.notification_content = content;
+        }
+    }
+    // Off means off now, not at the next launch: dropping the daemon
+    // unregisters any advertisement and stops browsing (TAURI-08), and what it
+    // found is forgotten with it.
+    if !settings.enable_mdns {
+        *crate::lock_or_recover(&state.discovery) = None;
+        crate::lock_or_recover(&state.discovered).clear();
     }
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
@@ -443,9 +546,12 @@ pub(crate) async fn pick_download_dir<R: tauri::Runtime>(
     state: tauri::State<'_, Bridge>,
 ) -> Result<Option<String>, String> {
     ensure_ready(&state)?;
-    let picked = crate::native_file_dialog(window, |d| {
-        d.set_title("Choose download folder").pick_folder()
-    })
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Folder {
+            title: "Choose download folder",
+        },
+    )
     .await?;
     let Some(dir) = picked else {
         return Ok(None);

@@ -7,14 +7,19 @@
 // reach the composer without crossing twenty controls.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-const bridge = vi.hoisted(() => ({ api: {}, real: null }));
+const bridge = vi.hoisted(() => ({ api: {}, real: null, handlers: {} }));
 vi.mock("./lib/bridge.js", async (importOriginal) => {
   const actual = await importOriginal();
   bridge.real = actual.api;
-  return { ...actual, api: bridge.api, onBridge: async () => () => {} };
+  // Records what the shell listens for, so a test can play a backend event.
+  const onBridge = async (event, handler) => {
+    bridge.handlers[event] = handler;
+    return () => { if (bridge.handlers[event] === handler) delete bridge.handlers[event]; };
+  };
+  return { ...actual, api: bridge.api, onBridge };
 });
 
 import App from "./App.jsx";
@@ -68,10 +73,21 @@ describe("App — boot", () => {
     await screen.findByRole("navigation", { name: "Primary" });
   });
 
-  it("reports a failed handshake and keeps retrying", async () => {
-    installApi({ authStatus: async () => { throw new Error("the backend did not respond"); } });
+  it("reports a failed handshake and keeps retrying until the backend answers", async () => {
+    // It used to assert only the error text, which passes for a shell that
+    // gives up after one try. The retry is the point: the backend can be slow
+    // to come up, and a window stuck on an error until restarted is broken.
+    let calls = 0;
+    const authStatus = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("the backend did not respond");
+      return ready;
+    });
+    readyApi({ authStatus });
     render(<App />);
     expect(await screen.findByText(/did not respond/)).toBeTruthy();
+    await screen.findByRole("navigation", { name: "Primary" }, { timeout: 3000 });
+    expect(authStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("refuses to continue past an unreadable identity, and offers no retry", async () => {
@@ -207,5 +223,330 @@ describe("App — conversation switching", () => {
     await userEvent.type(box, "for bob{Enter}");
     await waitFor(() => expect(api.sendMessage).toHaveBeenCalled());
     expect(api.sendMessage.mock.calls.every(([id]) => id === "chat-2")).toBe(true);
+  });
+
+  // A send the backend refuses must keep the text: the composer is the only
+  // copy of it, and the error is the only sign anything went wrong.
+  it("keeps the draft when a send is refused, and says why", async () => {
+    readyApi({
+      getConversation: detail("chat-1", "Alice"),
+      sendMessage: vi.fn(async () => { throw "Not connected — this conversation has no session"; }),
+    });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await screen.findByText("hi from Alice");
+    const box = document.getElementById("composer-input");
+    await userEvent.type(box, "do not lose me{Enter}");
+    await waitFor(() => expect(box.value).toBe("do not lose me"));
+    const { subscribe } = await import("./lib/toast.js");
+    let shown = [];
+    subscribe((l) => { shown = l; })();
+    expect(shown.some((t) => t.level === "error" && /Not connected/.test(t.message))).toBe(true);
+  });
+
+  it("deleting the open conversation closes it", async () => {
+    const api = readyApi({ getConversation: detail("chat-1", "Alice"), deleteChat: vi.fn(async () => {}) });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await screen.findByText("hi from Alice");
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /Delete conversation/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete conversation" });
+    await userEvent.click(within(dialog).getByRole("button", { name: /Delete/ }));
+    await waitFor(() => expect(api.deleteChat).toHaveBeenCalledWith("chat-1"));
+    await waitFor(() => expect(screen.queryByText("hi from Alice")).toBeNull());
+  });
+});
+
+
+// Reads the toast store, which the shell writes to and nothing on screen
+// exposes until <Toasts> renders a frame.
+async function toasts() {
+  const { subscribe } = await import("./lib/toast.js");
+  let shown = [];
+  subscribe((l) => { shown = l; })();
+  return shown;
+}
+
+describe("App — getting in", () => {
+  it("a wrong password keeps the lock screen up and says so; the right one opens the app", async () => {
+    let unlocked = false;
+    const api = installApi({
+      authStatus: async () => (unlocked ? ready : { ...ready, state: "unlock" }),
+      unlock: vi.fn(async (pw) => {
+        if (pw !== "correct horse battery") throw "Wrong password";
+        unlocked = true;
+      }),
+      listConversations: [], listTransfers: [], lockState: false, partyList: [],
+    });
+    render(<App />);
+    const field = await screen.findByLabelText("Password");
+    await userEvent.type(field, "guess{Enter}");
+    expect(await screen.findByText(/Wrong password/)).toBeTruthy();
+    expect(screen.queryByRole("navigation")).toBeNull();
+    expect(field.value).toBe("");
+    await userEvent.type(field, "correct horse battery{Enter}");
+    await screen.findByRole("navigation", { name: "Primary" });
+    expect(api.unlock).toHaveBeenCalledTimes(2);
+  });
+
+  it("a new identity is offered a backup once, before the app opens", async () => {
+    let created = false;
+    const api = installApi({
+      authStatus: async () => (created ? ready : { ...ready, state: "set_password" }),
+      setPassword: vi.fn(async () => { created = true; }),
+      listConversations: [], listTransfers: [], lockState: false, partyList: [],
+    });
+    render(<App />);
+    const pw = "a perfectly long passphrase";
+    await userEvent.type(await screen.findByLabelText("New password"), pw);
+    await userEvent.type(screen.getByLabelText("Confirm password"), pw);
+    await userEvent.click(screen.getByRole("button", { name: /Create identity/ }));
+    await waitFor(() => expect(api.setPassword).toHaveBeenCalledWith(pw));
+    // Not straight into the app: this is the one moment a backup is cheap.
+    await screen.findByRole("button", { name: /Save backup file/ });
+    expect(screen.queryByRole("navigation")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /Skip for now/ }));
+    await screen.findByRole("navigation", { name: "Primary" });
+  });
+});
+
+describe("App — shell controls", () => {
+  it("the new-peers switch closes the door, and a refused change does not claim to have happened", async () => {
+    let fail = false;
+    const api = readyApi({
+      setLocked: vi.fn(async () => { if (fail) throw "listener could not be stopped"; }),
+    });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: /Show how others can reach you/ }));
+    const accept = screen.getByRole("switch", { name: /Accept new peers/ });
+    expect(accept.checked).toBe(true);
+    await userEvent.click(accept);
+    await waitFor(() => expect(api.setLocked).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(screen.getByRole("switch", { name: /Accept new peers/ }).checked).toBe(false));
+    // A failure must leave the control showing what is true — still closed.
+    fail = true;
+    await userEvent.click(screen.getByRole("switch", { name: /Accept new peers/ }));
+    await waitFor(() => expect(api.setLocked).toHaveBeenLastCalledWith(false));
+    expect(screen.getByRole("switch", { name: /Accept new peers/ }).checked).toBe(false);
+    expect(screen.getByRole("button", { name: /Closed to new peers. Show how/ })).toBeTruthy();
+    expect((await toasts()).some((t) => t.level === "error" && /could not be stopped/.test(t.message))).toBe(true);
+  });
+
+  it("an unreadable history raises the banner, and starting over moves the file aside", async () => {
+    const api = readyApi({
+      historyStatus: { path: "/data/history.json.enc", error: "decryption failed" },
+      setAsideHistory: vi.fn(async () => "history.json.enc.unreadable-1"),
+    });
+    render(<App />);
+    expect(await screen.findByText(/could not be read/)).toBeTruthy();
+    // Two steps: the first click only asks.
+    await userEvent.click(screen.getByRole("button", { name: /Start a new history/ }));
+    expect(api.setAsideHistory).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: /Yes, start new/ }));
+    await waitFor(() => expect(api.setAsideHistory).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(/could not be read/)).toBeNull());
+    expect((await toasts()).some((t) => /unreadable-1/.test(t.message))).toBe(true);
+  });
+
+  it("a readable history raises no banner", async () => {
+    // Absence is asserted only once the answer has been applied: checking as
+    // soon as the shell paints passes before the status has even arrived.
+    let answered;
+    const applied = new Promise((r) => { answered = r; });
+    readyApi({
+      historyStatus: async () => {
+        queueMicrotask(answered);
+        return { path: "/data/history.json.enc", error: null };
+      },
+    });
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
+    await act(() => applied);
+    expect(screen.queryByText(/could not be read/)).toBeNull();
+  });
+});
+
+describe("App — conversation actions", () => {
+  const detail = {
+    id: "chat-1", title: "Alice", peer_fingerprint: "ab".repeat(32), participants: [],
+    created_at: new Date().toISOString(), is_host_placeholder: false,
+    messages: [{ id: "m1", from_me: false, content: { type: "text", text: "hello there" }, timestamp: new Date().toISOString() }],
+    kind: "dm", transport: "direct",
+  };
+  async function openAlice(over) {
+    const api = readyApi({ getConversation: detail, ...over });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await screen.findByText("hello there");
+    return api;
+  }
+
+  it("Verify opens the trust prompt only when one is pending for this conversation", async () => {
+    const verify = async () => {
+      await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: /Verify safety code/ }));
+    };
+    let pending = null;
+    await openAlice({ pendingFingerprint: async () => pending });
+    // Nothing pending: the read-only details, never an accept button.
+    await verify();
+    const info = await screen.findByRole("dialog", { name: "Conversation info" });
+    expect(within(info).queryByRole("button", { name: /trust|accept|match/i })).toBeNull();
+    await userEvent.click(within(info).getAllByRole("button", { name: /close/i })[0]);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    // A prompt for another conversation must not be offered here either.
+    pending = { chat_id: "chat-9", peer_name: "Mallory", fingerprint: "cd".repeat(32), sas: null };
+    await verify();
+    expect(await screen.findByRole("dialog", { name: "Conversation info" })).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: /Mallory/ })).toBeNull();
+    await userEvent.click(within(screen.getByRole("dialog")).getAllByRole("button", { name: /close/i })[0]);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    pending = { chat_id: "chat-1", peer_name: "Alice", fingerprint: "ab".repeat(32), sas: null };
+    await verify();
+    expect(await screen.findByRole("dialog", { name: "Verify Alice" })).toBeTruthy();
+  });
+
+  it("rename starts from the current name and saves the trimmed one", async () => {
+    const api = await openAlice({ renameChat: vi.fn(async () => {}) });
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /Rename/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Rename conversation" });
+    const field = within(dialog).getByRole("textbox");
+    expect(field.value).toBe("Alice");
+    await userEvent.clear(field);
+    await userEvent.type(field, "  Alice (work)  ");
+    await userEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+    await waitFor(() => expect(api.renameChat).toHaveBeenCalledWith("chat-1", "Alice (work)"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("shows only this conversation's live transfers, and acts on the one clicked", async () => {
+    const transfer = (id, chat, status, file) => ({
+      id, chat_id: chat, status, file_name: file, filename: file, name: file,
+      size: 1024, total: 1024, bytes: 0, progress: 0, direction: "incoming",
+    });
+    const api = await openAlice({
+      listTransfers: [
+        transfer("t-offer", "chat-1", "awaiting", "offer.pdf"),
+        transfer("t-done", "chat-1", "done", "finished.pdf"),
+        transfer("t-other", "chat-2", "awaiting", "elsewhere.pdf"),
+      ],
+      acceptTransfer: vi.fn(async () => {}),
+      declineTransfer: vi.fn(async () => { throw "the peer already cancelled"; }),
+    });
+    // Only one offer belongs on screen: the finished one is already a
+    // message, and the other conversation's is not this user's decision here.
+    const accept = await screen.findAllByRole("button", { name: "Accept" });
+    expect(accept).toHaveLength(1);
+    await userEvent.click(accept[0]);
+    await waitFor(() => expect(api.acceptTransfer).toHaveBeenCalledWith("t-offer"));
+    await userEvent.click(screen.getByRole("button", { name: "Decline" }));
+    await waitFor(() => expect(api.declineTransfer).toHaveBeenCalledWith("t-offer"));
+    await waitFor(async () =>
+      expect((await toasts()).some((t) => t.level === "error" && /already cancelled/.test(t.message))).toBe(true));
+  });
+});
+
+describe("App — backend events", () => {
+  // PERF-01: during a transfer the backend reports progress several times a
+  // second. Answering each report by refetching every conversation (and
+  // re-rendering them) is what made the window crawl; a progress report
+  // refetches the transfer list only.
+  it("a transfer progress event refetches transfers, not conversations", async () => {
+    const api = readyApi();
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
+    await waitFor(() => expect(bridge.handlers["transfers-updated"]).toBeTypeOf("function"));
+    api.listConversations.mockClear();
+    api.listTransfers.mockClear();
+
+    await act(async () => { bridge.handlers["transfers-updated"]({ payload: null }); });
+    await waitFor(() => expect(api.listTransfers).toHaveBeenCalledTimes(1));
+    expect(api.listConversations).not.toHaveBeenCalled();
+
+    await act(async () => { bridge.handlers["state-updated"]({ payload: null }); });
+    await waitFor(() => expect(api.listConversations).toHaveBeenCalledTimes(1));
+  });
+
+  it("a fingerprint request from the backend opens the trust prompt", async () => {
+    readyApi();
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
+    await waitFor(() => expect(bridge.handlers["fingerprint-request"]).toBeTypeOf("function"));
+    await act(async () => {
+      bridge.handlers["fingerprint-request"]({
+        payload: { chat_id: "chat-1", peer_name: "Alice", fingerprint: "ab".repeat(32), sas: "123456 🐱🌵🚀" },
+      });
+    });
+    expect(await screen.findByRole("dialog", { name: "Verify Alice" })).toBeTruthy();
+  });
+});
+
+describe("App — theme", () => {
+  it("applies the theme chosen in Settings, and remembers it across a restart", async () => {
+    const { THEMES, loadTheme } = await import("./lib/themes.js");
+    readyApi();
+    const { unmount } = render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    const other = THEMES.find((t) => t.id !== document.documentElement.getAttribute("data-theme"));
+    await userEvent.click(await screen.findByRole("button", { name: new RegExp(`^${other.label}`) }));
+    expect(document.documentElement.getAttribute("data-theme")).toBe(other.id);
+    expect(loadTheme()).toBe(other.id);
+
+    // A fresh shell starts on the remembered theme, not the default.
+    unmount();
+    document.documentElement.removeAttribute("data-theme");
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
+    expect(document.documentElement.getAttribute("data-theme")).toBe(other.id);
+  });
+});
+
+// Reconnect dials a saved contact, so which contact it picks is the whole
+// question: the bridge's own association (the contact's `chat_id`) wins, a
+// contact holding the conversation's verified fingerprint is the fallback, and
+// with neither there is nothing to dial — the invite link is offered instead.
+describe("App — reconnecting an offline conversation", () => {
+  const fp = "ab".repeat(32);
+  const contact = (id, over) => ({
+    id, name: id, address: "192.0.2.1:12345", reachable: true, relay_only: false,
+    trust: "verified", fingerprint: "ef".repeat(32), chat_id: null, ...over,
+  });
+  async function openOffline(contacts) {
+    const api = readyApi({
+      listConversations: [{ ...conv, connected: false }],
+      listContacts: contacts,
+      connectContact: vi.fn(async () => {}),
+    });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await screen.findByRole("log", { name: "Messages with Alice" });
+    return api;
+  }
+
+  it("dials the contact associated with the conversation before a fingerprint match", async () => {
+    const api = await openOffline([
+      contact("k-same-key", { fingerprint: fp }),
+      contact("k-linked", { chat_id: "chat-1" }),
+    ]);
+    await userEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(api.connectContact).toHaveBeenCalledWith("k-linked"));
+    expect(api.connectContact).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the contact holding the conversation's verified key", async () => {
+    const api = await openOffline([contact("k-other"), contact("k-same-key", { fingerprint: fp })]);
+    await userEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(api.connectContact).toHaveBeenCalledWith("k-same-key"));
+  });
+
+  it("offers the invite link, not a dial, when no saved contact matches", async () => {
+    const api = await openOffline([contact("k-stranger")]);
+    expect(await screen.findByRole("button", { name: /Copy invite link/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+    expect(api.connectContact).not.toHaveBeenCalled();
   });
 });

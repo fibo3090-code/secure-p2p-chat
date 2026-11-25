@@ -246,6 +246,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged, textSiz
         auto_accept_files: next.auto_accept_files,
         auto_connect: next.auto_connect,
         enable_mdns: next.enable_mdns,
+        notification_content: next.notification_content,
       });
     } catch (e) { toast(friendlyError(e), "error"); setS(s); }
   }
@@ -361,6 +362,18 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged, textSiz
               <h2 className="set-h" id="set-privacy-h">Messaging &amp; privacy</h2>
               <Toggle label="Desktop notifications" hint="Notify when a message arrives in the background"
                 on={s.enable_notifications} onChange={(v) => apply({ enable_notifications: v })} />
+              {s.enable_notifications && (
+                <div className="set-row">
+                  <label className="set-label" htmlFor="notif-content">What notifications show</label>
+                  <select id="notif-content" value={s.notification_content || "sender_only"}
+                    onChange={(e) => apply({ notification_content: e.target.value })}>
+                    <option value="sender_only">Who wrote — not the message</option>
+                    <option value="hidden">Nothing — just "New message"</option>
+                    <option value="full">Who wrote and the message</option>
+                  </select>
+                  <div className="set-hint">Notifications are kept by your system and can appear on the lock screen, outside the app's encryption.</div>
+                </div>
+              )}
               <Toggle label="Send typing indicators" hint="Peers can see when you are typing (they see nothing when off)"
                 on={s.enable_typing_indicators} onChange={(v) => apply({ enable_typing_indicators: v })} />
             </section>

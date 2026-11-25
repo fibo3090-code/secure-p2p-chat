@@ -4,6 +4,7 @@
 // place the app implements a focus trap and the "this decision cannot be waved
 // away" rule for the TOFU prompt, and neither is visible from reading a snapshot.
 
+import React from "react";
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -127,6 +128,53 @@ describe("Modal", () => {
     // A confirmation dialog must not open with a button already focused, one
     // Space away from firing.
     expect(document.activeElement).toBe(dialog);
+  });
+
+  // UI-08: a field the dialog asks to focus keeps it — the dialog used to
+  // take focus back from it, so every text dialog opened needing an extra
+  // Tab or click. And closing hands focus back to what *opened* the dialog,
+  // not to the field (which by then is gone).
+  it("leaves focus on an autoFocus field and returns it to the opener on close", async () => {
+    function Harness() {
+      const [open, setOpen] = React.useState(false);
+      return (
+        <>
+          <button onClick={() => setOpen(true)}>Rename</button>
+          <Modal open={open} onClose={() => setOpen(false)} title="Rename conversation">
+            <input aria-label="New name" autoFocus />
+          </Modal>
+        </>
+      );
+    }
+    render(<Harness />);
+    const opener = screen.getByRole("button", { name: "Rename" });
+    await userEvent.click(opener);
+    expect(document.activeElement).toBe(screen.getByLabelText("New name"));
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("returns focus to the opener when the dialog is mounted already open", async () => {
+    function Harness() {
+      const [open, setOpen] = React.useState(false);
+      return (
+        <>
+          <button onClick={() => setOpen(true)}>New channel</button>
+          {open && (
+            <Modal open onClose={() => setOpen(false)} title="New channel">
+              <input aria-label="Channel name" autoFocus />
+            </Modal>
+          )}
+        </>
+      );
+    }
+    render(<Harness />);
+    const opener = screen.getByRole("button", { name: "New channel" });
+    await userEvent.click(opener);
+    expect(document.activeElement).toBe(screen.getByLabelText("Channel name"));
+    await userEvent.keyboard("{Escape}");
+    expect(document.activeElement).toBe(opener);
   });
 
   it("closes on Escape and on a scrim click when dismissable", async () => {

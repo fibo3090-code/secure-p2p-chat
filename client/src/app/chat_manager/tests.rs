@@ -412,6 +412,137 @@ async fn connect_to_blocked_contact_is_refused() {
     assert!(err.to_string().contains("blocked"));
 }
 
+fn throwaway_key() -> rsa::PrivateKey {
+    // Never used in a handshake here: nothing these tests dial answers.
+    // (1024 bits: rsa 0.10 refuses smaller keys.)
+    messenger_core::core::generate_rsa_keypair(1024).unwrap()
+}
+
+/// `connect_to_contact` must not dial when something already reaches the
+/// peer: dialling again replaces a session that is working.
+#[tokio::test]
+async fn connecting_to_a_contact_reuses_a_live_session_instead_of_dialling() {
+    let mut mgr = ChatManager::new(Config::default());
+    let fp = "ab".repeat(32);
+    let contact = mgr.add_contact(
+        "Ann".into(),
+        Some("127.0.0.1:1".into()),
+        Some(fp.clone()),
+        None,
+    );
+
+    // Its own conversation is live: that is the answer.
+    let own = Uuid::new_v4();
+    mgr.create_local_chat_for_test(own, "Ann".into());
+    let _lane = wire_session_for_test(&mut mgr, own);
+    mgr.associate_contact_with_chat(contact, own);
+    assert_eq!(
+        mgr.connect_to_contact(contact, None, &throwaway_key())
+            .await
+            .unwrap(),
+        own
+    );
+    assert_eq!(mgr.sessions_len(), 1, "a live session was dialled over");
+
+    // Another conversation with the same verified peer is live: re-associate.
+    let mut mgr = ChatManager::new(Config::default());
+    let contact = mgr.add_contact(
+        "Ann".into(),
+        Some("127.0.0.1:1".into()),
+        Some(fp.clone()),
+        None,
+    );
+    let other = Uuid::new_v4();
+    mgr.create_local_chat_for_test(other, "Peer ab12".into());
+    mgr.chats.get_mut(&other).unwrap().peer_fingerprint = Some(fp);
+    let _lane = wire_session_for_test(&mut mgr, other);
+    assert_eq!(
+        mgr.connect_to_contact(contact, None, &throwaway_key())
+            .await
+            .unwrap(),
+        other
+    );
+    assert_eq!(mgr.contact_to_chat.get(&contact), Some(&other));
+    assert_eq!(mgr.sessions_len(), 1, "a live session was dialled over");
+}
+
+/// With nothing live, the dial lands in the conversation this contact
+/// already has — found by fingerprint when no association was ever recorded —
+/// so reconnecting never fragments the history; direct addresses are tried
+/// first, and the relay only when there is no usable one.
+#[tokio::test]
+async fn connecting_to_a_contact_dials_into_its_existing_conversation() {
+    let fp = "cd".repeat(32);
+    let existing = |mgr: &mut ChatManager| {
+        let id = Uuid::new_v4();
+        mgr.create_local_chat_for_test(id, "Bob".into());
+        mgr.chats.get_mut(&id).unwrap().peer_fingerprint = Some(fp.clone());
+        id
+    };
+
+    // Direct.
+    let mut mgr = ChatManager::new(Config::default());
+    let history = existing(&mut mgr);
+    let contact = mgr.add_contact(
+        "Bob".into(),
+        Some("127.0.0.1:1".into()),
+        Some(fp.clone()),
+        None,
+    );
+    let chat = mgr
+        .connect_to_contact(contact, None, &throwaway_key())
+        .await
+        .unwrap();
+    assert_eq!(chat, history, "a reconnect opened a second conversation");
+    assert_eq!(mgr.chats[&chat].transport, Transport::Direct);
+    assert_eq!(mgr.contact_to_chat.get(&contact), Some(&history));
+
+    // Relay, because the only address does not parse.
+    let mut mgr = ChatManager::new(Config::default());
+    let history = existing(&mut mgr);
+    let contact = mgr.add_contact(
+        "Bob".into(),
+        Some("not an address".into()),
+        Some(fp.clone()),
+        None,
+    );
+    {
+        let c = mgr.contacts.get_mut(&contact).unwrap();
+        c.relay_server = Some("127.0.0.1:1".into());
+        c.relay_token = Some("token".into());
+    }
+    let chat = mgr
+        .connect_to_contact(contact, None, &throwaway_key())
+        .await
+        .unwrap();
+    assert_eq!(chat, history);
+    assert_eq!(
+        mgr.chats[&chat].transport,
+        Transport::Relay,
+        "an unparsable address must not block the relay fallback"
+    );
+}
+
+/// A contact with no address, no relay and no live session cannot be reached;
+/// the error says what to do rather than pointing at an editor that does not
+/// exist. An unknown contact is an error too.
+#[tokio::test]
+async fn a_contact_with_no_route_is_an_error_that_says_what_to_do() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact = mgr.add_contact("Cy".into(), None, Some("ef".repeat(32)), None);
+    let err = mgr
+        .connect_to_contact(contact, None, &throwaway_key())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("fresh invite link"), "{err}");
+    assert_eq!(mgr.sessions_len(), 0);
+    assert!(mgr
+        .connect_to_contact(Uuid::new_v4(), None, &throwaway_key())
+        .await
+        .is_err());
+}
+
 /// CRYPTO-04. Dial a contact imported from an invite for key K1 and have K2
 /// answer. Without an expected fingerprint the new chat started with
 /// `peer_fingerprint: None`, so whatever key answered was shown as an ordinary
@@ -591,7 +722,10 @@ async fn accepting_a_changed_key_that_also_contradicts_the_invite_rebinds_the_co
     assert_eq!(
         mgr.pending_fingerprint().unwrap().warning,
         Some(FingerprintWarning::KeyChanged {
-            previous: previous_fp.clone()
+            previous: previous_fp.clone(),
+            // The new key contradicts Alice's invite too, and the prompt says
+            // that accepting repoints her.
+            repoints: Some("Alice".into()),
         })
     );
 
@@ -648,7 +782,8 @@ fn a_changed_key_prompt_carries_the_previous_fingerprint() {
     assert_eq!(
         mgr.pending_fingerprint().unwrap().warning,
         Some(FingerprintWarning::KeyChanged {
-            previous: "OLD-FP".into()
+            previous: "OLD-FP".into(),
+            repoints: None,
         })
     );
     assert!(rx.try_recv().is_err());
@@ -1177,35 +1312,53 @@ async fn outgoing_stream_is_backpressured_by_the_bounded_lane() {
     let file_size = content.len() as u64;
     let (_file, transfer_id) = start_send(&mut f.mgr, f.chat_id, &content).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    f.mgr.sync_outgoing_transfer_progress();
-    let sent = |mgr: &ChatManager| {
+    let sent = |mgr: &mut ChatManager| {
+        mgr.sync_outgoing_transfer_progress();
         mgr.active_transfers_snapshot()
             .into_iter()
             .find(|t| t.id == transfer_id)
             .map(|t| t.received)
             .unwrap_or(0)
     };
-    let stalled = sent(&f.mgr);
+    // Wait for the one state in which the reader is provably blocked: the
+    // lane full and nothing draining it. A fixed sleep instead passed on a
+    // slow runner where the reader had not run at all — "stalled at 0 bytes"
+    // satisfies every bound below without anything having been backpressured.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while f.file_rx.len() < FILE_LANE_CAPACITY {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lane never filled"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Let a blocked reader prove it stays blocked.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stalled = sent(&mut f.mgr);
     let cap_bytes = FILE_LANE_CAPACITY as u64 * crate::FILE_CHUNK_SIZE as u64;
+    assert!(stalled > 0, "the reader made no progress at all");
     assert!(
         stalled <= cap_bytes,
-        "backpressure must cap in-flight bytes at ~lane capacity; got {stalled} > {cap_bytes}"
+        "in-flight bytes must be capped at the lane capacity; got {stalled} > {cap_bytes}"
     );
-    assert!(
-        stalled < file_size,
-        "the whole file must not be buffered when the consumer is stalled"
+    assert_eq!(
+        f.file_rx.len(),
+        FILE_LANE_CAPACITY,
+        "nothing may queue past a full lane"
     );
+    assert!(stalled < file_size);
 
+    // Draining the lane lets the reader advance.
     for _ in 0..20 {
         let _ = f.file_rx.recv().await;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    f.mgr.sync_outgoing_transfer_progress();
-    assert!(
-        sent(&f.mgr) > stalled,
-        "draining the lane must let the backpressured reader advance"
-    );
+    while sent(&mut f.mgr) <= stalled {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "draining the lane did not let the reader advance"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 fn has_toast(mgr: &ChatManager, needle: &str) -> bool {
@@ -1297,6 +1450,8 @@ fn stale_incoming_large_message_is_discarded() {
             timestamp_millis: 1,
             parts: vec![Some("partial".to_string()), None],
             updated_at: std::time::Instant::now() - Duration::from_secs(121),
+            started_at: std::time::Instant::now() - Duration::from_secs(121),
+            bytes: 7,
         },
     );
 
@@ -1309,6 +1464,96 @@ fn stale_incoming_large_message_is_discarded() {
     );
 }
 
+/// APP-09: the 16 partial-message slots per chat were the only bound, and
+/// each could hold 511 of 512 parts — about 384 MiB from one verified peer.
+/// The buffered bytes are budgeted: the chunk that would cross the budget is
+/// refused and its message dropped, so the total never passes it.
+#[test]
+fn partial_large_messages_are_held_to_a_byte_budget() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat = Uuid::new_v4();
+    let part = "x".repeat(crate::TEXT_CHUNK_BYTES);
+    let buffered =
+        |mgr: &ChatManager| -> usize { mgr.incoming_text_messages.values().map(|m| m.bytes).sum() };
+    let mut refused = 0;
+    // Spread over the 16 slots, as a peer would, never completing any.
+    'outer: for message in 0..crate::MAX_CONCURRENT_PARTIAL_TEXT_PER_CHAT {
+        let id = Uuid::from_u128(message as u128 + 1);
+        for index in 0..(crate::MAX_TEXT_CHUNKS - 1) {
+            match mgr.register_incoming_text_chunk(
+                chat,
+                id,
+                index,
+                crate::MAX_TEXT_CHUNKS,
+                part.clone(),
+                1,
+            ) {
+                Ok(_) => {}
+                Err(_) => {
+                    refused += 1;
+                    assert!(
+                        !mgr.incoming_text_messages.contains_key(&(chat, id)),
+                        "the message that crossed the budget is dropped, not kept half-open"
+                    );
+                    if refused > 3 {
+                        break 'outer;
+                    }
+                    continue 'outer;
+                }
+            }
+            assert!(buffered(&mgr) <= super::text::MAX_PARTIAL_TEXT_BYTES_PER_CHAT);
+        }
+    }
+    assert!(refused > 0, "nothing was ever refused");
+
+    // Another conversation still has its own room — up to the global budget.
+    assert!(mgr
+        .register_incoming_text_chunk(Uuid::new_v4(), Uuid::new_v4(), 0, 2, part.clone(), 1)
+        .is_ok());
+}
+
+/// The budget must not refuse what it exists to allow: one message of the
+/// largest size the protocol permits still arrives whole.
+#[test]
+fn a_maximum_size_message_still_fits_the_budget() {
+    assert!(
+        crate::MAX_TEXT_CHUNKS as usize * crate::TEXT_CHUNK_BYTES
+            <= super::text::MAX_PARTIAL_TEXT_BYTES_PER_CHAT
+    );
+    let mut mgr = ChatManager::new(Config::default());
+    let (chat, id) = (Uuid::new_v4(), Uuid::new_v4());
+    let part = "y".repeat(crate::TEXT_CHUNK_BYTES);
+    let mut done = None;
+    for index in 0..crate::MAX_TEXT_CHUNKS {
+        done = mgr
+            .register_incoming_text_chunk(chat, id, index, crate::MAX_TEXT_CHUNKS, part.clone(), 1)
+            .unwrap();
+    }
+    let (text, _) = done.expect("reassembled");
+    assert_eq!(
+        text.len(),
+        crate::MAX_TEXT_CHUNKS as usize * crate::TEXT_CHUNK_BYTES
+    );
+    assert!(mgr.incoming_text_messages.is_empty());
+}
+
+/// APP-09: the timeout restarted with every chunk, so one chunk a minute kept
+/// a buffer forever. A message has `super::text::INCOMING_TEXT_MAX_AGE` to arrive in all.
+#[test]
+fn a_trickled_large_message_cannot_stay_open_forever() {
+    let mut mgr = ChatManager::new(Config::default());
+    let (chat, id) = (Uuid::new_v4(), Uuid::new_v4());
+    mgr.register_incoming_text_chunk(chat, id, 0, 4, "a".into(), 1)
+        .unwrap();
+    // Recently active, but started long ago.
+    let entry = mgr.incoming_text_messages.get_mut(&(chat, id)).unwrap();
+    entry.started_at =
+        std::time::Instant::now() - super::text::INCOMING_TEXT_MAX_AGE - Duration::from_secs(1);
+    entry.updated_at = std::time::Instant::now();
+    mgr.cleanup_stale_incoming_text_messages();
+    assert!(mgr.incoming_text_messages.is_empty());
+}
+
 #[test]
 fn mapped_session_ping_updates_actual_chat() {
     let mut mgr = ChatManager::default();
@@ -1319,6 +1564,83 @@ fn mapped_session_ping_updates_actual_chat() {
         mgr.chats[&incoming].recv_seq, 1,
         "Ping sequence must be applied to mapped actual chat"
     );
+}
+
+/// PERF-07: `finalize` — `sync_all` of up to 10 GiB, then the rename — ran
+/// inside `handle_session_event`, i.e. under the manager lock, so every
+/// command and the poll loop waited for the disk. It runs on a blocking
+/// thread now and completes on a later poll. Until then the file is not in
+/// the chat, and a disconnect in that window does not fail it: the last byte
+/// has arrived, only the write to disk is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalizing_a_received_file_happens_off_the_manager() {
+    let temp_dir = tempdir().unwrap();
+    let config = Config {
+        download_dir: temp_dir.path().join("downloads"),
+        temp_dir: temp_dir.path().join("temp"),
+        auto_accept_files: true,
+        ..Config::default()
+    };
+    let mut mgr = ChatManager::new(config);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Big file".to_string());
+    let payload = b"the whole file";
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "big.bin".to_string(),
+            size: payload.len() as u64,
+            seq: 1,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: payload.to_vec(),
+            seq: 2,
+        }),
+    );
+
+    // Hold the disk write until the test says so.
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    *files::FINALIZE_GATE.lock().unwrap() = Some(gate);
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 3 }),
+    );
+    let in_chat = |mgr: &ChatManager| {
+        mgr.chats[&chat_id]
+            .messages
+            .iter()
+            .any(|m| matches!(&m.content, MessageContent::File { path: Some(_), .. }))
+    };
+    assert!(
+        !in_chat(&mgr),
+        "the file was finalized inline, under the caller"
+    );
+
+    // The sender hangs up while the write is still in progress.
+    mgr.handle_session_event(chat_id, SessionEvent::Disconnected);
+    release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !in_chat(&mgr) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the finalized file never landed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        mgr.poll_session_events();
+    }
+    let path = mgr.chats[&chat_id]
+        .messages
+        .iter()
+        .find_map(|m| match &m.content {
+            MessageContent::File { path: Some(p), .. } => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), payload);
+    assert!(mgr.active_transfers.is_empty());
 }
 
 #[test]
@@ -1787,6 +2109,79 @@ fn concurrent_tofu_prompts_queue_instead_of_overwriting() {
     drop(confirm_rx);
 }
 
+/// NET-05: any machine can complete the handshake with a throwaway key, and
+/// each such caller queued a safety-code prompt. Nothing bounded the queue,
+/// so one machine could bury the real prompts under hundreds. Past the cap a
+/// caller is refused (its session told to abort) and the user is told why.
+#[test]
+fn unverified_callers_cannot_queue_prompts_without_limit() {
+    let mut mgr = ChatManager::default();
+    let mut answers = Vec::new();
+    for i in 0..(MAX_QUEUED_PROMPTS + 5) {
+        let session = Uuid::new_v4();
+        mgr.create_local_chat_for_test(session, format!("Peer {i}"));
+        let (tx, rx) = mpsc::unbounded_channel();
+        mgr.add_fingerprint_confirm_sender_for_test(session, tx);
+        mgr.handle_tofu_verification(session, &format!("FP-{i}"), "Peer", "");
+        answers.push(rx);
+    }
+    assert_eq!(mgr.pending_fingerprint_count(), MAX_QUEUED_PROMPTS);
+    for (i, rx) in answers.iter_mut().enumerate() {
+        let got = rx.try_recv().ok();
+        if i < MAX_QUEUED_PROMPTS {
+            assert_eq!(got, None, "caller {i} is waiting for the user");
+        } else {
+            assert_eq!(got, Some(false), "caller {i} should have been refused");
+        }
+    }
+    assert!(
+        mgr.toasts
+            .iter()
+            .any(|t| t.message.contains("waiting to be verified")),
+        "{:?}",
+        mgr.toasts.iter().map(|t| &t.message).collect::<Vec<_>>()
+    );
+}
+
+/// NET-05: a caller that hung up without being verified left a persisted
+/// "Peer ab12…" conversation behind — one per throwaway key, forever. An
+/// incoming conversation that was never verified and holds nothing goes with
+/// its session; one the user accepted, or one with messages, stays.
+#[test]
+fn a_caller_that_leaves_unverified_leaves_no_conversation() {
+    for accept in [false, true] {
+        let mut mgr = ChatManager::default();
+        let listener = Uuid::new_v4();
+        mgr.create_local_chat_for_test(listener, "Host on :12345".into());
+        mgr.chats.get_mut(&listener).unwrap().is_host_placeholder = true;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        mgr.add_fingerprint_confirm_sender_for_test(listener, tx);
+        let offered = Uuid::new_v4();
+        mgr.handle_session_event(
+            listener,
+            SessionEvent::NewConnection {
+                peer_addr: "198.51.100.9:50000".into(),
+                fingerprint: "ab".repeat(32),
+                sas: "123456".into(),
+                chat_id: offered,
+            },
+        );
+        assert!(
+            mgr.chats.contains_key(&offered),
+            "an incoming conversation was opened"
+        );
+        if accept {
+            mgr.confirm_fingerprint(listener, true).unwrap();
+        }
+        mgr.handle_session_event(listener, SessionEvent::Disconnected);
+        assert_eq!(
+            mgr.chats.contains_key(&offered),
+            accept,
+            "accepted: {accept} — a verified conversation must survive its session, an unverified empty one must not"
+        );
+    }
+}
+
 /// A dead session's prompt can never be answered and would block the queue.
 #[test]
 fn a_dead_session_drops_its_queued_tofu_prompt() {
@@ -1852,4 +2247,860 @@ fn host_side_reconnect_resets_the_replay_high_water_mark() {
     );
 
     assert_eq!(mgr.get_chat(incoming).unwrap().recv_seq, 0);
+}
+
+/// APP-04: a chunk that cannot be written — a full disk, or a peer sending
+/// past the size it declared — failed the transfer here and told the sender
+/// nothing. It kept streaming (up to 10 GiB) into nothing, then reported
+/// "File sent". The sender is told to stop, and the stream is closed so the
+/// rest of its chunks are not routed anywhere.
+#[test]
+fn a_chunk_that_cannot_be_written_tells_the_sender_to_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+    mgr.config.auto_accept_files = true;
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let mut app_rx = wire_session_for_test(&mut mgr, chat_id);
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "four.bin".into(),
+            size: 4,
+            seq: 1,
+        }),
+    );
+    // Past the declared size: the receiver refuses to write it.
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: vec![0u8; 64],
+            seq: 2,
+        }),
+    );
+
+    let frames: Vec<ProtocolMessage> = std::iter::from_fn(|| app_rx.try_recv().ok()).collect();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, ProtocolMessage::FileCancel { .. })),
+        "the sender was not told: {frames:?}"
+    );
+    assert!(
+        !mgr.incoming_streams.contains_key(&chat_id),
+        "the dead transfer still owns the stream"
+    );
+}
+
+/// APP-05: a held offer whose last byte had arrived is not "stuck" — the file
+/// is complete on disk and waits only for the user. A disconnect failed it
+/// anyway and deleted the file, so a peer that sent and quit (or a network
+/// blip) cost the recipient the whole download. It stays acceptable, and
+/// accepting it after the session is gone still saves it.
+#[test]
+fn a_complete_offer_survives_the_sender_hanging_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let _app_rx = wire_session_for_test(&mut mgr, chat_id);
+    for frame in [
+        ProtocolMessage::FileMeta {
+            filename: "done.txt".into(),
+            size: 5,
+            seq: 1,
+        },
+        ProtocolMessage::FileChunk {
+            chunk: b"hello".to_vec(),
+            seq: 2,
+        },
+        ProtocolMessage::FileEnd { seq: 3 },
+    ] {
+        mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(frame));
+    }
+    let transfer_id = *mgr
+        .active_transfers
+        .iter()
+        .find(|(_, t)| t.status == TransferStatus::AwaitingAcceptance)
+        .expect("held for the user")
+        .0;
+
+    mgr.handle_session_event(chat_id, SessionEvent::Disconnected);
+    assert_eq!(
+        mgr.active_transfers
+            .get(&transfer_id)
+            .map(|t| t.status.clone()),
+        Some(TransferStatus::AwaitingAcceptance),
+        "a complete offer was failed by the disconnect"
+    );
+
+    mgr.accept_incoming_file(transfer_id)
+        .expect("accept offline");
+    assert_eq!(
+        std::fs::read(dir.path().join("done.txt")).unwrap(),
+        b"hello"
+    );
+}
+
+/// The other half of the rule: an offer still *streaming* when the session
+/// dies is incomplete, and is failed and cleaned up as before.
+#[test]
+fn an_incomplete_offer_is_still_failed_by_a_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let _app_rx = wire_session_for_test(&mut mgr, chat_id);
+    for frame in [
+        ProtocolMessage::FileMeta {
+            filename: "half.txt".into(),
+            size: 10,
+            seq: 1,
+        },
+        ProtocolMessage::FileChunk {
+            chunk: b"hello".to_vec(),
+            seq: 2,
+        },
+    ] {
+        mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(frame));
+    }
+    mgr.handle_session_event(chat_id, SessionEvent::Disconnected);
+    assert!(mgr
+        .active_transfers
+        .values()
+        .all(|t| matches!(t.status, TransferStatus::Failed(_))));
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "spool left behind"
+    );
+}
+
+/// APP-02: `send_file` awaited room on the bounded file lane while the caller
+/// held the manager lock. A lane still full from a cancelled send, behind a
+/// stalled peer, parked that await — and with it every desktop command and the
+/// poll loop, which all need the lock: the app froze. A full lane is now an
+/// immediate "busy, try again".
+#[tokio::test]
+async fn a_full_file_lane_refuses_a_send_instead_of_freezing_the_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.txt");
+    std::fs::write(&file, b"data").unwrap();
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let (app_tx, _app_rx) = mpsc::unbounded_channel();
+    let (file_tx, _file_rx) = mpsc::channel(1);
+    // Left over from an earlier send the peer never drained.
+    file_tx
+        .try_send(ProtocolMessage::FileChunk {
+            chunk: vec![0],
+            seq: 0,
+        })
+        .unwrap();
+    mgr.add_session_for_test(
+        chat_id,
+        SessionHandle {
+            from_app_tx: app_tx,
+            file_tx,
+        },
+    );
+
+    let res = tokio::time::timeout(Duration::from_secs(2), mgr.send_file(chat_id, file))
+        .await
+        .expect("send_file blocked on a full lane while holding the manager");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("try again"), "{err}");
+    assert!(
+        mgr.active_outgoing_transfer_id_for_chat(chat_id).is_none(),
+        "a refused send must not leave a transfer behind"
+    );
+}
+
+/// APP-07: spools live in the download folder (`tmp_<uuid>_<name>`, because
+/// finalizing is a rename), and after a crash or an exit with an offer still
+/// held nothing ever removed them — peer-chosen bytes under a peer-chosen
+/// extension, in ~/Downloads, forever. Loading the history sweeps them; it
+/// touches nothing else, and nothing while a receive is in flight.
+#[test]
+fn leftover_spools_are_swept_and_nothing_else_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let orphan = dir
+        .path()
+        .join(format!("tmp_{}_invoice.pdf", Uuid::new_v4()));
+    let mine = dir.path().join("tmp_notes.txt");
+    let lookalike = dir
+        .path()
+        .join("tmp_not-a-uuid-at-all-but-36-chars-x_y.txt");
+    for p in [&orphan, &mine, &lookalike] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+
+    assert_eq!(mgr.sweep_orphaned_spools(), 1);
+    assert!(!orphan.exists(), "the orphaned spool survived");
+    assert!(
+        mine.exists() && lookalike.exists(),
+        "a file the app did not write was removed"
+    );
+
+    // With a receive in flight its own spool must not be touched.
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Peer".into());
+    let _rx = wire_session_for_test(&mut mgr, chat);
+    mgr.handle_session_event(
+        chat,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "live.bin".into(),
+            size: 10,
+            seq: 1,
+        }),
+    );
+    assert_eq!(mgr.sweep_orphaned_spools(), 0);
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| e
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tmp_"))
+            .count(),
+        3,
+        "the live spool was removed"
+    );
+}
+
+/// TUI-15: closing a connection must not cost the conversation. The TUI's
+/// `:disconnect` deleted it — history and all, saved at once. This closes the
+/// session through the same path as a dropped connection and keeps the rest.
+#[test]
+fn disconnecting_keeps_the_conversation_and_its_history() {
+    let mut mgr = ChatManager::default();
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Peer".into());
+    mgr.get_chat_mut(chat).unwrap().peer_fingerprint = Some("ab".repeat(32));
+    mgr.get_chat_mut(chat)
+        .unwrap()
+        .messages
+        .push(messenger_core::types::Message {
+            id: Uuid::new_v4(),
+            from_me: false,
+            content: messenger_core::types::MessageContent::Text {
+                text: "kept".into(),
+            },
+            timestamp: chrono::Utc::now(),
+            delivered: false,
+        });
+    let _rx = wire_session_for_test(&mut mgr, chat);
+    assert!(mgr.is_connected(&chat));
+
+    assert!(mgr.disconnect_chat(chat));
+    assert!(!mgr.is_connected(&chat));
+    assert!(!mgr.sessions.contains_key(&chat));
+    assert_eq!(
+        mgr.get_chat(chat).unwrap().messages.len(),
+        1,
+        "the history went with it"
+    );
+    assert!(!mgr.disconnect_chat(chat), "nothing left to close");
+}
+
+/// PRIV-06 / JOURNEY-07: a notification put the message text into the OS's
+/// notification store and on the lock screen, outside the app's encryption,
+/// with no way to say less. By default it names the sender only; "hidden"
+/// names nobody; "full" is the old behaviour, on request.
+#[test]
+fn a_notification_says_only_what_the_setting_allows() {
+    use crate::types::NotificationContent;
+    let mut mgr = ChatManager::default();
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Alice".into());
+    assert_eq!(
+        mgr.config.notification_content,
+        NotificationContent::SenderOnly
+    );
+
+    let shown = |mgr: &ChatManager| mgr.notification_text(chat, "the secret plan");
+    assert_eq!(shown(&mgr), ("Alice".into(), "New message".into()));
+    mgr.config.notification_content = NotificationContent::Hidden;
+    assert_eq!(shown(&mgr), ("P2PEM".into(), "New message".into()));
+    mgr.config.notification_content = NotificationContent::Full;
+    assert_eq!(shown(&mgr), ("Alice".into(), "the secret plan".into()));
+}
+
+/// APP-17: deleting a conversation left the contact pointing at it, so the
+/// next "connect" to that contact aimed at a chat id that no longer existed.
+/// The association goes with the chat; the contact itself stays.
+#[test]
+fn deleting_a_chat_unlinks_its_contact() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+    let contact = mgr.add_contact(
+        "Contact".to_string(),
+        Some("127.0.0.1:12345".to_string()),
+        None,
+        None,
+    );
+    let other = mgr.add_contact(
+        "Other".to_string(),
+        Some("127.0.0.1:12346".to_string()),
+        None,
+        None,
+    );
+    mgr.create_local_chat_for_test(chat_id, "Chat".to_string());
+    mgr.create_local_chat_for_test(kept, "Kept".to_string());
+    mgr.contact_to_chat.insert(contact, chat_id);
+    mgr.contact_to_chat.insert(other, kept);
+
+    mgr.delete_chat(chat_id);
+
+    assert!(
+        mgr.contacts.contains_key(&contact),
+        "the contact was deleted with the chat"
+    );
+    assert_eq!(
+        mgr.contact_to_chat.get(&contact),
+        None,
+        "still linked to a deleted chat"
+    );
+    assert_eq!(
+        mgr.contact_to_chat.get(&other),
+        Some(&kept),
+        "an unrelated link was dropped"
+    );
+}
+
+/// APP-16: `clear_history` aborted every session task — the listener
+/// included — but left `is_hosting` and `hosting_port` set, so auto-rehost
+/// promptly opened the port again: "erase everything" quietly resumed
+/// listening. Clearing stops hosting outright.
+#[tokio::test]
+async fn clearing_history_stops_hosting_for_good() {
+    let dir = tempdir().unwrap();
+    let mut mgr = ChatManager::new(Config::default());
+    let key = crate::identity::Identity::new_with_plaintext("H".into())
+        .unwrap()
+        .private_key()
+        .unwrap();
+    mgr.start_host(0, key).await.unwrap();
+    assert!(mgr.is_hosting && mgr.hosting_port.is_some());
+
+    mgr.clear_history(&dir.path().join("history.json.enc"));
+
+    assert!(!mgr.is_hosting, "still marked as hosting");
+    assert_eq!(mgr.hosting_port, None);
+    assert!(
+        !mgr.check_rehost_needed(),
+        "auto-rehost would reopen the port"
+    );
+}
+
+/// APP-15: an unsigned (v1) link can be written by anyone: it only has to
+/// name a fingerprint with its matching public key, both of which are public.
+/// Importing one for a contact the user already had replaced that contact's
+/// name and address — a verified contact's next dial went wherever the forger
+/// said. An unsigned link may add a contact, never change an existing one; a
+/// signed link, which only the key's owner can make, still refreshes it.
+#[test]
+fn an_unsigned_invite_cannot_change_an_existing_contact() {
+    use crate::identity::Identity;
+    let peer = Identity::new_with_plaintext("Real Bob".into()).unwrap();
+    let mut mgr = ChatManager::new(Config::default());
+    let signed = peer
+        .generate_signed_invite_link(Some("192.0.2.10:12345".into()))
+        .unwrap();
+    let contact = mgr.parse_invite_link(&signed).unwrap();
+    let id = mgr.import_contact_from_link(contact, true).unwrap();
+    mgr.contacts.get_mut(&id).unwrap().trust_state = TrustState::Verified;
+
+    // A forger's v1 link: Bob's (public) key and fingerprint, their address.
+    let forged = mgr
+        .generate_invite_link(
+            "Bob (new number)",
+            Some("203.0.113.66:12345".into()),
+            &peer.fingerprint,
+            &peer.public_key_pem,
+        )
+        .unwrap();
+    let contact = mgr.parse_invite_link(&forged).unwrap();
+    let err = mgr.import_contact_from_link(contact, false).unwrap_err();
+    assert!(err.to_string().contains("unsigned"), "{err}");
+    let kept = &mgr.contacts[&id];
+    assert_eq!(kept.name, "Real Bob");
+    assert_eq!(kept.address.as_deref(), Some("192.0.2.10:12345"));
+    assert_eq!(kept.trust_state, TrustState::Verified);
+
+    // Bob's own signed link with a new address is a genuine refresh.
+    let moved = peer
+        .generate_signed_invite_link(Some("192.0.2.20:12345".into()))
+        .unwrap();
+    let contact = mgr.parse_invite_link(&moved).unwrap();
+    assert_eq!(mgr.import_contact_from_link(contact, true).unwrap(), id);
+    assert_eq!(
+        mgr.contacts[&id].address.as_deref(),
+        Some("192.0.2.20:12345")
+    );
+    assert_eq!(mgr.contacts[&id].trust_state, TrustState::Verified);
+}
+
+/// One listener at a time: a second `start_host` is refused while the first
+/// is live (and so is relay hosting), but a placeholder whose session has
+/// died — its task gone, nothing listening — is cleared and replaced rather
+/// than blocking hosting for the rest of the process.
+#[tokio::test]
+async fn hosting_twice_is_refused_but_a_dead_listener_is_replaced() {
+    let mut mgr = ChatManager::default();
+    let first = mgr.start_host(0, throwaway_key()).await.unwrap();
+
+    let again = mgr.start_host(0, throwaway_key()).await;
+    assert!(
+        again.unwrap_err().to_string().contains("Already listening"),
+        "a second listener was started"
+    );
+    let relay = mgr
+        .start_host_via_relay("127.0.0.1:1", None, throwaway_key())
+        .await;
+    assert!(relay.unwrap_err().to_string().contains("Already hosting"));
+    assert_eq!(
+        mgr.chats.values().filter(|c| c.is_host_placeholder).count(),
+        1
+    );
+
+    // The session behind the placeholder is gone (as after a crash in its
+    // task): the next start clears it and listens again.
+    mgr.teardown_session(first);
+    let second = mgr.start_host(0, throwaway_key()).await.unwrap();
+    assert_ne!(second, first);
+    assert!(
+        !mgr.chats.contains_key(&first),
+        "the dead placeholder stayed"
+    );
+    assert_eq!(
+        mgr.chats.values().filter(|c| c.is_host_placeholder).count(),
+        1
+    );
+    mgr.stop_hosting();
+}
+
+/// Auto-rehost is a timer, so a port that cannot be bound must not be retried
+/// for ever while the app claims to be hosting: after
+/// `MAX_CONSECUTIVE_REHOST_FAILURES` failures in a row it stops and says why.
+/// A success in between resets the count — a transient failure is not one of
+/// a run.
+#[tokio::test]
+async fn repeated_bind_failures_stop_hosting_but_a_success_resets_the_count() {
+    use super::MAX_CONSECUTIVE_REHOST_FAILURES as MAX;
+    let taken = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let mut mgr = ChatManager::default();
+    mgr.is_hosting = true;
+    mgr.hosting_port = Some(port);
+    for _ in 0..MAX - 1 {
+        assert!(mgr.start_host(port, throwaway_key()).await.is_err());
+    }
+    assert!(mgr.is_hosting, "stopped before the limit");
+    // A success resets the run.
+    let ok = mgr.start_host(0, throwaway_key()).await.unwrap();
+    mgr.remove_host_placeholder(ok);
+    for _ in 0..MAX - 1 {
+        assert!(mgr.start_host(port, throwaway_key()).await.is_err());
+    }
+    assert!(mgr.is_hosting, "a success did not reset the failure count");
+    assert!(mgr.start_host(port, throwaway_key()).await.is_err());
+    assert!(
+        !mgr.is_hosting,
+        "hosting continued after {MAX} failures in a row"
+    );
+    assert_eq!(mgr.hosting_port, None);
+    assert!(
+        mgr.toasts
+            .iter()
+            .any(|t| t.message.starts_with("Stopped hosting —")),
+        "the user was not told why"
+    );
+    drop(taken);
+}
+
+/// `auto_reconnect_contacts` runs when the desktop app unlocks. With
+/// `auto_connect` off it dials nobody. On, it dials each mapped contact into
+/// *its own* conversation (not a new one), skips a blocked contact, and drops a
+/// mapping whose contact has been deleted rather than tripping on it each
+/// start-up. (The blocked skip is two layers deep — `connect_to_contact`
+/// refuses a blocked contact too — so this fails only when both go.)
+#[tokio::test]
+async fn auto_reconnect_dials_mapped_contacts_into_their_own_conversations() {
+    use std::time::{Duration, Instant};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    let mut mgr = ChatManager::default();
+    let (alice_chat, blocked_chat, orphan_chat) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for (id, title) in [
+        (alice_chat, "Alice"),
+        (blocked_chat, "Mallory"),
+        (orphan_chat, "Gone"),
+    ] {
+        mgr.create_local_chat_for_test(id, title.into());
+    }
+    let alice = mgr.add_contact("Alice".into(), Some(addr.clone()), None, None);
+    let mallory = mgr.add_contact("Mallory".into(), Some(addr.clone()), None, None);
+    mgr.block_contact(mallory).unwrap();
+    let deleted = Uuid::new_v4();
+    mgr.contact_to_chat.insert(alice, alice_chat);
+    mgr.contact_to_chat.insert(mallory, blocked_chat);
+    mgr.contact_to_chat.insert(deleted, orphan_chat);
+    let chats_before = mgr.chats.len();
+
+    mgr.config.auto_connect = false;
+    mgr.auto_reconnect_contacts(&throwaway_key()).await;
+    assert!(mgr.sessions.is_empty(), "dialled with auto_connect off");
+    assert!(
+        mgr.contact_to_chat.contains_key(&deleted),
+        "touched state while off"
+    );
+
+    mgr.config.auto_connect = true;
+    mgr.auto_reconnect_contacts(&throwaway_key()).await;
+    assert!(
+        mgr.sessions.contains_key(&alice_chat),
+        "Alice was not dialled into her chat"
+    );
+    assert!(
+        !mgr.sessions.contains_key(&blocked_chat),
+        "a blocked contact was dialled"
+    );
+    assert!(
+        !mgr.contact_to_chat.contains_key(&deleted),
+        "the stale mapping stayed"
+    );
+    assert_eq!(mgr.contact_to_chat.get(&alice), Some(&alice_chat));
+    assert_eq!(
+        mgr.chats.len(),
+        chats_before,
+        "a reconnect opened a new conversation"
+    );
+
+    // And the dial really reached the address: exactly one connection.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut accepted = 0;
+    while Instant::now() < deadline && accepted == 0 {
+        match listener.accept() {
+            Ok(_) => accepted += 1,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    assert_eq!(accepted, 1, "nothing dialled the contact's address");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        listener.accept().is_err(),
+        "the blocked contact was dialled too"
+    );
+}
+
+/// Three ways a peer's file offer ends before it starts, each of which must
+/// leave nothing behind and tell the sender to stop: a new offer arriving
+/// while the previous file is still streaming (the old spool is discarded and
+/// that transfer failed, not left at 10% for ever), an offer over
+/// `MAX_FILE_SIZE`, and a download folder that cannot be written.
+#[tokio::test]
+async fn a_file_offer_that_cannot_proceed_cleans_up_and_tells_the_sender() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = manager_in(dir.path(), false);
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Peer".into());
+    let mut control = wire_session_for_test(&mut mgr, chat);
+    let cancels = |rx: &mut mpsc::UnboundedReceiver<ProtocolMessage>| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|m| matches!(m, ProtocolMessage::FileCancel { .. }))
+            .count()
+    };
+
+    // Superseded mid-stream.
+    frame(&mut mgr, chat, meta("first.bin", 100, 1));
+    frame(&mut mgr, chat, chunk(&[7; 10], 2));
+    let first = mgr.active_transfers_snapshot()[0].id;
+    frame(&mut mgr, chat, meta("second.bin", 50, 3));
+    // The new offer clears finished rows, so the user learns of the lost file
+    // from the toast, and the row does not linger at 10%.
+    assert_eq!(
+        transfer_status(&mgr, first),
+        None,
+        "the abandoned row lingered"
+    );
+    assert!(
+        mgr.toasts.iter().any(|t| t.message
+            == "File transfer interrupted (the sender started another file): first.bin"),
+        "the half-received file vanished without a word"
+    );
+    let spools: Vec<_> = downloads_left(dir.path())
+        .into_iter()
+        .filter(|n| n.to_string_lossy().contains("first.bin"))
+        .collect();
+    assert!(spools.is_empty(), "the abandoned spool stayed: {spools:?}");
+    let second = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.filename == "second.bin")
+        .expect("the new offer was not taken");
+    assert_eq!(second.status, TransferStatus::AwaitingAcceptance);
+    frame(&mut mgr, chat, ProtocolMessage::FileCancel { seq: 4 });
+    let _ = cancels(&mut control);
+
+    // Too big to accept at all.
+    let before = mgr.active_transfers_snapshot().len();
+    frame(
+        &mut mgr,
+        chat,
+        meta("huge.iso", crate::MAX_FILE_SIZE + 1, 5),
+    );
+    assert_eq!(cancels(&mut control), 1, "the sender was not told to stop");
+    assert_eq!(mgr.active_transfers_snapshot().len(), before);
+    assert!(mgr
+        .toasts
+        .iter()
+        .any(|t| t.message.starts_with("Failed to receive file")));
+
+    // Nowhere to write it: the download "folder" is a file.
+    let blocker = dir.path().join("not-a-folder");
+    std::fs::write(&blocker, b"x").unwrap();
+    mgr.config.download_dir = blocker;
+    frame(&mut mgr, chat, meta("third.bin", 10, 6));
+    assert_eq!(cancels(&mut control), 1, "the sender was not told to stop");
+    let third = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.filename == "third.bin")
+        .expect("the failed offer is not shown");
+    assert!(
+        matches!(third.status, TransferStatus::Failed(_)),
+        "{:?}",
+        third.status
+    );
+    // A failed offer does not block the next one.
+    mgr.config.download_dir = dir.path().join("downloads");
+    frame(&mut mgr, chat, meta("fourth.bin", 10, 7));
+    assert!(mgr
+        .active_transfers_snapshot()
+        .iter()
+        .any(|t| t.filename == "fourth.bin" && t.status.is_active()));
+}
+
+/// A background port mapping resolves on a later poll: success publishes the
+/// external address (which the invite link then carries) and names the
+/// protocol, failure says LAN and relay still work, and an attempt whose task
+/// went away is forgotten quietly. Still pending, nothing changes.
+#[tokio::test]
+async fn a_port_mapping_result_is_applied_on_the_next_poll() {
+    use crate::network::nat::{MappedAddress, Protocol};
+    let mut mgr = ChatManager::default();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    mgr.pending_upnp = Some(rx);
+    mgr.poll_session_events();
+    assert!(mgr.pending_upnp.is_some(), "a pending attempt was dropped");
+    tx.send(Ok(MappedAddress {
+        external_ip: "203.0.113.5".parse().unwrap(),
+        external_port: 40000,
+        protocol: Protocol::NatPmp,
+    }))
+    .unwrap();
+    mgr.poll_session_events();
+    assert_eq!(mgr.external_address.as_deref(), Some("203.0.113.5:40000"));
+    assert!(mgr.pending_upnp.is_none());
+    assert!(mgr
+        .toasts
+        .iter()
+        .any(|t| t.message == "NAT-PMP: reachable from the internet at 203.0.113.5:40000"));
+
+    let mut mgr = ChatManager::default();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    mgr.pending_upnp = Some(rx);
+    tx.send(Err(anyhow!("no gateway"))).unwrap();
+    mgr.poll_session_events();
+    assert_eq!(mgr.external_address, None);
+    assert!(mgr.pending_upnp.is_none());
+    assert!(mgr
+        .toasts
+        .iter()
+        .any(|t| t.message == "UPnP port mapping failed: no gateway (LAN/relay still work)"));
+
+    let mut mgr = ChatManager::default();
+    let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<MappedAddress>>();
+    mgr.pending_upnp = Some(rx);
+    drop(tx);
+    mgr.poll_session_events();
+    assert!(mgr.pending_upnp.is_none());
+    assert!(
+        mgr.toasts.is_empty(),
+        "a vanished attempt raised {:?}",
+        mgr.toasts
+    );
+}
+
+/// An incoming connection arriving at a listener, as the session layer
+/// reports it: returns the listener's session id and the conversation id the
+/// caller offered.
+fn incoming(
+    mgr: &mut ChatManager,
+    peer_addr: &str,
+    fingerprint: &str,
+) -> (Uuid, Uuid, mpsc::UnboundedReceiver<bool>) {
+    let listener = Uuid::new_v4();
+    mgr.create_local_chat_for_test(listener, "Host on :12345".into());
+    mgr.chats.get_mut(&listener).unwrap().is_host_placeholder = true;
+    let (tx, rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(listener, tx);
+    let offered = Uuid::new_v4();
+    mgr.handle_session_event(
+        listener,
+        SessionEvent::NewConnection {
+            peer_addr: peer_addr.into(),
+            fingerprint: fingerprint.into(),
+            sas: "123456 🎃🎈🎁".into(),
+            chat_id: offered,
+        },
+    );
+    (listener, offered, rx)
+}
+
+/// Review of #209: on the listener side the only binding was the key itself,
+/// so a saved contact arriving with another key — MITM or new device — got a
+/// fresh "Peer xxxx" conversation and a prompt identical to a stranger's first
+/// connection. When the connection comes from the address of exactly one
+/// saved contact, and its key is neither that contact's nor one already
+/// trusted, the prompt now leads with a warning naming the contact. Accepting
+/// does not repoint the contact (an address is a hint, not an invite), and the
+/// accepted key is not warned about again.
+#[test]
+fn an_incoming_key_that_is_not_the_contacts_from_their_address_warns() {
+    let carol_fp = "aa".repeat(32);
+    let other_fp = "bb".repeat(32);
+    let mut mgr = ChatManager::default();
+    let carol = mgr.add_contact(
+        "Carol".into(),
+        Some("192.0.2.7:12345".into()),
+        Some(carol_fp.clone()),
+        None,
+    );
+    let (listener, offered, _answers) = incoming(&mut mgr, "192.0.2.7:51000", &other_fp);
+    assert_eq!(
+        mgr.pending_fingerprint().unwrap().warning,
+        Some(FingerprintWarning::ContactAddressMismatch {
+            contact_id: carol,
+            contact_name: "Carol".into(),
+            expected: carol_fp.clone(),
+        })
+    );
+    assert!(mgr.toasts.iter().any(|t| t
+        .message
+        .contains("from Carol's address presented a key that is not theirs")));
+
+    mgr.confirm_fingerprint(listener, true).unwrap();
+    assert_eq!(
+        mgr.get_contact(carol).unwrap().fingerprint.as_deref(),
+        Some(carol_fp.as_str()),
+        "an address hint repointed the contact"
+    );
+    assert_eq!(
+        mgr.get_chat(offered).unwrap().peer_fingerprint.as_deref(),
+        Some(other_fp.as_str())
+    );
+
+    // The same key again is a key this app now trusts: no repeat warning.
+    let mut mgr2 = mgr;
+    mgr2.handle_session_event(listener, SessionEvent::Disconnected);
+    let _ = incoming(&mut mgr2, "192.0.2.7:51001", &other_fp);
+    assert!(
+        mgr2.pending_fingerprint()
+            .is_none_or(|p| p.warning.is_none()),
+        "an accepted key warned again"
+    );
+}
+
+/// The address hint fires only where it means something: a direct or
+/// hole-punched source (a relayed connection comes from the relay), an IPv4
+/// address however the listener reports it, one contact at that address, and
+/// a key that contact does not already hold.
+#[test]
+fn the_address_hint_stays_quiet_where_it_proves_nothing() {
+    let carol_fp = "aa".repeat(32);
+    let other_fp = "bb".repeat(32);
+    let warned = |contacts: &[(&str, &str)], peer_addr: &str, fp: &str| {
+        let mut mgr = ChatManager::default();
+        for (name, addr) in contacts {
+            mgr.add_contact(
+                (*name).into(),
+                Some((*addr).into()),
+                Some(carol_fp.clone()),
+                None,
+            );
+        }
+        let _ = incoming(&mut mgr, peer_addr, fp);
+        matches!(
+            mgr.pending_fingerprint().and_then(|p| p.warning.clone()),
+            Some(FingerprintWarning::ContactAddressMismatch { .. })
+        )
+    };
+    let carol = [("Carol", "192.0.2.7:12345")];
+    assert!(warned(&carol, "192.0.2.7:51000", &other_fp), "direct");
+    assert!(
+        warned(&carol, "p2p:192.0.2.7:51000", &other_fp),
+        "hole punched"
+    );
+    assert!(
+        warned(&carol, "[::ffff:192.0.2.7]:51000", &other_fp),
+        "dual-stack listener"
+    );
+    assert!(
+        !warned(&carol, "relay:relay.example:9000", &other_fp),
+        "relayed"
+    );
+    assert!(
+        !warned(&carol, "192.0.2.8:51000", &other_fp),
+        "another address"
+    );
+    assert!(
+        !warned(&carol, "192.0.2.7:51000", &carol_fp),
+        "the contact's own key"
+    );
+    let shared = [("Carol", "192.0.2.7:12345"), ("Dave", "192.0.2.7:23456")];
+    assert!(
+        !warned(&shared, "192.0.2.7:51000", &other_fp),
+        "two contacts behind one address"
+    );
+}
+
+/// Review of #209: accepting a key change for a contact the user had marked
+/// Trusted demoted it to Verified. The user compared the new code; their
+/// trust in the person carries over.
+#[tokio::test]
+async fn a_trusted_contact_stays_trusted_when_its_new_key_is_accepted() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some("aa".repeat(32)),
+        None,
+    );
+    mgr.contacts.get_mut(&contact_id).unwrap().trust_state = TrustState::Trusted;
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+    let presented = "bb".repeat(32);
+    mgr.handle_tofu_verification(chat_id, &presented, "127.0.0.1:1", "123456 🎃🎈🎁");
+    mgr.confirm_fingerprint(chat_id, true).unwrap();
+    let contact = mgr.get_contact(contact_id).unwrap();
+    assert_eq!(contact.fingerprint.as_deref(), Some(presented.as_str()));
+    assert_eq!(contact.trust_state, TrustState::Trusted);
 }

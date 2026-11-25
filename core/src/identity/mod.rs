@@ -21,6 +21,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const KEY_SIZE: usize = 32; // 256-bit key
+const NONCE_SIZE: usize = 12; // ChaCha20-Poly1305, 96-bit
 
 /// The Argon2id costs `encrypt` writes (and the unrecorded "strict" legacy
 /// scheme): 64 MiB, t=3, p=4.
@@ -84,6 +85,22 @@ pub struct ArgonParams {
     pub p_cost: u32,
     pub output_len: u32,
 }
+
+/// The one `decrypt` failure that a different password could fix: the stored
+/// parameters are sound and the key simply did not open. Every other error
+/// from `decrypt` means the file itself is damaged, and the UIs say so instead
+/// of asking for the password again (TAURI-20). Test with
+/// `err.is::<WrongPassword>()`.
+#[derive(Debug)]
+pub struct WrongPassword;
+
+impl std::fmt::Display for WrongPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Decryption failed (likely wrong password)")
+    }
+}
+
+impl std::error::Error for WrongPassword {}
 
 /// Argon2id with the costs `encrypt` writes.
 fn strict_argon() -> Result<Argon2<'static>> {
@@ -177,6 +194,8 @@ impl Identity {
         let mut salt = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut salt);
         let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
+        #[cfg(test)]
+        tests::derivations::bump();
         argon
             .hash_password_into(password.as_bytes(), &salt, &mut key_bytes[..])
             .map_err(|e| anyhow!("Failed to derive key with Argon2: {}", e))?;
@@ -187,6 +206,18 @@ impl Identity {
             .encrypt(&nonce, pem.as_bytes())
             .map_err(|e| anyhow!("Encryption failed: {}", e))?;
         Ok((ciphertext, salt.to_vec(), nonce.to_vec()))
+    }
+
+    /// Set the first password and **stay unlocked**: [`Identity::encrypt`]
+    /// without discarding the key in memory. Setup used to `encrypt` and then
+    /// `decrypt` just to get the key back, paying for Argon2 twice (PERF-12).
+    /// The file written by [`Identity::save`] is the same either way — the
+    /// plaintext key is never serialised.
+    pub fn protect(&mut self, password: &str) -> Result<()> {
+        let pem = self.private_key_pem_plaintext.clone();
+        self.encrypt(password)?;
+        self.private_key_pem_plaintext = pem;
+        Ok(())
     }
 
     /// Re-wrap the private key under a new password after verifying `current`
@@ -219,10 +250,17 @@ impl Identity {
         ciphertext: &[u8],
     ) -> Option<Zeroizing<String>> {
         let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
+        #[cfg(test)]
+        tests::derivations::bump();
         argon
             .hash_password_into(password.as_bytes(), salt, &mut key_bytes[..])
             .ok()?;
         let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
+        // The nonce is read from the file. `.into()` on an unchecked slice
+        // asserts its length and panics; a damaged file must be an error.
+        if nonce.len() != NONCE_SIZE {
+            return None;
+        }
         let plaintext = cipher.decrypt(nonce.into(), ciphertext).ok()?;
         String::from_utf8(plaintext).ok().map(Zeroizing::new)
     }
@@ -245,6 +283,15 @@ impl Identity {
             .encrypted_private_key
             .as_ref()
             .ok_or_else(|| anyhow!("Encrypted private key not found"))?;
+        // A nonce of the wrong length is damage, not a password problem: say
+        // so, rather than letting the unwrap below fail as if the password
+        // were wrong (TAURI-20).
+        if nonce.len() != NONCE_SIZE {
+            bail!(
+                "Stored nonce is {} bytes, expected {NONCE_SIZE}",
+                nonce.len()
+            );
+        }
         let pem = if let Some(ap) = &self.argon_params {
             if ap.m_cost_kib > MAX_ARGON_M_COST_KIB
                 || ap.t_cost > MAX_ARGON_T_COST
@@ -276,7 +323,7 @@ impl Identity {
                     Self::unwrap_private_key(argon, password, salt, nonce, ciphertext)
                 })
         };
-        let pem = pem.ok_or_else(|| anyhow!("Decryption failed (likely wrong password)"))?;
+        let pem = pem.ok_or_else(|| anyhow::Error::new(WrongPassword))?;
         self.private_key_pem_plaintext = Some(pem);
         Ok(())
     }
@@ -922,11 +969,73 @@ mod tests {
         );
     }
 
+    /// The display name both UIs set: trimmed, never empty, at most 48
+    /// *characters* (a name in a non-Latin script must not hit the limit at a
+    /// third of its length), and a refused name leaves the old one in place.
+    #[test]
+    fn set_name_trims_and_enforces_its_limits() {
+        let mut identity = fresh("Old");
+        identity.set_name("  Maya  ").unwrap();
+        assert_eq!(identity.name, "Maya");
+
+        for bad in ["", "   ", &"x".repeat(49)] {
+            assert!(identity.set_name(bad).is_err(), "{bad:?} accepted");
+            assert_eq!(identity.name, "Maya", "a refused name replaced the old one");
+        }
+        let longest = "é".repeat(48); // 96 bytes, 48 characters
+        identity.set_name(&longest).unwrap();
+        assert_eq!(identity.name, longest);
+    }
+
     #[test]
     fn test_decryption_with_wrong_password_fails() {
         let mut identity = fresh("Test User");
         identity.encrypt(&test_password()).unwrap();
-        assert!(identity.decrypt(&test_password()).is_err());
+        // `test_password()` is random, so this is a different password. It must
+        // fail as *wrong password* — the UIs ask again for that one and report
+        // anything else as a damaged file (TAURI-20) — and say so if printed.
+        let err = identity.decrypt(&test_password()).unwrap_err();
+        assert!(err.is::<WrongPassword>(), "{err:#}");
+        assert_eq!(err.to_string(), "Decryption failed (likely wrong password)");
+    }
+
+    /// CRYPTO-08: the nonce and salt come from `identity.json`, which can be
+    /// truncated or edited. A wrong-sized nonce used to reach
+    /// `GenericArray::from_slice`, which *asserts* the length — so a damaged
+    /// file panicked the unlock instead of reaching the "error" auth state,
+    /// and inside a Tauri command could poison the bridge mutex.
+    #[test]
+    fn a_malformed_nonce_or_salt_is_an_error_not_a_panic() {
+        let password = test_password();
+        let mut good = Identity::new_with_plaintext("Test User".to_string()).unwrap();
+        good.encrypt(&password).unwrap();
+        let nonce = good.nonce.clone().unwrap();
+        let salt = good.salt.clone().unwrap();
+
+        let damaged = [
+            ("empty nonce", Vec::new(), salt.clone()),
+            ("short nonce", nonce[..11].to_vec(), salt.clone()),
+            (
+                "long nonce",
+                [nonce.clone(), vec![0]].concat(),
+                salt.clone(),
+            ),
+            ("empty salt", nonce.clone(), Vec::new()),
+            ("short salt", nonce.clone(), salt[..4].to_vec()),
+        ];
+        for (what, nonce, salt) in damaged {
+            let mut identity = good.clone();
+            identity.private_key_pem_plaintext = None;
+            identity.nonce = Some(nonce);
+            identity.salt = Some(salt);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                identity.decrypt(&password)
+            }));
+            match outcome {
+                Ok(result) => assert!(result.is_err(), "{what}: unlocked anyway"),
+                Err(_) => panic!("{what}: decrypt panicked instead of returning an error"),
+            }
+        }
     }
 
     #[test]
@@ -1142,6 +1251,21 @@ mod tests {
         }
     }
 
+    /// Argon2 runs on this thread, counted.
+    pub(super) mod derivations {
+        use std::cell::Cell;
+        thread_local!(static COUNT: Cell<u32> = const { Cell::new(0) });
+        pub(in crate::identity) fn bump() {
+            COUNT.with(|c| c.set(c.get() + 1));
+        }
+        pub(in crate::identity) fn reset() {
+            COUNT.with(|c| c.set(0));
+        }
+        pub(in crate::identity) fn count() -> u32 {
+            COUNT.with(Cell::get)
+        }
+    }
+
     // Argon2 compatibility. Three on-disk shapes exist: `Argon2::default()`,
     // strict parameters unrecorded, and (current) strict parameters recorded in
     // `argon_params`, which are then the only ones tried.
@@ -1158,6 +1282,65 @@ mod tests {
         identity.salt = Some(salt);
         identity.nonce = Some(nonce);
         identity.argon_params = None;
+    }
+
+    /// The wrapping key for the strict parameters, pinned against the
+    /// reference C implementation (argon2-cffi 25.1, `hash_secret_raw`, type
+    /// ID, v19). What it guards: every identity file opens only if this
+    /// derivation never changes — a crate upgrade, or turning on the
+    /// `parallel` feature (PERF-12), must reproduce these bytes exactly.
+    #[test]
+    fn the_wrapping_key_matches_the_reference_implementation() {
+        let mut key = [0u8; KEY_SIZE];
+        strict_argon()
+            .unwrap()
+            .hash_password_into(
+                b"correct horse battery staple",
+                b"p2pem-kat-salt!!",
+                &mut key,
+            )
+            .unwrap();
+        assert_eq!(
+            hex::encode(key),
+            "e6e1221008715771c9ac2c8b0317d37f4301e772a202accc6224e51946701a8e"
+        );
+    }
+
+    /// PERF-12: first-time setup ran Argon2 twice — `encrypt`, then `decrypt`
+    /// only to get back the key `encrypt` had just thrown away. `protect`
+    /// wraps once and keeps the key, and what reaches the disk is the same
+    /// encrypted file `encrypt` writes.
+    #[test]
+    fn protecting_an_identity_derives_once_and_stays_unlocked() {
+        let mut identity = Identity::new_with_plaintext("Setup".to_string()).unwrap();
+        let history_key = identity.history_key().unwrap();
+        let password = test_password();
+        derivations::reset();
+        identity.protect(&password).unwrap();
+        assert_eq!(derivations::count(), 1, "Argon2 ran more than once");
+        assert!(identity.is_encrypted());
+        assert!(!identity.is_locked(), "setup left the identity locked");
+        assert_eq!(identity.history_key().unwrap(), history_key);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        identity.save(&path).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("PRIVATE KEY"),
+            "the plaintext key was written"
+        );
+        let mut reopened = Identity::load(&path).unwrap();
+        assert!(reopened.is_locked());
+        reopened.decrypt(&password).unwrap();
+        assert_eq!(reopened.history_key().unwrap(), history_key);
+
+        // Same floor as `encrypt`, and a refusal changes nothing.
+        let mut fresh = Identity::new_with_plaintext("Short".to_string()).unwrap();
+        assert!(fresh
+            .protect(&"s".repeat(crate::MIN_PASSWORD_LEN - 1))
+            .is_err());
+        assert!(!fresh.is_encrypted() && !fresh.is_locked());
     }
 
     #[test]
@@ -1182,19 +1365,41 @@ mod tests {
 
     #[test]
     fn absurd_stored_argon_params_are_refused() {
-        let mut identity = fresh("Hostile File");
+        let mut locked = fresh("Hostile File");
         let password = test_password();
-        identity.encrypt(&password).unwrap();
+        locked.encrypt(&password).unwrap();
 
-        // 2 GiB: legal per the RFC, but unlock must not allocate it.
-        identity.argon_params.as_mut().unwrap().m_cost_kib = 2 * 1024 * 1024;
+        // Each cost on its own, one past its cap: an edited `identity.json`
+        // needs only one of them to turn unlock into a huge allocation (memory)
+        // or a hang (time, lanes). 2 GiB is legal per the RFC, for instance.
+        type Edit = fn(&mut ArgonParams);
+        let edits: [(&str, Edit); 3] = [
+            ("memory", |p| p.m_cost_kib = MAX_ARGON_M_COST_KIB + 1),
+            ("time", |p| p.t_cost = MAX_ARGON_T_COST + 1),
+            ("lanes", |p| p.p_cost = MAX_ARGON_P_COST + 1),
+        ];
+        for (which, edit) in edits {
+            let mut identity = locked.clone();
+            edit(identity.argon_params.as_mut().unwrap());
+            let err = identity
+                .decrypt(&password)
+                .expect_err("out-of-range parameters must be refused");
+            assert!(
+                err.to_string().contains("out of range"),
+                "{which}: expected a parameter-range error, got: {err}"
+            );
+        }
 
-        let err = identity
-            .decrypt(&password)
-            .expect_err("out-of-range parameters must be refused");
+        // At the cap is allowed: it gets past the range check, and then fails
+        // only because these are not the costs the key was wrapped with. (The
+        // lane count is the one boundary cheap enough to run; the memory and
+        // time caps at their limit would cost a 1 GiB / 16-pass derivation.)
+        let mut identity = locked.clone();
+        identity.argon_params.as_mut().unwrap().p_cost = MAX_ARGON_P_COST;
+        let err = identity.decrypt(&password).unwrap_err();
         assert!(
-            err.to_string().contains("out of range"),
-            "expected a parameter-range error, got: {err}"
+            err.is::<WrongPassword>(),
+            "the cap itself was refused: {err}"
         );
     }
 

@@ -1,11 +1,20 @@
 //! Property tests over the contact store's **trust lifecycle**, over random
 //! operation sequences (ordering is where the failures live):
 //!
-//! - an imported invite is *never* trusted on arrival, whatever it claims
-//! - identity is the fingerprint: importing twice refreshes, not duplicates
-//! - blocking survives anything short of deletion
-//! - unblocking does not invent verification
-//! - deleting a contact revokes its trust, as the confirmation dialog promises
+//! Not "add and remove keep the map consistent" — that is a test of `HashMap`,
+//! and names are the one field with no rules attached to them. What carries weight here is the **trust lifecycle**, because the
+//! contact store is where trust decisions are recorded and every one of them has
+//! an invariant that a bug would break silently:
+//!
+//! - an imported invite is *never* trusted on arrival, whatever the link claims
+//! - identity is the fingerprint, so importing twice must refresh, not duplicate
+//! - blocking must survive anything short of deletion
+//! - unblocking must not invent verification that never happened
+//! - deleting a contact must revoke its trust, because the confirmation dialog
+//!   promises exactly that
+//!
+//! These are checked against randomised sequences of operations rather than one
+//! hand-picked path, since the ordering is where the interesting failures live.
 
 use p2pem_classic::app::chat_manager::ChatManager;
 use p2pem_classic::types::{Config, Contact, TrustState};
@@ -60,27 +69,6 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
-
-    /// Adding and removing stays consistent for any names, including empty or
-    /// case/whitespace-only differences.
-    #[test]
-    fn add_and_remove_is_consistent(names in proptest::collection::vec(".{0,32}", 0..50)) {
-        let mut manager = manager();
-        let mut ids = Vec::new();
-
-        for name in names {
-            ids.push(manager.add_contact(name, None, None, None));
-        }
-
-        prop_assert_eq!(manager.contacts.len(), ids.len());
-        for id in &ids {
-            prop_assert!(manager.contacts.contains_key(id));
-        }
-        for id in ids {
-            manager.remove_contact(id);
-        }
-        prop_assert!(manager.contacts.is_empty());
-    }
 
     /// A contact added by hand starts Unverified, whatever it is called.
     #[test]

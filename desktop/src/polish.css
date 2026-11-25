@@ -125,7 +125,6 @@
 /* One region per politeness level (a live region's politeness is fixed per
    element), stacked so they read as a single column of toasts. */
 .toast-region { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
-.toast-region:empty { display: none; }
 .toast {
   display: flex; align-items: center; gap: 9px; max-width: 360px; text-align: left;
   background: var(--s1); border: 1px solid var(--border-2); border-left: 3px solid var(--accent);

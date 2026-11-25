@@ -250,7 +250,7 @@ impl PartyState {
         meta: &FileMeta,
         location: Uuid,
         is_dm: bool,
-    ) {
+    ) -> Uuid {
         let entry = FileRef {
             id: Uuid::new_v4(),
             default_perms: FilePermissions::default(),
@@ -263,7 +263,21 @@ impl PartyState {
             shared_at: current_timestamp_millis(),
         };
         self.persist_file_ref(&entry);
+        let id = entry.id;
         self.file_refs.push(entry);
+        id
+    }
+
+    /// Undo a file reference and the blob reference it held, for a file
+    /// message that could not be stored. The transaction around a commit
+    /// commits even when it returns `Err` (`with_tx`), so without this a
+    /// refused message left the reference recorded and the bytes counted:
+    /// the retry was refused as "already shared there", and the blob was
+    /// never collected, charging the member's quota for a file nobody holds.
+    fn forget_file_ref(&mut self, id: Uuid, hash: &str) {
+        self.file_refs.retain(|r| r.id != id);
+        self.delete_file_ref_row(id);
+        self.release_blob(hash);
     }
 
     /// What `member` may do with the share `r`: an admin holds everything;
@@ -369,31 +383,31 @@ impl PartyState {
             return Err("that file is already shared there".to_string());
         }
 
-        // A new reference to existing bytes: a refcount, counted against the
-        // sharer's quota as one more holder.
-        let meta = {
-            let Some(rec) = self.blobs.get_mut(hash) else {
-                return Err("that file is no longer stored here".to_string());
-            };
+        let Some(rec) = self.blobs.get(hash) else {
+            return Err("that file is no longer stored here".to_string());
+        };
+        let meta = FileMeta {
+            hash: hash.to_string(),
+            name: source.name.clone(),
+            size: rec.size,
+            mime: rec.mime.clone(),
+        };
+
+        // The message first: it is the one write that can be refused (QUAL-05),
+        // and nothing may be counted for a share that was never posted.
+        let envelope = if is_dm {
+            self.append_dm_message(actor, location, MessagePayload::File(meta.clone()))?
+        } else {
+            self.append_channel_message(actor, location, MessagePayload::File(meta.clone()))?
+        };
+        // Then the new reference to existing bytes: a refcount, counted
+        // against the sharer's quota as one more holder.
+        if let Some(rec) = self.blobs.get_mut(hash) {
             rec.refcount += 1;
             let refcount = rec.refcount;
-            let (size, mime) = (rec.size, rec.mime.clone());
             self.persist_blob_refcount(hash, refcount);
-            FileMeta {
-                hash: hash.to_string(),
-                name: source.name.clone(),
-                size,
-                mime,
-            }
-        };
+        }
         self.record_file_ref(actor, &meta, location, is_dm);
-
-        let envelope = if is_dm {
-            self.append_dm_message(actor, location, MessagePayload::File(meta))
-        } else {
-            self.append_channel_message(actor, location, MessagePayload::File(meta))
-                .expect("checked above")
-        };
         let detail = format!("shared {} again", source.name);
         self.record_audit(actor, "file.share", &detail);
         Ok(envelope)
@@ -624,6 +638,9 @@ impl PartyState {
         if !self.is_member(uploader) {
             return Err("sender is not a member of this server".to_string());
         }
+        // Before anything counts what is in flight: an upload that went quiet
+        // must not hold the budget (or this member's slots) for ever.
+        self.expire_idle_uploads();
         if self.uploads_in_flight(uploader) >= MAX_CONCURRENT_UPLOADS {
             return Err(format!(
                 "you already have {MAX_CONCURRENT_UPLOADS} uploads in progress"
@@ -640,8 +657,33 @@ impl PartyState {
         }
         self.check_may_post_file(uploader, target)?;
         // Provisional: deduplicated content costs nothing, but that is only
-        // knowable once the bytes have arrived.
-        self.check_member_allowance(uploader, size)?;
+        // knowable once the bytes have arrived. Spools are held in memory until
+        // they finish, so what is already in flight counts too: checked one at
+        // a time, four 100 MiB uploads each passed a 128 MiB allowance (SRV-07).
+        let in_flight = |only: Option<Uuid>| -> u64 {
+            self.uploads
+                .values()
+                .filter(|p| only.is_none_or(|m| p.uploader == m))
+                .map(|p| p.declared)
+                .sum()
+        };
+        if in_flight(None).saturating_add(size) > self.max_upload_spool_bytes {
+            return Err(
+                "the server is busy receiving other uploads — try again shortly".to_string(),
+            );
+        }
+        if let Some(limit) = self.member_blob_limit(uploader) {
+            let used = self
+                .member_blob_bytes(uploader)
+                .saturating_add(in_flight(Some(uploader)));
+            if used.saturating_add(size) > limit {
+                return Err(format!(
+                    "this would exceed your {} file storage allowance ({} of it already used)",
+                    messenger_core::util::format_size(limit),
+                    messenger_core::util::format_size(used)
+                ));
+            }
+        }
         let id = Uuid::new_v4();
         self.uploads.insert(
             id,
@@ -655,9 +697,26 @@ impl PartyState {
                 target,
                 data: Vec::with_capacity(size.min(PARTY_CHUNK_BYTES as u64 * 4) as usize),
                 hasher: BlobHasher::new(),
+                last_active: std::time::Instant::now(),
             },
         );
         Ok(id)
+    }
+
+    /// Drop every chunked upload that has received nothing for
+    /// `upload_idle_timeout`, returning how many went. Its sender, if it ever
+    /// resumes, is answered "no such upload" and can offer the file again.
+    pub(super) fn expire_idle_uploads(&mut self) -> usize {
+        let timeout = self.upload_idle_timeout;
+        let before = self.uploads.len();
+        self.uploads.retain(|id, p| {
+            let fresh = p.last_active.elapsed() < timeout;
+            if !fresh {
+                tracing::info!(upload = %id, name = %p.name, "dropped an upload that sent nothing for too long");
+            }
+            fresh
+        });
+        before - self.uploads.len()
     }
 
     /// Append one chunk, refusing anything past the declared size *before*
@@ -685,6 +744,7 @@ impl PartyState {
         }
         pending.data.extend_from_slice(data);
         pending.hasher.update(data);
+        pending.last_active = std::time::Instant::now();
         Ok(())
     }
 
@@ -1105,9 +1165,19 @@ impl PartyState {
         channel: Uuid,
         meta: FileMeta,
     ) -> Result<Envelope, String> {
-        self.record_file_ref(sender, &meta, channel, false);
+        let (hash, file_ref) = (
+            meta.hash.clone(),
+            self.record_file_ref(sender, &meta, channel, false),
+        );
         self.append_channel_message(sender, channel, MessagePayload::File(meta))
-            .ok_or_else(|| "channel no longer exists".to_string())
+            .map_err(|e| {
+                self.forget_file_ref(file_ref, &hash);
+                if e == "unknown channel" {
+                    "channel no longer exists".to_string()
+                } else {
+                    e
+                }
+            })
     }
 
     /// Store a file and send it as a direct message to `to`. Returns the assigned
@@ -1132,8 +1202,12 @@ impl PartyState {
         meta: FileMeta,
     ) -> Result<Envelope, String> {
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        self.record_file_ref(from, &meta, thread_id, true);
-        Ok(self.append_dm_message(from, thread_id, MessagePayload::File(meta)))
+        let (hash, file_ref) = (
+            meta.hash.clone(),
+            self.record_file_ref(from, &meta, thread_id, true),
+        );
+        self.append_dm_message(from, thread_id, MessagePayload::File(meta))
+            .inspect_err(|_| self.forget_file_ref(file_ref, &hash))
     }
 
     /// The bytes of a stored blob by content hash, or `None` if unknown.

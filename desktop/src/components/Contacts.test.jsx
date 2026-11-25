@@ -140,4 +140,72 @@ describe("Contacts", () => {
     expect(api.removeContact).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
+
+  // An unsigned (v1) link carries no proof of who made it. Importing one with
+  // the same quiet success as a signed one told the user nothing.
+  it("warns when an invite link is unsigned, and not when it is signed", async () => {
+    const { subscribe, dismiss } = await import("../lib/toast.js");
+    const shown = () => { let l = []; subscribe((x) => { l = x; })(); return l; };
+    shown().forEach((t) => dismiss(t.id));
+    const importInvite = vi.fn(async (link) =>
+      ({ contact: { ...alice, name: "Bob" }, signed: !link.endsWith("v1") }));
+    installApi({ importInvite, listContacts: [] });
+    render(<Contacts />);
+    const box = screen.getByPlaceholderText(/Paste an invite link/);
+    const add = screen.getByRole("button", { name: "Add" });
+
+    await userEvent.type(box, "chat-p2p://invite/v1");
+    await userEvent.click(add);
+    await vi.waitFor(() => expect(shown().some((t) => /unsigned invite link/.test(t.message) && t.level === "error")).toBe(true));
+
+    shown().forEach((t) => dismiss(t.id));
+    await userEvent.type(box, "chat-p2p://invite/v2");
+    await userEvent.click(add);
+    await vi.waitFor(() => expect(shown().some((t) => t.message === "Added Bob.")).toBe(true));
+    expect(shown().some((t) => /unsigned/.test(t.message))).toBe(false);
+  });
+
+  it("connects to a contact, and shows why when it cannot", async () => {
+    const onConnected = vi.fn();
+    const connectContact = vi.fn(async (id) => { if (id === "c2") throw "This contact is blocked"; });
+    installApi({
+      listContacts: [alice, { ...alice, id: "c2", name: "Mallory", fingerprint: "b".repeat(64) }],
+      connectContact,
+    });
+    render(<Contacts onConnected={onConnected} />);
+    const card = (name) => screen.getByText(name).closest(".contact-row");
+    await screen.findByText("Alice");
+    await userEvent.click(within(card("Alice")).getByRole("button", { name: "Connect" }));
+    expect(connectContact).toHaveBeenCalledWith("c1");
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledTimes(1));
+
+    await userEvent.click(within(card("Mallory")).getByRole("button", { name: "Connect" }));
+    expect(await screen.findByText(/This contact is blocked/)).toBeTruthy();
+    expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  // A refused clipboard write must say so: silently doing nothing invites the
+  // user to paste a stale fingerprint into a verification conversation.
+  it("says whether the fingerprint was actually copied", async () => {
+    const { subscribe, dismiss } = await import("../lib/toast.js");
+    const shown = () => { let l = []; subscribe((x) => { l = x; })(); return l; };
+    shown().forEach((t) => dismiss(t.id));
+    installApi({ listContacts: [alice] });
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<Contacts />);
+    await screen.findByText("Alice");
+    const copy = async () => {
+      await userEvent.click(screen.getByRole("button", { name: /More actions for Alice/ }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "Copy fingerprint" }));
+    };
+    await copy();
+    expect(writeText).toHaveBeenCalledWith("a".repeat(64));
+    await vi.waitFor(() => expect(shown().some((t) => t.message === "Fingerprint copied")).toBe(true));
+
+    writeText.mockRejectedValueOnce(new Error("denied"));
+    await copy();
+    await vi.waitFor(() => expect(shown().some((t) => /Could not copy/.test(t.message))).toBe(true));
+  });
 });
+

@@ -1,6 +1,7 @@
-//! In-process ring buffer of recent `tracing` events, for the log overlay and
-//! diagnostics bundles: a `tracing_subscriber::Layer` keeping the last
-//! [`LOG_CAPACITY`] events, bounded so a long session cannot grow it forever.
+//! In-process ring buffer of recent `tracing` events, for the TUI's copy-logs
+//! action (Ctrl+L) and diagnostics bundles: a `tracing_subscriber::Layer`
+//! keeping the last [`LOG_CAPACITY`] events, bounded so a long session cannot
+//! grow it forever.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -69,29 +70,47 @@ impl LogBuffer {
     }
 }
 
-/// Pulls the `message` field out of an event, falling back to the first field
-/// so an event recorded only with structured fields still says something.
+/// Renders an event the way `tracing_subscriber::fmt` does: the message,
+/// then every other field as `key=value`. Keeping only the message dropped
+/// the error, path or id that most structured calls carry (QUAL-06).
 #[derive(Default)]
 struct MessageVisitor {
     message: Option<String>,
-    first_field: Option<String>,
+    fields: String,
+}
+
+impl MessageVisitor {
+    fn field(&mut self, name: &str, value: std::fmt::Arguments<'_>) {
+        use std::fmt::Write;
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        let _ = write!(self.fields, "{name}={value}");
+    }
+
+    fn render(self) -> String {
+        match (self.message, self.fields.is_empty()) {
+            (Some(m), true) => m,
+            (Some(m), false) => format!("{m} {}", self.fields),
+            (None, _) => self.fields,
+        }
+    }
 }
 
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let rendered = format!("{value:?}");
         if field.name() == "message" {
-            self.message = Some(rendered);
-        } else if self.first_field.is_none() {
-            self.first_field = Some(format!("{}={}", field.name(), rendered));
+            self.message = Some(format!("{value:?}"));
+        } else {
+            self.field(field.name(), format_args!("{value:?}"));
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
             self.message = Some(value.to_string());
-        } else if self.first_field.is_none() {
-            self.first_field = Some(format!("{}={}", field.name(), value));
+        } else {
+            self.field(field.name(), format_args!("{value}"));
         }
     }
 }
@@ -105,7 +124,7 @@ impl<S: Subscriber> Layer<S> for LogBuffer {
             time: Utc::now(),
             level: meta.level().as_str(),
             target: meta.target().to_string(),
-            message: visitor.message.or(visitor.first_field).unwrap_or_default(),
+            message: visitor.render(),
         });
     }
 }
@@ -161,14 +180,25 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(buf.clone());
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("hello from the pipeline");
-            tracing::warn!(peer = "alice", "structured too");
+            // QUAL-06: the fields *are* the information — which file, what
+            // error. They were dropped whenever a message was present, so
+            // a copied log said "failed to persist party member" and nothing
+            // about why.
+            let e = std::io::Error::other("disk full");
+            tracing::warn!(peer = "alice", error = %e, attempt = 2, "structured too");
+            tracing::error!(path = "/x");
         });
         let events = buf.events();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0].level, "INFO");
         assert_eq!(events[0].message, "hello from the pipeline");
         assert_eq!(events[1].level, "WARN");
-        assert_eq!(events[1].message, "structured too");
+        assert_eq!(
+            events[1].message,
+            "structured too peer=alice error=disk full attempt=2"
+        );
+        // No message: the fields alone.
+        assert_eq!(events[2].message, "path=/x");
     }
 
     /// An event with only structured fields still renders as something.

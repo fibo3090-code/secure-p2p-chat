@@ -1,9 +1,11 @@
-//! P2PEM desktop bridge: a thin Tauri layer over the UI-agnostic `ChatManager`,
-//! sharing one tokio runtime with Tauri and running a poll loop that drains
-//! `SessionEvent`s and notifies the webview.
+//! P2PEM desktop bridge (Phase 1).
+//!
+//! A thin Tauri layer over the existing, UI-agnostic `ChatManager` from the
+//! client crate, driving it the same way the terminal client does — it owns an
+//! `Identity` plus an `Arc<Mutex<ChatManager>>`, shares a single tokio runtime
+//! with Tauri, and runs a background poll loop that drains `SessionEvent`s and
+//! notifies the webview. The frontend (static `dist/`) talks to it over the commands below.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
@@ -28,25 +30,38 @@ type PendingFp = Arc<StdMutex<Option<PendingFingerprint>>>;
 /// Shared application state managed by Tauri.
 struct Bridge {
     manager: Arc<Mutex<ChatManager>>,
-    /// Community server connections; ephemeral, re-fetched on join.
+    /// Client-side Party/Community server connections (channels, members, DMs).
+    /// State is ephemeral and re-fetched on join — the server holds durable history.
     party: Arc<Mutex<PartyManager>>,
     /// Shared with the poll loop, which needs the private key for auto-rehost.
     identity: Arc<StdMutex<Identity>>,
-    /// mDNS handle, created lazily when `enable_mdns` is on.
+    /// mDNS browse/advertise handle, created lazily when `enable_mdns` is on.
     discovery: Arc<StdMutex<Option<Discovery>>>,
+    /// Peers found on the local network (mDNS), refreshed on demand.
     discovered: Arc<StdMutex<Vec<DiscoveredPeer>>>,
     history_path: PathBuf,
+    /// Identity file (sibling of the history file).
     identity_path: PathBuf,
-    /// Saved communities with their pinned server fingerprints.
+    /// Saved communities (`parties.json`, sibling of the history file): address,
+    /// username, and the pinned server fingerprint, so joined communities survive
+    /// a restart (one-click rejoin) and a changed server identity is detected.
     parties_path: PathBuf,
-    /// No password yet (new identity or legacy plaintext key).
+    /// The identity has no password yet (brand new, or a plaintext key from an
+    /// older install), so a set-password step must come before anything else.
     needs_password_setup: AtomicBool,
-    /// Queryable copy of the TOFU prompt, so a missed event never strands it.
+    /// Pending TOFU fingerprint request, held as queryable state so a missed
+    /// `fingerprint-request` event never strands a session awaiting verification.
     pending_fp: PendingFp,
-    /// Startup could not read the identity file; every command refuses rather
-    /// than replace it with a new identity.
+    /// Set when startup found an identity file it could not read. The app boots
+    /// into a dead state that only reports this, rather than generating a
+    /// replacement identity and quietly abandoning the user's history.
     init_error: Option<String>,
+    /// Shared with the poll loop so a command's save and the loop's save do not
+    /// both write the same bytes. See [`SavedSig`].
     saved_sig: SavedSig,
+    /// Exclusive lock on `<data_dir>/.lock`, held for the life of the process
+    /// (TAURI-05). `None` only where no data dir could be resolved.
+    _instance_lock: Option<std::fs::File>,
 }
 
 impl Bridge {
@@ -59,9 +74,14 @@ impl Bridge {
     }
 }
 
-/// Lock a std mutex, recovering from poisoning instead of panicking. Every
-/// bridge mutex guards a value that is only read or wholly replaced, so a
-/// poisoned lock implies no torn state, and panicking would freeze the poll loop.
+/// Lock a std mutex, recovering from poisoning instead of panicking.
+///
+/// `Mutex::lock().unwrap()` turns one panic anywhere in the process into a
+/// permanent, cascading failure: every later access panics too, and in the poll
+/// loop that kills event processing entirely — the app looks frozen rather than
+/// reporting anything. Every std mutex in the bridge guards a value that is
+/// only ever read or wholly replaced, so a poisoned lock does not imply torn
+/// state; carrying on is strictly better than dying.
 fn lock_or_recover<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("a bridge mutex was poisoned by an earlier panic; recovering");
@@ -74,21 +94,44 @@ fn parse_id(id: &str) -> Result<Uuid, String> {
     Uuid::parse_str(id).map_err(|e| e.to_string())
 }
 
-/// Signature of the last successful save, shared by the poll loop and the
-/// commands so one change is not written twice.
+fn lock_identity(identity: &StdMutex<Identity>) -> MutexGuard<'_, Identity> {
+    lock_or_recover(identity)
+}
+
+/// Signature of the state as of the last successful save, shared between the
+/// poll loop and the commands. Both write the *whole* encrypted history, so
+/// without a shared marker every user action cost two full rewrites: the command
+/// saved, then the next poll tick saw a signature it had not recorded and saved
+/// the identical bytes again. That write is O(total history) and fsynced.
 type SavedSig = Arc<StdMutex<Option<u64>>>;
 
-/// Minimum gap between poll-loop history writes. Each save re-encrypts and
-/// fsyncs the whole history, so saving per message would be O(n²); structural
-/// commands still save immediately and window close flushes.
+/// Minimum gap between poll-loop history writes.
+///
+/// Each save re-encrypts and fsyncs the entire history, so one save per message
+/// is O(total history) per message — quadratic over a conversation's life. This
+/// bounds it to a couple of writes a second at worst while keeping the window of
+/// not-yet-persisted messages short. It is a floor on the *poll loop* only:
+/// commands that change something structural (rename, delete, settings, accepted
+/// fingerprint) still save immediately, and the window-close handler flushes.
 const HISTORY_SAVE_MIN_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Best-effort encrypted history save; errors are logged, never propagated. A
-/// no-op while locked. The recorded signature is taken under the same lock as
-/// the snapshot, so it describes exactly what was written; a failed save leaves
-/// it alone so the poll loop retries. An empty unlocked history IS saved, so
-/// deleting the last chat sticks.
+/// Best-effort encrypted history save. A no-op while the identity is still
+/// locked (no history key) or when there is nothing to persist. Errors are
+/// logged, never propagated — a transient disk failure must not break a live
+/// command.
+///
+/// Without this the desktop app never wrote history back: `unlock` loaded it,
+/// but every message sent or received in a session was lost on restart.
+///
+/// On success the signature of exactly what was written is recorded in
+/// `saved_sig`. It is captured under the same lock as the snapshot, so it
+/// describes the bytes that actually went to disk even if state changes while
+/// the encrypt+write runs off-thread. A failed save deliberately leaves the
+/// marker alone, so the poll loop retries.
 async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path, saved_sig: &SavedSig) {
+    // `history_snapshot()` fails only when the identity is still locked (no
+    // history key); in that state there is nothing to persist. An unlocked but
+    // empty history IS saved on purpose, so deleting the last chat sticks.
     let (snapshot, sig) = {
         let m = manager.lock().await;
         (m.history_snapshot(), state_signature(&m))
@@ -104,19 +147,28 @@ async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path, saved_s
     }
 }
 
-/// Signature of the persisted state (shared with the terminal client's
-/// autosave), so the poll loop saves only on a real change.
+/// A cheap signature of the persisted-state surface (chat count + per-chat
+/// message count, delivered count, and title length). Used by the poll loop to
+/// save only when something actually changed, so received messages — and
+/// delivery receipts, which flip `Message.delivered` without changing any
+/// count — are persisted without rewriting the encrypted history on every
+/// idle tick.
 fn state_signature(mgr: &ChatManager) -> u64 {
+    // One definition, shared with the terminal client's autosave.
     mgr.persisted_signature()
 }
 
-/// Refuse post-auth commands until the identity is loaded, unlocked and has a
-/// password. The shell hides the UI in those states; this enforces it.
+/// Reject any post-auth command while the identity is still locked or a password
+/// setup is pending. The React shell already hides the UI in those states, but
+/// the bridge must enforce the barrier itself so no command can mutate state or
+/// start a session before unlock/set-password completes.
 fn ensure_ready(state: &Bridge) -> Result<(), String> {
+    // A broken identity blocks everything: any command that ran here would
+    // operate on the throwaway identity created just to render the error.
     if let Some(err) = &state.init_error {
         return Err(err.clone());
     }
-    if lock_or_recover(&state.identity).is_locked() {
+    if lock_identity(&state.identity).is_locked() {
         return Err("Unlock required".to_string());
     }
     if state.needs_password_setup() {
@@ -125,30 +177,83 @@ fn ensure_ready(state: &Bridge) -> Result<(), String> {
     Ok(())
 }
 
-/// Run a native file dialog on a blocking thread, parented to the app window.
-/// An unowned rfd dialog can open behind the window and the app looks frozen.
-/// `build` gets a parented dialog and calls `pick_file`/`save_file`/`pick_folder`.
-async fn native_file_dialog<R: tauri::Runtime, T, F>(
+/// Run a native file dialog on a blocking thread, **owned by the app window**.
+///
+/// Without an explicit parent, rfd creates an unowned dialog. It is then free to
+/// open *behind* the main window: the app stops responding to clicks (there is a
+/// modal dialog, just not where the user can see it) with nothing on screen to
+/// explain why. That reads as a freeze, and the usual reaction is to kill the
+/// app — mid-transfer, mid-handshake.
+///
+/// The dialog is described as data ([`Dialog`]) rather than built by the
+/// caller, so tests can answer it: under `cfg(test)` no window opens, the
+/// request is recorded and a scripted answer returned (`tests::dialogs`).
+/// That is what lets the commands behind a dialog — what a cancel does, what
+/// a pick reaches, which name a save is pre-filled with — run in tests.
+async fn native_file_dialog<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
-    build: F,
-) -> Result<T, String>
-where
-    F: FnOnce(rfd::FileDialog) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || build(rfd::FileDialog::new().set_parent(&window)))
+    dialog: Dialog,
+) -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(all(test, not(windows)))]
+    {
+        let _ = window;
+        Ok(tests::dialogs::answer(dialog))
+    }
+    #[cfg(not(all(test, not(windows))))]
+    {
+        tokio::task::spawn_blocking(move || {
+            let d = rfd::FileDialog::new().set_parent(&window);
+            match dialog {
+                Dialog::Open { title } => d.set_title(title).pick_file(),
+                Dialog::Save { title, file_name } => {
+                    d.set_title(title).set_file_name(file_name).save_file()
+                }
+                Dialog::Folder { title } => d.set_title(title).pick_folder(),
+            }
+        })
         .await
         .map_err(|e| e.to_string())
+    }
+}
+
+/// A native file dialog to show: pick a file, save one under a suggested
+/// name, or pick a folder. `None` from [`native_file_dialog`] means cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dialog {
+    Open {
+        title: &'static str,
+    },
+    Save {
+        title: &'static str,
+        file_name: String,
+    },
+    Folder {
+        title: &'static str,
+    },
 }
 
 mod commands;
-use commands::party::{upsert_saved_party, SavedParty};
+use p2pem_classic::app::saved_parties::{upsert_saved_party, SavedParty};
 
 // Not on Windows — see the dev-dependencies note in Cargo.toml.
 #[cfg(all(test, not(windows)))]
 mod tests;
 
-/// The command registration, shared by the app and the test harness.
+/// The log filter when `RUST_LOG` is not set. Debug builds log at debug level
+/// for development; a release build does not. Its debug output names files,
+/// peer addresses and frame metadata, and on Linux stdout can end up in the
+/// systemd journal, outside the app's encryption (audit PRIV-05).
+pub(crate) fn default_log_filter(debug_build: bool) -> &'static str {
+    if debug_build {
+        "info,p2pem_classic=debug,messenger_core=debug"
+    } else {
+        "warn,p2pem_desktop=info"
+    }
+}
+
+/// The full command registration, shared by the real app and the test harness
+/// so a command can never be reachable in tests but unregistered in the app
+/// (or vice versa).
 fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync {
     tauri::generate_handler![
         commands::auth::auth_status,
@@ -224,26 +329,53 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
     ]
 }
 
+/// The in-process log buffer: what the app has logged recently, for the
+/// diagnostics bundle (QUAL-07).
+fn app_logs() -> &'static p2pem_classic::logbuf::LogBuffer {
+    static LOGS: std::sync::OnceLock<p2pem_classic::logbuf::LogBuffer> = std::sync::OnceLock::new();
+    LOGS.get_or_init(p2pem_classic::logbuf::LogBuffer::new)
+}
+
+// ── Entry point ─────────────────────────────────────────────────────────────
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,p2pem_classic=debug,messenger_core=debug")
-            }),
-        )
-        .try_init();
+    // ChatManager / core `tracing` logs go to stdout (captured by `tauri dev`)
+    // *and* to an in-process buffer, which is what the diagnostics bundle
+    // carries: a release build on Windows has no stdout at all, so without the
+    // buffer every warning and error vanished (QUAL-07). Override with RUST_LOG.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(default_log_filter(cfg!(debug_assertions)))
+                }),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(app_logs().clone())
+            .try_init();
+    }
 
-    // One runtime for ChatManager's bare `tokio::spawn`s and Tauri's async
-    // commands; leaked so it lives as long as the process.
+    // One shared tokio runtime for both the ChatManager's spawned tasks and
+    // Tauri's async commands. `tauri::async_runtime::set` makes Tauri schedule
+    // async command handlers (and our poll loop) onto this runtime, so the
+    // bare `tokio::spawn` calls inside ChatManager find a runtime context.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
     tauri::async_runtime::set(rt.handle().clone());
+    // Keep the runtime alive for the lifetime of the process.
     Box::leak(Box::new(rt));
 
     let bridge = init_bridge();
+    // Crash reports go beside the app's own data, where the diagnostics
+    // bundle and "open data folder" already point (QUAL-07).
+    p2pem_classic::support::install_panic_hook_in(
+        bridge.history_path.with_file_name("diagnostics"),
+    );
 
     tauri::Builder::default()
         .manage(bridge)
@@ -254,7 +386,8 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Flush history synchronously so nothing is lost between ticks.
+            // Flush history synchronously on close so the final session state
+            // (last messages, deletions) is never lost between poll-loop ticks.
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let bridge = window.state::<Bridge>();
                 let manager = bridge.manager.clone();
@@ -268,10 +401,43 @@ pub fn run() {
 }
 
 /// Build the identity + manager from the desktop app's data directory.
+/// Take the exclusive advisory lock on `<data>/.lock` that marks the folder as
+/// in use. The OS releases it when the process exits, however it exits, so a
+/// crash never leaves the folder stuck.
+fn acquire_instance_lock(data: &std::path::Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data.join(".lock"))
+        .map_err(|e| format!("Could not open the data folder's lock file: {e}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "P2PEM is already running with the data folder {}. Close the other \
+             window first: two copies would each overwrite the other's message history.",
+            data.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => {
+            // A filesystem without locking support should not make the app
+            // unusable; it only loses this guard.
+            tracing::warn!("could not lock the data folder ({e}); continuing without the single-instance guard");
+            Ok(file)
+        }
+    }
+}
+
 fn init_bridge() -> Bridge {
-    // The desktop app's OWN dir ("P2PEM"), not the terminal client's: sharing
-    // one would make both apps the same peer. `P2PEM_DATA_DIR` overrides it to
-    // run extra test peers on one machine.
+    // The data dir holds `identity.json` (this peer's key/fingerprint) and the
+    // encrypted history. It uses the desktop app's OWN identifier ("P2PEM"), NOT
+    // the terminal client's ("EncryptedMessenger"): sharing one dir made both
+    // apps load the same identity, so they were the same P2P peer and could not
+    // connect to each other (a connection between them was a self-connection).
+    // With distinct dirs the two apps are distinct peers and connect normally.
+    //
+    // `P2PEM_DATA_DIR` overrides it, so extra instances can each run with their
+    // own identity/history — handy for testing several peers on one machine:
+    //   P2PEM_DATA_DIR=%LOCALAPPDATA%\p2pem-test cargo tauri dev
     let data_dir: Option<PathBuf> = std::env::var_os("P2PEM_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -279,19 +445,36 @@ fn init_bridge() -> Bridge {
                 .map(|dirs| dirs.data_dir().to_path_buf())
         });
 
-    // Never replace an identity that failed to load: the history key derives
-    // from it. Boot into an error state instead.
+    // A failure to load an *existing* identity must never be papered over by
+    // generating a new one: the history key is derived from the private key, so
+    // a replacement identity silently makes every stored message unreadable and
+    // changes the fingerprint every contact verified. When that happens the app
+    // starts in an error state that the shell surfaces, and touches nothing.
     let mut init_error: Option<String> = None;
+    let mut instance_lock: Option<std::fs::File> = None;
     let (history_path, identity, is_new) = if let Some(data) = data_dir {
         std::fs::create_dir_all(&data).ok();
         tracing::info!(data_dir = %data.display(), "using data directory");
-        match Identity::get_or_create(&data, "User") {
+        // One instance per data folder (TAURI-05). Two would each rewrite the
+        // whole history from their own copy, and the last writer silently
+        // destroys what only the other had received.
+        let locked = match acquire_instance_lock(&data) {
+            Ok(file) => {
+                instance_lock = Some(file);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        match locked
+            .and_then(|()| Identity::get_or_create(&data, "User").map_err(|e| e.to_string()))
+        {
             Ok((id, isnew)) => (data.join("history.json.enc"), id, isnew),
             Err(e) => {
-                tracing::error!("identity load failed: {e}");
-                init_error = Some(e.to_string());
-                // Throwaway identity, only so the error can be shown; every
-                // command refuses while `init_error` is set.
+                tracing::error!("start-up refused: {e}");
+                init_error = Some(e);
+                // A throwaway in-memory identity so the app can boot far enough
+                // to *show* the error. Every command is refused while
+                // `init_error` is set, so it is never saved or used on the wire.
                 (
                     data.join("history.json.enc"),
                     Identity::new_with_plaintext("User".to_string()).expect("identity"),
@@ -308,11 +491,15 @@ fn init_bridge() -> Bridge {
         )
     };
 
-    Bridge::new(identity, history_path, is_new, init_error)
+    Bridge {
+        _instance_lock: instance_lock,
+        ..Bridge::new(identity, history_path, is_new, init_error)
+    }
 }
 
 impl Bridge {
-    /// The bridge over `identity`, with its files beside `history_path`.
+    /// The bridge over `identity`, with its files beside `history_path`. No
+    /// instance lock: `init_bridge` adds the one it took, tests need none.
     fn new(
         identity: Identity,
         history_path: PathBuf,
@@ -325,6 +512,8 @@ impl Bridge {
         Bridge {
             manager: Arc::new(Mutex::new(chat_manager)),
             party: Arc::new(Mutex::new(PartyManager::new())),
+            // A new identity, or a plaintext key in hand (no password), must
+            // get a password before anything else.
             needs_password_setup: AtomicBool::new(is_new || !identity.is_locked()),
             identity: Arc::new(StdMutex::new(identity)),
             discovery: Arc::new(StdMutex::new(None)),
@@ -335,24 +524,36 @@ impl Bridge {
             pending_fp: Arc::new(StdMutex::new(None)),
             init_error,
             saved_sig: Arc::new(StdMutex::new(None)),
+            _instance_lock: None,
         }
     }
 }
 
 /// Signature of everything the chat UI renders (a superset of
-/// `state_signature`); `state-updated` fires only when it changes.
-fn ui_signature(mgr: &ChatManager) -> u64 {
+/// `state_signature`): connection states, transfer progress, hosting and lock
+/// state. The poll loop emits `state-updated` only when this changes, so an
+/// idle app no longer makes the webview refetch conversations four times a
+/// second.
+///
+/// Takes the already computed `state_signature`: the poll
+/// loop needs both each tick, and computing the state signature walks every
+/// message of every conversation — twice per tick was half the loop's cost
+/// (PERF-09).
+fn ui_signature_from(mgr: &ChatManager, state_sig: u64) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    state_signature(mgr).hash(&mut h);
+    state_sig.hash(&mut h);
+    // TOFU trust (the "verified" badge) needs nothing here: accepting a
+    // fingerprint changes `state_sig`, which hashes every chat's
+    // `peer_fingerprint` — `the_ui_signature_moves_for_badges_and_hosting`
+    // pins that it moves.
     for id in mgr.chat_ids() {
         mgr.is_connected(&id).hash(&mut h);
-        // Accepting a fingerprint flips the "verified" badge without changing
-        // any count.
-        if let Some(chat) = mgr.get_chat(id) {
-            chat.peer_fingerprint.hash(&mut h);
-        }
     }
-    // Status changes only; byte progress is `transfer_signature`'s (PERF-01).
+    // A transfer starting, finishing or failing changes what the chat pane
+    // shows; its byte count ticking up does not need the whole conversation
+    // refetched — that is `transfer_signature`'s job (PERF-01).
     for t in mgr.active_transfers_snapshot() {
         t.id.hash(&mut h);
         std::mem::discriminant(&t.status).hash(&mut h);
@@ -365,9 +566,14 @@ fn ui_signature(mgr: &ChatManager) -> u64 {
     h.finish()
 }
 
-/// Transfer progress. When only this moved, the poll loop emits the light
-/// `transfers-updated` instead of a full `state-updated` (PERF-01).
+/// Progress of the active transfers. While anything is in flight this moves
+/// every tick; when it is the *only* thing that moved, the poll loop emits the
+/// light `transfers-updated` (the frontend refetches the transfer list) instead
+/// of `state-updated`, which refetched every conversation and re-serialized the
+/// open one four times a second for the whole transfer (PERF-01).
 fn transfer_signature(mgr: &ChatManager) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     for t in mgr.active_transfers_snapshot() {
         t.id.hash(&mut h);
@@ -376,15 +582,22 @@ fn transfer_signature(mgr: &ChatManager) -> u64 {
     h.finish()
 }
 
-/// Signature of the Communities surface, so `party-updated` fires only on change.
+/// Signature of the Communities surface, so `party-updated` fires only when
+/// the directory or a thread actually changed.
 fn party_signature(p: &PartyManager) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     for sid in p.server_ids() {
         sid.hash(&mut h);
         if let Some(conn) = p.server(sid) {
-            format!("{:?}", conn.status).hash(&mut h);
+            conn.status.hash(&mut h);
             conn.server_name.hash(&mut h);
-            // Hash what is shown, not counts: presence changes keep counts equal.
+            // Hash what is actually *shown*, not how many rows there are. Hashing
+            // the counts meant a member going online or offline — the count is
+            // unchanged — produced an identical signature, so `party-updated`
+            // never fired and the presence dots sat stale until something else
+            // happened to change a count.
             for c in &conn.channels {
                 c.id.hash(&mut h);
                 c.name.hash(&mut h);
@@ -399,7 +612,9 @@ fn party_signature(p: &PartyManager) -> u64 {
             }
             conn.last_error.hash(&mut h);
             conn.last_notice.hash(&mut h);
-            // Drive listing, quota and audit arrive asynchronously.
+            // The Drive listing, quota and audit log arrive asynchronously well
+            // after the request that asked for them, so they have to be part of
+            // the signature or the panel that asked would never be told.
             conn.files.len().hash(&mut h);
             for f in &conn.files {
                 f.hash.hash(&mut h);
@@ -410,7 +625,8 @@ fn party_signature(p: &PartyManager) -> u64 {
             conn.quota.map(|q| (q.used, q.server_used)).hash(&mut h);
             conn.audit.len().hash(&mut h);
             conn.audit.first().map(|a| a.at).hash(&mut h);
-            // Length *and* last seq: a retraction plus an arrival keeps the length.
+            // Per thread, the length *and* the last sequence: a retraction paired
+            // with an arrival leaves the total unchanged but is a real change.
             let mut threads: Vec<_> = conn.messages.iter().collect();
             threads.sort_by_key(|(id, _)| **id);
             for (thread, msgs) in threads {
@@ -431,7 +647,8 @@ fn toast_level_str(l: ToastLevel) -> &'static str {
     }
 }
 
-/// The poll loop's handles, cloned once from the [`Bridge`] at startup.
+/// Everything the poll loop needs from the [`Bridge`], cloned once at startup so
+/// the loop owns its handles rather than borrowing Tauri state on every tick.
 struct PollContext {
     manager: Arc<Mutex<ChatManager>>,
     party: Arc<Mutex<PartyManager>>,
@@ -456,9 +673,11 @@ impl PollContext {
     }
 }
 
+/// How often the auto-rehost check runs.
 const REHOST_CHECK_INTERVAL: Duration = Duration::from_millis(1500);
 
-/// What the poll loop remembers between ticks, to emit and write only on change.
+/// What the poll loop remembers between ticks, so that it emits events and
+/// writes files only when something actually changed.
 #[derive(Default)]
 struct PollMemory {
     last_ui_sig: Option<u64>,
@@ -466,73 +685,183 @@ struct PollMemory {
     last_party_sig: Option<u64>,
     /// Session id of the TOFU prompt currently published to the frontend.
     last_fp_session: Option<Uuid>,
-    /// Servers already recorded as Joined, so parties.json is touched once per join.
+    /// Servers already recorded as Joined, so the saved-communities file is
+    /// touched once per join (to fill in the server's display name), not every
+    /// tick.
     joined_recorded: std::collections::HashSet<Uuid>,
+}
+
+impl PollMemory {
+    /// Which refresh events one tick sends the webview, given this tick's
+    /// signatures, and whether anything moved at all (which keeps the loop on
+    /// its fast period).
+    ///
+    /// - `state-updated` when the rendered chat surface changed, or a TOFU
+    ///   prompt was just published (its fallback polling must run): the
+    ///   webview refetches everything, transfers included;
+    /// - otherwise `transfers-updated` when only transfer progress moved — the
+    ///   light refresh, instead of re-serialising every conversation four
+    ///   times a second for the length of a transfer (PERF-01);
+    /// - `party-updated` when the Communities surface changed.
+    ///
+    /// Nothing is sent for a tick on which nothing changed.
+    fn refresh_events(
+        &mut self,
+        ui_sig: u64,
+        transfer_sig: u64,
+        party_sig: u64,
+        new_prompt: bool,
+    ) -> (Vec<&'static str>, bool) {
+        let mut events = Vec::new();
+        let transfers_moved = self.last_transfer_sig != Some(transfer_sig);
+        self.last_transfer_sig = Some(transfer_sig);
+        let mut moved = transfers_moved;
+        if self.last_ui_sig != Some(ui_sig) || new_prompt {
+            moved = true;
+            self.last_ui_sig = Some(ui_sig);
+            events.push("state-updated");
+        } else if transfers_moved {
+            events.push("transfers-updated");
+        }
+        if self.last_party_sig != Some(party_sig) {
+            moved = true;
+            self.last_party_sig = Some(party_sig);
+            events.push("party-updated");
+        }
+        (events, moved)
+    }
+}
+
+/// Poll period while the user is looking, or something has just moved.
+const POLL_FAST: Duration = Duration::from_millis(250);
+/// Poll period in the background once nothing has moved for
+/// [`POLL_IDLE_AFTER`]. A message arriving then is seen — and notified — at
+/// most this late, and the first one puts the loop back on [`POLL_FAST`].
+const POLL_SLOW: Duration = Duration::from_secs(1);
+const POLL_IDLE_AFTER: Duration = Duration::from_secs(10);
+
+/// How long the poll loop sleeps next (PERF-09). Four wakeups a second, for
+/// as long as the app is open, is what an idle messenger costs a laptop
+/// battery: it keeps the CPU out of its deep idle states.
+fn poll_delay(focused: bool, quiet_for: Duration) -> Duration {
+    if focused || quiet_for < POLL_IDLE_AFTER {
+        POLL_FAST
+    } else {
+        POLL_SLOW
+    }
+}
+
+/// The poll loop's clocks and memory, carried from one tick to the next.
+struct PollState {
+    memory: PollMemory,
+    last_activity: std::time::Instant,
+    last_rehost: std::time::Instant,
+    /// Floor between poll-driven history writes — see `save_history_if_changed`.
+    last_save: std::time::Instant,
+}
+
+impl PollState {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            memory: PollMemory::default(),
+            last_activity: now,
+            last_rehost: now,
+            last_save: now - HISTORY_SAVE_MIN_INTERVAL,
+        }
+    }
 }
 
 /// Periodically drain network events and notify the webview to refresh.
 fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
     tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
-        let mut memory = PollMemory::default();
-        let mut last_rehost = std::time::Instant::now();
-        let mut last_save = std::time::Instant::now() - HISTORY_SAVE_MIN_INTERVAL;
+        let mut state = PollState::new();
+        let mut delay = POLL_FAST;
         loop {
-            interval.tick().await;
-            let party_sig = ctx.poll_parties(&mut memory.joined_recorded).await;
-            if last_rehost.elapsed() >= REHOST_CHECK_INTERVAL {
-                last_rehost = std::time::Instant::now();
-                ctx.auto_rehost().await;
-            }
-            let (prompt, toasts, sig, ui_sig, transfer_sig) = {
-                let mut m = ctx.manager.lock().await;
-                m.poll_session_events();
-                let toasts: Vec<(&'static str, String)> = std::mem::take(&mut m.toasts)
-                    .into_iter()
-                    .map(|t| (toast_level_str(t.level), t.message))
-                    .collect();
-                // Peek, never take: `confirm_fingerprint` needs the queued entry.
-                let prompt = m.pending_fingerprint().cloned();
-                (
-                    prompt,
-                    toasts,
-                    state_signature(&m),
-                    ui_signature(&m),
-                    transfer_signature(&m),
-                )
-            };
-            if ctx.save_history_if_changed(sig, last_save).await {
-                last_save = std::time::Instant::now();
-            }
-            for (level, message) in toasts {
-                let _ = app.emit(
-                    "toast",
-                    serde_json::json!({ "level": level, "message": message }),
-                );
-            }
-            let new_prompt =
-                ctx.publish_fingerprint_prompt(&app, prompt, &mut memory.last_fp_session);
-            let transfers_moved = memory.last_transfer_sig != Some(transfer_sig);
-            memory.last_transfer_sig = Some(transfer_sig);
-            if memory.last_ui_sig != Some(ui_sig) || new_prompt {
-                memory.last_ui_sig = Some(ui_sig);
-                // A full refresh refetches the transfers too.
-                let _ = app.emit("state-updated", ());
-            } else if transfers_moved {
-                let _ = app.emit("transfers-updated", ());
-            }
-            if memory.last_party_sig != Some(party_sig) {
-                memory.last_party_sig = Some(party_sig);
-                let _ = app.emit("party-updated", ());
-            }
+            tokio::time::sleep(delay).await;
+            delay = ctx.tick(&app, &mut state).await;
         }
     });
 }
 
 impl PollContext {
-    /// Drain community events and return their signature. A community is saved
-    /// (and its fingerprint pinned) only once the server has accepted us, so a
-    /// typo'd address or wrong password leaves no entry behind.
+    /// One pass of the poll loop: drain the network and the Communities,
+    /// persist what changed, tell the webview, and say how long to sleep
+    /// before the next pass. Separate from the loop so a test can run the
+    /// loop's real body on a mock runtime, one tick at a time.
+    async fn tick<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        state: &mut PollState,
+    ) -> Duration {
+        let party_sig = self.poll_parties(&mut state.memory.joined_recorded).await;
+        if state.last_rehost.elapsed() >= REHOST_CHECK_INTERVAL {
+            state.last_rehost = std::time::Instant::now();
+            self.auto_rehost().await;
+        }
+        let (prompt, toasts, sig, ui_sig, transfer_sig, focused) = {
+            let mut m = self.manager.lock().await;
+            m.poll_session_events();
+            // Drain ChatManager's internal toasts (Connected, errors,
+            // "connection refused", …) so the webview can surface them.
+            let toasts: Vec<(&'static str, String)> = std::mem::take(&mut m.toasts)
+                .into_iter()
+                .map(|t| (toast_level_str(t.level), t.message))
+                .collect();
+            // Peek, never take: the manager keeps the prompt until the user
+            // actually answers it. Taking it here meant `confirm_fingerprint`
+            // could no longer find the fingerprint to persist, and a second
+            // peer's prompt silently replaced the first one's.
+            let prompt = m.pending_fingerprint().cloned();
+            let sig = state_signature(&m);
+            (
+                prompt,
+                toasts,
+                sig,
+                ui_signature_from(&m, sig),
+                transfer_signature(&m),
+                m.ui_presence().focused,
+            )
+        };
+        // Anything that moved — or a prompt waiting on the user — keeps
+        // the loop fast for a while.
+        let mut moved = !toasts.is_empty() || prompt.is_some();
+        if self.save_history_if_changed(sig, state.last_save).await {
+            state.last_save = std::time::Instant::now();
+        }
+        for (level, message) in toasts {
+            let _ = app.emit(
+                "toast",
+                serde_json::json!({ "level": level, "message": message }),
+            );
+        }
+        let new_prompt =
+            self.publish_fingerprint_prompt(app, prompt, &mut state.memory.last_fp_session);
+        // Emit refresh events only for what changed (see `refresh_events`).
+        let (events, changed) =
+            state
+                .memory
+                .refresh_events(ui_sig, transfer_sig, party_sig, new_prompt);
+        moved |= changed;
+        for event in events {
+            let _ = app.emit(event, ());
+        }
+        if moved {
+            state.last_activity = std::time::Instant::now();
+        }
+        poll_delay(focused, state.last_activity.elapsed())
+    }
+}
+
+impl PollContext {
+    /// Drain Party/Community server events (joins, channel/member updates,
+    /// incoming messages) so the Communities pane stays live, and record newly
+    /// joined communities. Returns the Communities signature.
+    ///
+    /// A community is saved — and its fingerprint pinned — only once the server
+    /// has actually accepted us. Pinning at connect time meant a typo'd address
+    /// or a wrong password left a permanent entry behind for a community the
+    /// user never joined.
     async fn poll_parties(&self, joined_recorded: &mut std::collections::HashSet<Uuid>) -> u64 {
         let mut p = self.party.lock().await;
         p.poll_events();
@@ -554,12 +883,19 @@ impl PollContext {
         party_signature(&p)
     }
 
-    /// Re-open the listener after an accepted peer consumed it. Not gated on
-    /// `auto_host_on_startup` (that is about launch); `check_rehost_needed()`
-    /// requires `is_hosting` and an unlocked conversation. No-op while locked.
+    /// Re-open the listener after an accepted peer consumed it.
+    ///
+    /// Without this the app silently stops accepting new peers after the first
+    /// one. Not gated on `auto_host_on_startup`: that setting decides whether
+    /// hosting begins at launch, not whether hosting the user explicitly
+    /// started survives its first peer — gating on it meant a user who clicked
+    /// "Start hosting" with the setting off accepted exactly one peer, ever.
+    /// `check_rehost_needed()` already requires `is_hosting` and an unlocked
+    /// conversation, so stopping/locking still stops. A no-op while the
+    /// identity is locked (no private key, config not loaded yet).
     async fn auto_rehost(&self) {
         let pk = {
-            let id = lock_or_recover(&self.identity);
+            let id = lock_identity(&self.identity);
             if id.is_locked() {
                 return;
             }
@@ -572,8 +908,9 @@ impl PollContext {
         if !m.check_rehost_needed() {
             return;
         }
-        // Rebind the port in use, not the settings default: the shared address
-        // must stay valid.
+        // Rebind the port actually in use, not the settings default — the user
+        // may have typed another one in the Host pane, and rehosting elsewhere
+        // silently invalidates the address they shared.
         let port = m.hosting_port.unwrap_or(m.config.listen_port);
         match m.start_host(port, pk).await {
             Ok(_) => tracing::info!(port, "auto-rehosted after a consumed listener"),
@@ -581,8 +918,17 @@ impl PollContext {
         }
     }
 
-    /// Persist on change, at most once per `HISTORY_SAVE_MIN_INTERVAL`.
-    /// Returns whether it wrote.
+    /// Persist when the conversation surface changed (e.g. a received
+    /// message), at most once per `HISTORY_SAVE_MIN_INTERVAL`. Returns whether
+    /// it wrote.
+    ///
+    /// The marker is shared with the commands, which also save immediately, so
+    /// a user action does not cost a second identical rewrite on the next tick.
+    /// Coalesced because every save re-encrypts and fsyncs the WHOLE history:
+    /// saving once per message makes a long conversation cost O(n²) over its
+    /// life. Nothing is risked beyond that window — the close handler flushes
+    /// synchronously, and the marker means a deferred change is still pending,
+    /// not lost.
     async fn save_history_if_changed(&self, sig: u64, last_save: std::time::Instant) -> bool {
         let already_saved = *lock_or_recover(&self.saved_sig) == Some(sig);
         if already_saved || last_save.elapsed() < HISTORY_SAVE_MIN_INTERVAL {
@@ -592,12 +938,17 @@ impl PollContext {
         true
     }
 
-    /// Publish the head of the manager's TOFU queue. Fires only when the head's
-    /// identity changes, or a closed dialog would reopen every tick. Returns
-    /// `true` when a new prompt appeared.
-    fn publish_fingerprint_prompt(
+    /// Publish whichever TOFU prompt is at the head of the manager's queue.
+    /// Returns `true` when a new prompt appeared.
+    ///
+    /// Because the loop peeks rather than takes, this runs every tick — so the
+    /// event only fires when the *identity* of the prompt changes, or a closed
+    /// dialog would spring back open four times a second. When the user
+    /// answers one, the next peer's prompt becomes the head and is emitted in
+    /// its turn instead of being lost.
+    fn publish_fingerprint_prompt<R: tauri::Runtime>(
         &self,
-        app: &tauri::AppHandle,
+        app: &tauri::AppHandle<R>,
         prompt: Option<PendingFingerprint>,
         last_session: &mut Option<Uuid>,
     ) -> bool {
@@ -607,11 +958,14 @@ impl PollContext {
         }
         *last_session = head;
         let Some(prompt) = prompt else {
-            // Queue drained: stop the fallback poll resurfacing a dead prompt.
+            // The queue drained (answered, or the session died): clear the
+            // queryable copy so the fallback poll stops resurfacing a prompt
+            // nobody can answer any more.
             *lock_or_recover(&self.pending_fp) = None;
             return false;
         };
         tracing::info!(peer = %prompt.peer_name, session = %prompt.session_id, "TOFU fingerprint verification requested");
+        // Store it as queryable state first, then emit the event.
         let payload = fingerprint_prompt_json(&prompt);
         *lock_or_recover(&self.pending_fp) = Some(prompt);
         let _ = app.emit("fingerprint-request", payload);
@@ -622,16 +976,19 @@ impl PollContext {
 /// The shape the frontend expects for a TOFU prompt (event and poll alike).
 ///
 /// `warning` is `null` for an ordinary first use, otherwise
-/// `{ kind: "key_changed", previous }` or
-/// `{ kind: "invite_mismatch", contact, expected }` (CRYPTO-04). `Verify`
-/// leads with it, so a key that is not the invite's never reads as a first
-/// contact.
+/// `{ kind: "key_changed", previous, repoints }` (`repoints`: the contact an
+/// accept moves to the new key, or null), `{ kind: "invite_mismatch",
+/// contact, expected }` (CRYPTO-04), or `{ kind: "contact_address_mismatch",
+/// contact, expected }` (listener side: a saved contact's address, another
+/// key). `Verify` leads with it, so none of them reads as a first contact.
 fn fingerprint_prompt_json(prompt: &PendingFingerprint) -> serde_json::Value {
     let warning = match &prompt.warning {
         None => serde_json::Value::Null,
-        Some(FingerprintWarning::KeyChanged { previous }) => serde_json::json!({
+        Some(FingerprintWarning::KeyChanged { previous, repoints }) => serde_json::json!({
             "kind": "key_changed",
             "previous": previous,
+            // The contact an accept repoints to the new key, or null.
+            "repoints": repoints,
         }),
         Some(FingerprintWarning::InviteMismatch {
             contact_name,
@@ -639,6 +996,15 @@ fn fingerprint_prompt_json(prompt: &PendingFingerprint) -> serde_json::Value {
             ..
         }) => serde_json::json!({
             "kind": "invite_mismatch",
+            "contact": contact_name,
+            "expected": expected,
+        }),
+        Some(FingerprintWarning::ContactAddressMismatch {
+            contact_name,
+            expected,
+            ..
+        }) => serde_json::json!({
+            "kind": "contact_address_mismatch",
             "contact": contact_name,
             "expected": expected,
         }),

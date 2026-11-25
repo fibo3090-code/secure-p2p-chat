@@ -1,24 +1,20 @@
+// @vitest-environment jsdom
+// (bridge.js, which owns the extension list, reads `location` on import.)
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
 import { RISKY_EXTENSIONS, fileKind, splitName } from "./fileKind.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
-
 describe("fileKind", () => {
-  it("mirrors the bridge's list of extensions that execute", () => {
-    const rust = readFileSync(resolve(here, "../../src-tauri/src/commands/chats.rs"), "utf8");
-    // The list is a whitespace-separated string literal (`\` continues it
-    // across lines, CRLF in a Windows checkout); an array of literals is
-    // accepted too.
-    const list = rust.match(/const RISKY_EXTENSIONS: &str = "([^"]*)";/);
-    const array = rust.match(/const RISKY_EXTENSIONS: &\[&str\] = &\[([\s\S]*?)\];/);
-    const fromRust = list
-      ? list[1].replace(/\\\r?\n/g, " ").split(/\s+/).filter(Boolean)
-      : [...array[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
-    expect(fromRust.length).toBeGreaterThan(40);
-    expect([...RISKY_EXTENSIONS].sort()).toEqual([...fromRust].sort());
+  // One list, the bridge's: a card that names a file "document" while the
+  // click warns "this is a program" is the confusion this module removes.
+  it("calls every extension the bridge refuses to open a program", () => {
+    expect(RISKY_EXTENSIONS.size).toBeGreaterThan(40);
+    for (const ext of RISKY_EXTENSIONS) {
+      expect(fileKind(`x.${ext}`), ext).toMatchObject({ risky: true, label: "Program" });
+    }
+    // Ones a shorter copy of the list once missed.
+    for (const name of ["setup.dmg", "invoice.docm", "page.html", "disk.iso"]) {
+      expect(fileKind(name).risky, name).toBe(true);
+    }
   });
 
   it("judges a double extension by the final one", () => {

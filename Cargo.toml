@@ -15,7 +15,7 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 messenger-core = { path = "core" }
-# Only ever a dev-dependency of the client, so `tests/party_e2e.rs` can stand a
+# Only ever a dev-dependency of the client, so `tests/it/party.rs` can stand a
 # real Community server up in process. Acyclic: the server depends only on core.
 messenger-server = { path = "server" }
 
@@ -92,7 +92,7 @@ thiserror = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
-argon2 = "0.6"
+argon2 = { version = "0.6", features = ["parallel"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # File dialogs
@@ -105,8 +105,8 @@ open = "5"
 notify-rust = "4"
 
 # QR code generation and scanning
-qrcode = "0.14.0"
-image = "0.25.9"
+qrcode = { version = "0.14.0", default-features = false, features = ["image"] }
+image = { version = "0.25.9", default-features = false, features = ["png"] }
 arboard = "3"
 chacha20poly1305 = "0.10.1"
 

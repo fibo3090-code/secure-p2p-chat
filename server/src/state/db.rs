@@ -32,6 +32,9 @@ pub(super) struct LegacySnapshot {
     pub(super) dm_threads: Vec<LegacyDmThread>,
 }
 
+/// What a sender is told when their message could not be written.
+pub(super) const STORE_FAILED: &str = "the server could not store the message; try again";
+
 impl PartyState {
     /// Run one logical mutation as one database transaction, so the rows it
     /// touches (refcount, file reference, message, audit entry) commit together
@@ -157,14 +160,24 @@ impl PartyState {
         });
     }
 
-    pub(super) fn persist_message(&self, e: &Envelope) {
-        self.mirror("persist party message", |conn| insert_message_row(conn, e));
+    /// Write a channel message's row. An `Err` means it is not stored, and
+    /// the caller must not confirm it (QUAL-05): unlike the bookkeeping rows,
+    /// a message is the thing a sender is told was kept.
+    pub(super) fn persist_message(&self, e: &Envelope) -> Result<(), String> {
+        let Some(conn) = &self.db else { return Ok(()) };
+        insert_message_row(conn, e).map_err(|e| {
+            tracing::error!(error = %e, "failed to persist party message");
+            STORE_FAILED.to_string()
+        })
     }
 
-    pub(super) fn persist_dm(&self, thread_id: Uuid, e: &Envelope) {
-        self.mirror("persist party direct message", |conn| {
-            insert_dm_message_row(conn, thread_id, e)
-        });
+    /// The DM twin of [`Self::persist_message`].
+    pub(super) fn persist_dm(&self, thread_id: Uuid, e: &Envelope) -> Result<(), String> {
+        let Some(conn) = &self.db else { return Ok(()) };
+        insert_dm_message_row(conn, thread_id, e).map_err(|e| {
+            tracing::error!(error = %e, "failed to persist party direct message");
+            STORE_FAILED.to_string()
+        })
     }
 
     pub(super) fn persist_blob_row(&self, hash: &str, size: u64, mime: &str, refcount: u32) {

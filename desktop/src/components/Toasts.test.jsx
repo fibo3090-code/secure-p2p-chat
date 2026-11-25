@@ -19,8 +19,8 @@ function clearAll() {
   current.forEach((t) => dismiss(t.id));
 }
 
-beforeEach(clearAll);
-afterEach(() => { vi.useRealTimers(); clearAll(); });
+beforeEach(() => act(clearAll));
+afterEach(() => { act(clearAll); vi.useRealTimers(); });
 
 describe("Toasts", () => {
   it("puts errors in an assertive region and everything else in a polite one", () => {

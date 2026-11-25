@@ -176,16 +176,27 @@ pub const MAX_FILENAME_BYTES: usize = 150;
 /// Windows device names, reserved in any directory and with any extension.
 #[rustfmt::skip]
 const WINDOWS_RESERVED: &[&str] = &[
-    "con", "prn", "aux", "nul",
-    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
-    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "con", "prn", "aux", "nul", "conin$", "conout$",
+    "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "com\u{00B9}", "com\u{00B2}", "com\u{00B3}",
+    "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "lpt\u{00B9}", "lpt\u{00B2}", "lpt\u{00B3}",
 ];
 
 /// C0/C1 controls and bidi overrides, which must never survive into a filename
 /// (U+202E renders `photo_gnp.exe` as `photo_exe.png`).
 fn is_forbidden_char(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
+        || matches!(
+            c,
+            '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{061C}' // Arabic letter mark, a bidi mark like the two above
+                | '\u{2028}' // line separator: not `is_control`, still a line break
+                | '\u{2029}' // paragraph separator
+        )
 }
 
 /// True when `name` contains an invisible or text-direction-changing character
@@ -200,9 +211,35 @@ pub fn has_hidden_characters(name: &str) -> bool {
                     | '\u{180E}'                // Mongolian vowel separator
                     | '\u{200B}'..='\u{200D}'  // zero-width space / (non-)joiner
                     | '\u{2060}'..='\u{2064}'  // word joiner, invisible operators
-                    | '\u{FEFF}' // byte-order mark / zero-width no-break space
+                    | '\u{FEFF}'               // byte-order mark / zero-width no-break space
+                    | '\u{034F}'               // combining grapheme joiner
+                    | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // Hangul fillers (blank)
+                    | '\u{FE00}'..='\u{FE0F}' // variation selectors
+                    | '\u{E0000}'..='\u{E007F}' // tag characters (CRYPTO-12)
             )
     })
+}
+
+/// Tag a file received from a peer the way a browser tags a download, so the
+/// OS applies its own protections when it is opened (TAURI-06): on Windows a
+/// `Zone.Identifier` stream with `ZoneId=3` (Internet) is what makes
+/// SmartScreen check an executable and Office open a document in Protected
+/// View. Best effort — a filesystem without alternate data streams (FAT, some
+/// network shares) simply does not get the tag.
+///
+/// macOS needs no code: the desktop bundle sets `LSFileQuarantineEnabled`, so
+/// the system quarantines every file the app writes. Linux has no equivalent.
+pub fn mark_as_downloaded(path: &Path) {
+    #[cfg(windows)]
+    {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        if let Err(e) = std::fs::write(&stream, b"[ZoneTransfer]\r\nZoneId=3\r\n") {
+            tracing::debug!(path = %path.display(), "could not mark a received file as downloaded: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
 }
 
 /// Reduce a peer-supplied name to something safe to create and honest to
@@ -222,10 +259,13 @@ pub fn sanitize_filename(filename: &str) -> String {
     let mut sanitized = tidy_edges(&truncate_filename_bytes(&mapped, MAX_FILENAME_BYTES));
 
     // Reserved names are reserved only as the stem, so prefixing defuses them.
+    // Win32 ignores trailing spaces and dots in the stem, so `CON .txt` is the
+    // console too (CRYPTO-13).
     let stem = sanitized
         .split('.')
         .next()
         .unwrap_or("")
+        .trim_end_matches([' ', '.'])
         .to_ascii_lowercase();
     if WINDOWS_RESERVED.contains(&stem.as_str()) {
         sanitized = format!("_{sanitized}");
@@ -435,6 +475,75 @@ pub fn primary_local_ipv4() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// CRYPTO-12: characters that render as nothing, or change how the text
+    /// around them is drawn, but slipped past the name checks — a username of
+    /// Hangul fillers looks blank, `admin` plus a tag character looks like
+    /// `admin`.
+    #[test]
+    fn names_hiding_these_characters_are_refused() {
+        for c in [
+            '\u{061C}', // Arabic letter mark (bidi)
+            '\u{2028}',
+            '\u{2029}', // line / paragraph separator
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}', // Hangul fillers
+            '\u{034F}', // combining grapheme joiner
+            '\u{FE00}',
+            '\u{FE0F}', // variation selectors
+            '\u{E0001}',
+            '\u{E0061}',
+            '\u{E007F}', // tag characters
+        ] {
+            let name = format!("ad{c}min");
+            assert!(
+                super::has_hidden_characters(&name),
+                "U+{:04X} passed",
+                c as u32
+            );
+        }
+        assert!(!super::has_hidden_characters("admin"));
+        assert!(!super::has_hidden_characters("Zoë 李"));
+        // A filename keeps neither a line break nor a bidi mark: either one
+        // rearranges the file card that draws it.
+        for c in ['\u{2028}', '\u{2029}', '\u{061C}'] {
+            let cleaned = super::sanitize_filename(&format!("report{c}.pdf"));
+            assert!(
+                !cleaned.contains(c),
+                "U+{:04X} kept in {cleaned:?}",
+                c as u32
+            );
+        }
+    }
+
+    /// CRYPTO-13: Windows reserves more device names than the list had, and
+    /// ignores trailing spaces and dots in the stem: `CON .txt` is `CON`.
+    #[test]
+    fn every_reserved_windows_device_name_is_defused() {
+        for name in [
+            "COM0.txt",
+            "LPT0.log",
+            "COM\u{00B9}.txt",
+            "COM\u{00B2}",
+            "COM\u{00B3}.dat",
+            "LPT\u{00B9}.txt",
+            "LPT\u{00B2}",
+            "lpt\u{00B3}.x",
+            "CONIN$.txt",
+            "conout$",
+            "CON .txt",
+            "nul. .txt",
+            "Aux  .md",
+        ] {
+            let cleaned = super::sanitize_filename(name);
+            assert!(cleaned.starts_with('_'), "{name:?} became {cleaned:?}");
+        }
+        for name in ["console.txt", "com10.txt", "lpt.txt", "nullify.md"] {
+            assert_eq!(super::sanitize_filename(name), name);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -529,34 +638,100 @@ mod tests {
         assert!(short.starts_with("abcdefgh"));
     }
 
+    /// What users actually paste into "address" fields, against the one
+    /// parser every connect path goes through (TUI, contacts, invites, the
+    /// relay and the community client).
     #[test]
-    fn test_parse_host_port_ipv4_and_hostname() {
-        assert_eq!(
-            parse_host_port("127.0.0.1:12345", None).unwrap(),
-            ("127.0.0.1".to_string(), 12345)
-        );
-        assert_eq!(
-            parse_host_port("example.local", Some(9000)).unwrap(),
-            ("example.local".to_string(), 9000)
-        );
+    fn parse_host_port_accepts_what_can_be_dialled() {
+        for (input, default, host, port) in [
+            ("127.0.0.1:12345", None, "127.0.0.1", 12345),
+            ("example.com:80", None, "example.com", 80),
+            ("  example.com:80 \n", None, "example.com", 80),
+            ("127.0.0.1:1", None, "127.0.0.1", 1),
+            ("[::1]:65535", None, "::1", 65535),
+            ("[fe80::1%eth0]:80", None, "fe80::1%eth0", 80),
+            ("::1", Some(12345), "::1", 12345),
+            ("2001:db8::7", Some(9), "2001:db8::7", 9),
+            ("example.local", Some(9000), "example.local", 9000),
+            ("[::1]", Some(7), "::1", 7),
+        ] {
+            assert_eq!(
+                parse_host_port(input, default).unwrap_or_else(|e| panic!("{input:?}: {e}")),
+                (host.to_string(), port),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_parse_host_port_ipv6() {
-        assert_eq!(
-            parse_host_port("[::1]:12345", None).unwrap(),
-            ("::1".to_string(), 12345)
-        );
-        assert_eq!(
-            parse_host_port("::1", Some(12345)).unwrap(),
-            ("::1".to_string(), 12345)
-        );
-        assert!(parse_host_port("::1", None).is_err());
+    fn parse_host_port_refuses_what_cannot_be_dialled() {
+        let refused = |input: &str, default: Option<u16>| {
+            if let Ok(parsed) = parse_host_port(input, default) {
+                panic!("{input:?} (default {default:?}) was accepted as {parsed:?}");
+            }
+        };
+        for default in [None, Some(12345)] {
+            // Nothing to dial.
+            for input in ["", "   ", ":80", "[]:80", "[]"] {
+                refused(input, default);
+            }
+            // Pasted URLs and garbage are not hosts.
+            for input in [
+                "http://example.com:8080",
+                "chat-p2p://invite/abc",
+                "example.com:80:90",
+                "ex ample.com:80",
+                "[::1]x",
+                "[::1:80",
+            ] {
+                refused(input, default);
+            }
+        }
+        // Ports that cannot be dialled.
+        for input in [
+            "example.com:0",
+            "example.com:65536",
+            "example.com:-1",
+            "example.com:+80",
+            "example.com:",
+            "[::1]:0",
+        ] {
+            refused(input, None);
+        }
+        // A bare IPv6 address with no default port is ambiguous, not "::" + port 1.
+        refused("::1", None);
     }
 
     #[test]
     fn test_format_host_port_brackets_ipv6() {
         assert_eq!(format_host_port("::1", 12345), "[::1]:12345");
         assert_eq!(format_host_port("127.0.0.1", 12345), "127.0.0.1:12345");
+    }
+}
+
+/// Resolves when the process is asked to stop: Ctrl+C (SIGINT) anywhere, and
+/// SIGTERM on Unix (what `docker stop`, systemd and `kill` send). The server
+/// and the relay select on it, so they log and return instead of dying
+/// mid-write — and so an instrumented test binary writes its coverage on the
+/// way out, which a killed one never did.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

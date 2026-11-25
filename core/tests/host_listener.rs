@@ -116,3 +116,55 @@ async fn binding_an_occupied_port_is_an_error_the_caller_can_see() {
         "the error should name the port it could not take, got: {err}"
     );
 }
+
+/// The host's per-address limit (5 connections per 10 s) is wired into the
+/// accept loop: the first five connections from one address each get the
+/// host's opening version frame; the sixth inside the window is closed without
+/// a byte. Each earlier connection is dropped before the next, so the
+/// handshake-slot cap (4) is never what refuses it. Relies on nextest's
+/// process-per-test: the limiter is process-global.
+#[tokio::test]
+async fn a_sixth_connection_from_one_address_inside_the_window_is_refused() {
+    use tokio::io::AsyncReadExt;
+    let listener = bind_host_listener(0).await.expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let (to_app_tx, _to_app_rx) = mpsc::unbounded_channel();
+    let (_from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+    let (_file_tx, file_rx) = mpsc::channel(4);
+    let (_confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+    let privkey = generate_rsa_keypair(RSA_KEY_BITS).expect("keypair");
+    let host = tokio::spawn(run_host_session(
+        listener,
+        privkey,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+        confirm_rx,
+        uuid::Uuid::new_v4(),
+        None,
+    ));
+
+    // Bytes the host sends on a fresh connection before it closes, if any.
+    async fn first_bytes(port: u16) -> usize {
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => 0, // reset: refused
+            Err(_) => panic!("the host neither spoke nor closed"),
+        }
+    }
+    for i in 1..=5 {
+        assert!(first_bytes(port).await > 0, "connection {i} was refused");
+        // Let the host notice the drop and free the handshake slot.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        first_bytes(port).await,
+        0,
+        "the sixth connection was served"
+    );
+    host.abort();
+}

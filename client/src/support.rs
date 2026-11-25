@@ -69,6 +69,15 @@ pub struct DiagnosticsReport {
 
 /// Render the retained log events as plain text for the clipboard and the
 /// diagnostics bundle.
+/// The event log as it may leave the machine — copied to the clipboard or
+/// put in a diagnostics bundle: [`format_event_logs`] scrubbed by
+/// [`redact_for_sharing`]. One function for both, because log lines now carry
+/// their structured fields (fingerprints, addresses — QUAL-06) and a copy is
+/// usually pasted into a public issue, exactly like the bundle.
+pub fn shareable_event_logs(logs: &LogBuffer) -> String {
+    redact_for_sharing(&format_event_logs(logs))
+}
+
 pub fn format_event_logs(logs: &LogBuffer) -> String {
     logs.events()
         .iter()
@@ -108,24 +117,163 @@ pub fn export_diagnostics_bundle(
     std::fs::create_dir_all(&bundle_dir)
         .with_context(|| format!("failed to create bundle directory {}", bundle_dir.display()))?;
 
+    let report_path = bundle_dir.join("diagnostics.json");
+    let logs_path = bundle_dir.join("logs.txt");
+    let readme_path = bundle_dir.join("README.txt");
+
+    // Owner-only, like everything else the app writes about its user, and the
+    // logs scrubbed: this bundle is made to be attached to a public issue, and
+    // it carried live relay tokens, peer addresses and full fingerprints in
+    // world-readable files (audit PRIV-04).
+    let write = |path: &Path, body: &[u8]| {
+        messenger_core::util::write_file_atomic(path, body)
+            .with_context(|| format!("failed to write {}", path.display()))
+    };
     let report_json = serde_json::to_string_pretty(report)?;
-    for (name, contents) in [
-        ("diagnostics.json", report_json.as_str()),
-        ("logs.txt", logs),
-        (
-            "README.txt",
-            "Diagnostics bundle for support.\nShare diagnostics.json and logs.txt when reporting a bug.\nPrivate keys are not included.\n",
-        ),
-    ] {
-        let path = bundle_dir.join(name);
-        std::fs::write(&path, contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-    }
+    write(&report_path, report_json.as_bytes())?;
+    write(&logs_path, redact_for_sharing(logs).as_bytes())?;
+    write(
+        &readme_path,
+        b"Diagnostics bundle for support.\n\
+          Share diagnostics.json and logs.txt when reporting a bug.\n\
+          Private keys and message text are not included. Relay tokens, long\n\
+          fingerprints, IP addresses (IPv4 and IPv6) and server host names in the\n\
+          logs are replaced with <hex> / <ip> / <host>, but file names and contact\n\
+          names may remain: read logs.txt before sharing it.\n",
+    )?;
 
     Ok(bundle_dir)
 }
 
+/// Scrub what must not leave the machine from text meant to be shared: runs of
+/// 32+ hex digits (relay tokens, fingerprints, hashes) become `<hex>`, IP
+/// addresses — IPv4 and IPv6, bracketed or not, v4-mapped included — `<ip>`,
+/// and a host name that names a server (followed by `:port`, or after a
+/// `relay:` label) `<host>`. Best effort by shape: a short fingerprint prefix,
+/// which identifies nothing alone, is kept, names are not recognised, and a
+/// bare dotted name with no port is kept, because it cannot be told from a
+/// file name (`report.pdf`).
+pub fn redact_for_sharing(text: &str) -> String {
+    redact_hex_and_ipv4(&redact_network_names(text))
+}
+
+/// The address half of [`redact_for_sharing`]: IPv6 (which the word-based pass
+/// cannot see — `:` splits it) and server host names. Tokens are runs between
+/// whitespace and `()[]{},;"'<>=`, so `[2001:db8::5]:12345` yields `2001:db8::5`.
+fn redact_network_names(text: &str) -> String {
+    const DELIMITERS: &[char] = &[
+        '(', ')', '[', ']', '{', '}', ',', ';', '"', '\'', '<', '>', '=',
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        out.push_str(&redact_address_token(token));
+        token.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() || DELIMITERS.contains(&c) {
+            flush(&mut token, &mut out);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+fn redact_address_token(token: &str) -> String {
+    let core = token.trim_end_matches(['.', ':']);
+    let tail = &token[core.len()..];
+    // The labels the apps print before an address: `p2p:` (hole punched) and
+    // `relay:` (bridged through a relay server named by host).
+    let (label, rest) = match core.split_once(':') {
+        Some((l @ ("p2p" | "relay"), rest)) => (Some(l), rest),
+        _ => (None, core),
+    };
+    let redacted = if rest.parse::<std::net::IpAddr>().is_ok() {
+        Some("<ip>".to_string())
+    } else if rest.parse::<std::net::SocketAddr>().is_ok() {
+        rest.rsplit_once(':')
+            .map(|(_, port)| format!("<ip>:{port}"))
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() && is_host_name(host) => {
+                Some(format!("<host>:{port}"))
+            }
+            _ if label == Some("relay") && is_host_name(rest) => Some("<host>".to_string()),
+            _ => None,
+        }
+    };
+    match redacted {
+        Some(r) => format!(
+            "{}{r}{tail}",
+            label.map(|l| format!("{l}:")).unwrap_or_default()
+        ),
+        None => token.to_string(),
+    }
+}
+
+/// A DNS name with at least two labels and an alphabetic top level.
+fn is_host_name(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !l.starts_with('-')
+        })
+        && labels
+            .last()
+            .is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// The word-based half of [`redact_for_sharing`]: long hex runs and IPv4.
+fn redact_hex_and_ipv4(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let core = word.trim_end_matches('.');
+        let tail = &word[core.len()..];
+        let is_hex = core.len() >= 32 && core.chars().all(|c| c.is_ascii_hexdigit());
+        let parts: Vec<&str> = core.split('.').collect();
+        let is_ipv4 = parts.len() == 4
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.len() <= 3 && p.parse::<u16>().is_ok_and(|n| n <= 255));
+        if is_hex {
+            out.push_str("<hex>");
+            out.push_str(tail);
+        } else if is_ipv4 {
+            out.push_str("<ip>");
+            out.push_str(tail);
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 pub fn install_panic_hook() {
+    install_panic_hook_in(default_diagnostics_dir());
+}
+
+/// [`install_panic_hook`] writing under `diagnostics_dir/crashes`. The
+/// desktop app passes its own data folder: the default is the terminal
+/// client's, and the desktop shipped with no hook at all, so a crash in a
+/// `panic = "abort"` release left no trace anywhere (QUAL-07).
+pub fn install_panic_hook_in(diagnostics_dir: PathBuf) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -141,7 +289,7 @@ pub fn install_panic_hook() {
             .map(|loc| format!("{}:{}", loc.file(), loc.line()))
             .unwrap_or_else(|| "unknown".to_string());
 
-        let crash_dir = default_diagnostics_dir().join("crashes");
+        let crash_dir = diagnostics_dir.join("crashes");
         let _ = std::fs::create_dir_all(&crash_dir);
         let crash_path =
             crash_dir.join(format!("panic-{}.log", Utc::now().format("%Y%m%d-%H%M%S")));
@@ -164,6 +312,27 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic leaves a report where it was told to, with the message and
+    /// where it happened.
+    #[test]
+    fn a_panic_leaves_a_crash_report_in_the_given_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        install_panic_hook_in(dir.path().to_path_buf());
+        let caught = std::panic::catch_unwind(|| panic!("the crash under test"));
+        // Back to the default hook before asserting, so a failure below is
+        // reported normally.
+        let _ = std::panic::take_hook();
+        assert!(caught.is_err());
+        let reports: Vec<_> = std::fs::read_dir(dir.path().join("crashes"))
+            .expect("no crashes folder")
+            .flatten()
+            .collect();
+        assert_eq!(reports.len(), 1);
+        let report = std::fs::read_to_string(reports[0].path()).unwrap();
+        assert!(report.contains("panic: the crash under test"), "{report}");
+        assert!(report.contains("support.rs"), "no location: {report}");
+    }
 
     #[test]
     fn export_bundle_writes_expected_files() {
@@ -188,9 +357,103 @@ mod tests {
             config: DiagnosticsConfig::from(&Config::default()),
         };
 
-        let bundle_dir = export_diagnostics_bundle(dir.path(), &report, "hello logs").unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let fp = "ab".repeat(32);
+        let logs = format!("relay token {token} from 192.168.1.20:12345 peer {fp}.");
+        let bundle_dir = export_diagnostics_bundle(dir.path(), &report, &logs).unwrap();
         assert!(bundle_dir.join("diagnostics.json").exists());
-        assert!(bundle_dir.join("logs.txt").exists());
         assert!(bundle_dir.join("README.txt").exists());
+
+        // PRIV-04: the bundle is meant to be attached to a public issue, and
+        // its logs carried live relay tokens, peer addresses and full
+        // fingerprints, in files any local user could read.
+        let written = std::fs::read_to_string(bundle_dir.join("logs.txt")).unwrap();
+        for leaked in [token, "192.168.1.20", fp.as_str()] {
+            assert!(
+                !written.contains(leaked),
+                "{leaked} left in the shared logs: {written}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in ["diagnostics.json", "logs.txt", "README.txt"] {
+                let mode = std::fs::metadata(bundle_dir.join(f))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "{f} is {:o}", mode & 0o777);
+            }
+        }
+    }
+
+    #[test]
+    fn redaction_removes_secrets_and_keeps_the_rest() {
+        let out = redact_for_sharing(
+            "v1.2.3 dialled 10.0.0.5:9000 with 0123456789ABCDEF0123456789ABCDEF; port 12345 ok",
+        );
+        assert_eq!(out, "v1.2.3 dialled <ip>:9000 with <hex>; port 12345 ok");
+        // Not addresses: too few parts, or an octet out of range.
+        assert_eq!(
+            redact_for_sharing("1.2.3 and 1.2.3.999"),
+            "1.2.3 and 1.2.3.999"
+        );
+        // Short hex (an 8-char fingerprint prefix) is kept: it identifies nothing alone.
+        assert_eq!(redact_for_sharing("fp abcd1234"), "fp abcd1234");
+    }
+
+    /// #213 review: only dotted-quad IPv4 was matched, so IPv6 addresses
+    /// ("dialled [2001:db8::5]:12345") and relay host names went out in the
+    /// "scrubbed" bundle untouched.
+    #[test]
+    fn redaction_removes_ipv6_addresses_and_server_names() {
+        for (raw, scrubbed) in [
+            ("dialled [2001:db8::5]:12345 ok", "dialled [<ip>]:12345 ok"),
+            ("peer fd00::1 left", "peer <ip> left"),
+            ("from [::ffff:203.0.113.7]:40000", "from [<ip>]:40000"),
+            ("label p2p:[2001:db8::9]:7", "label p2p:[<ip>]:7"),
+            ("label p2p:198.51.100.2:7", "label p2p:<ip>:7"),
+            (
+                "via relay:relay.example.com:9000.",
+                "via relay:<host>:9000.",
+            ),
+            ("via relay:relay.example.org", "via relay:<host>"),
+            (
+                "connect to chat.example.net:443 failed",
+                "connect to <host>:443 failed",
+            ),
+            ("addr=203.0.113.7:12345", "addr=<ip>:12345"),
+        ] {
+            assert_eq!(redact_for_sharing(raw), scrubbed, "{raw}");
+        }
+        // Not addresses: times, Rust paths, file names, versions.
+        for kept in [
+            "at 2026-11-24T19:56:54.568Z",
+            "p2pem_classic::app::chat_manager::events",
+            "saved report.pdf",
+            "v1.2.3 and 12:34:56",
+        ] {
+            assert_eq!(redact_for_sharing(kept), kept);
+        }
+    }
+
+    /// What leaves the machine is scrubbed, fields included.
+    #[test]
+    fn the_shareable_log_keeps_the_error_and_drops_identifiers() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = LogBuffer::new();
+        let fp = "ab".repeat(32);
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(logs.clone()),
+            || {
+                tracing::warn!(peer = %fp, addr = "203.0.113.7:12345", error = "handshake timed out", "dial failed");
+            },
+        );
+        let out = shareable_event_logs(&logs);
+        assert!(
+            out.contains("dial failed") && out.contains("handshake timed out"),
+            "{out}"
+        );
+        assert!(!out.contains(&fp) && !out.contains("203.0.113.7"), "{out}");
     }
 }

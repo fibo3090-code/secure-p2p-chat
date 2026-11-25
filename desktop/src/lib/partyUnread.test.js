@@ -40,7 +40,7 @@ describe("computeUnread", () => {
 
   it("counts only growth beyond the read mark", () => {
     const id = sid();
-    markRead(id, "general", 10);
+    markRead({ id }, "general", 10);
     const { total, byKey } = computeUnread([server(id, 13)]);
     expect(total).toBe(3);
     expect(byKey[`${id}|general`]).toBe(3);
@@ -48,13 +48,13 @@ describe("computeUnread", () => {
 
   it("never reports negative unread when counts shrink", () => {
     const id = sid();
-    markRead(id, "general", 10);
+    markRead({ id }, "general", 10);
     expect(computeUnread([server(id, 4)]).total).toBe(0);
   });
 
   it("tracks DM threads but skips the local member", () => {
     const id = sid();
-    markRead(id, "dm-peer", 5);
+    markRead({ id }, "dm-peer", 5);
     const { total, byKey } = computeUnread([server(id, 0, 7)]);
     expect(total).toBe(2);
     expect(byKey[`${id}|dm-peer`]).toBe(2);
@@ -64,20 +64,24 @@ describe("computeUnread", () => {
   it("markRead clears a thread's unread count", () => {
     const id = sid();
     expect(computeUnread([server(id, 15)]).total).toBe(15);
-    markRead(id, "general", 15);
+    markRead({ id }, "general", 15);
     expect(computeUnread([server(id, 15)]).total).toBe(0);
   });
 });
 
 describe("persistence", () => {
-  it("survives a reload of the module's backing store", async () => {
-    const id = sid();
-    markRead(id, "general", 12);
-    // A fresh import reads the same localStorage, standing in for a restart.
+  // A restart is a fresh module over the same localStorage *and a new server
+  // id*: the bridge mints one on every join. Reusing the id here is what let
+  // UI-05 through — marks keyed by it never survived a real restart.
+  it("survives a restart, which gives the community a new id", async () => {
+    const fingerprint = "ab".repeat(32);
+    markRead({ id: sid(), fingerprint }, "general", 12);
     vi.resetModules();
     const reloaded = await import("./partyUnread.js");
-    expect(reloaded.computeUnread([server(id, 12)]).total).toBe(0);
-    expect(reloaded.computeUnread([server(id, 15)]).total).toBe(3);
+    const rejoined = { ...server(sid(), 12), fingerprint };
+    expect(reloaded.computeUnread([rejoined]).total).toBe(0);
+    expect(reloaded.computeUnread([{ ...rejoined, channels: [{ id: "general", messages: 15 }] }]).byKey)
+      .toEqual({ [`${rejoined.id}|general`]: 3 });
   });
 
   it("survives corrupt storage without breaking the pane", async () => {
@@ -114,11 +118,20 @@ describe("stored marks", () => {
 });
 
 describe("pruneTo", () => {
+  it("keeps the marks of a saved community that has not rejoined yet", () => {
+    const fingerprint = "cd".repeat(32);
+    markRead({ id: sid(), fingerprint }, "general", 5);
+    // After a restart the live list fills in one community at a time.
+    pruneTo([{ address: "10.0.0.5:12345", fingerprint }]);
+    const rejoined = { ...server(sid(), 5), fingerprint };
+    expect(computeUnread([rejoined]).total).toBe(0);
+  });
+
   it("drops marks for servers the user has left", () => {
     const kept = sid();
     const left = sid();
-    markRead(kept, "general", 5);
-    markRead(left, "general", 5);
+    markRead({ id: kept }, "general", 5);
+    markRead({ id: left }, "general", 5);
     pruneTo([server(kept, 5)]);
     expect(computeUnread([server(kept, 5)]).total).toBe(0);
     // The departed server's mark is gone, so its threads read as fully unread.

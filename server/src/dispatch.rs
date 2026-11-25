@@ -6,8 +6,8 @@
 //! (`connection.rs`) owns transport, fan-out and deferred I/O.
 
 use messenger_core::party::{
-    ChannelKind, Envelope, PartyRequest, PartyResponse, UploadTarget, PARTY_CHUNK_BYTES,
-    UNKNOWN_FILE_ERROR,
+    ChannelKind, Envelope, PartyRequest, PartyResponse, UploadTarget, MAX_INLINE_FILE_BYTES,
+    PARTY_CHUNK_BYTES, UNKNOWN_FILE_ERROR,
 };
 use uuid::Uuid;
 
@@ -286,6 +286,16 @@ fn begin_inline_upload(
 /// otherwise); the read itself happens after the lock is released.
 fn plan_download(state: &PartyState, member: Uuid, hash: String, offset: Option<u64>) -> Dispatch {
     match state.plan_blob_read(member, &hash, offset) {
+        // A whole-file read is one frame; past the inline limit it would read
+        // up to 100 MiB into memory and then fail the frame limit, taking the
+        // connection with it (SRV-14). Decided after the access check, so the
+        // refusal says nothing about a file this member cannot see.
+        Some(plan) if offset.is_none() && plan.total() > MAX_INLINE_FILE_BYTES as u64 => {
+            Dispatch::reply(PartyResponse::Error(
+                "this file is too large to download in one piece; download it in chunks"
+                    .to_string(),
+            ))
+        }
         Some(plan) => Dispatch::defer(Deferred::Download { hash, offset, plan }),
         None => unknown_file(),
     }
@@ -980,6 +990,58 @@ mod tests {
             }
             other => panic!("expected a broadcast File message, got {other:?}"),
         }
+    }
+
+    /// SRV-14: `DownloadFile` returns the whole blob in one frame. The honest
+    /// client uses it only up to `MAX_INLINE_FILE_BYTES`, but the server took
+    /// it for any size: a member could make it read 100 MiB into memory per
+    /// request, and the reply then broke the frame limit and the connection.
+    /// Past the inline limit the answer is to use chunks, before a byte is read.
+    #[test]
+    fn a_whole_file_download_is_refused_past_the_inline_limit() {
+        use messenger_core::party::{UploadTarget, PARTY_CHUNK_BYTES};
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        join(&mut state, &mut conn, "alice", None);
+        let me = conn.member().unwrap();
+        let channel = state.default_channel();
+        let payload = vec![7u8; MAX_INLINE_FILE_BYTES + 1];
+        let upload = state
+            .start_upload(
+                me,
+                "big.bin".into(),
+                "application/octet-stream".into(),
+                payload.len() as u64,
+                UploadTarget::Channel(channel),
+            )
+            .unwrap();
+        for chunk in payload.chunks(PARTY_CHUNK_BYTES) {
+            state.upload_chunk(me, upload, chunk).unwrap();
+        }
+        state.finish_upload(me, upload).unwrap();
+        let hash = messenger_core::party::blob_hash(&payload);
+
+        let whole = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::DownloadFile { hash: hash.clone() },
+        );
+        assert!(
+            whole.deferred.is_none(),
+            "a read was planned for a whole 4 MiB+ blob"
+        );
+        assert!(
+            matches!(&whole.replies[..], [PartyResponse::Error(e)] if e.contains("chunks")),
+            "{:?}",
+            whole.replies
+        );
+        // The chunked route still works.
+        let chunk = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::DownloadChunk { hash, offset: 0 },
+        );
+        assert!(chunk.deferred.is_some());
     }
 
     #[test]

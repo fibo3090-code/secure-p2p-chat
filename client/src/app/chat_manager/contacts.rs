@@ -51,9 +51,26 @@ impl ChatManager {
         id
     }
 
-    /// Save a contact parsed from an invite link. Deduplicated by fingerprint
-    /// (refreshing reachability, keeping trust), and the user's own is refused.
-    pub fn import_contact(&mut self, mut contact: Contact) -> Result<Uuid> {
+    /// Save a contact parsed from an invite link.
+    ///
+    /// Importing the same link twice used to add a second identical card, and
+    /// importing your *own* link added you to your own contacts. Both are
+    /// resolved by identity, not by name: an invite for a fingerprint we already
+    /// have refreshes that contact instead of duplicating it.
+    pub fn import_contact(&mut self, contact: Contact) -> Result<Uuid> {
+        self.import_contact_from_link(contact, true)
+    }
+
+    /// [`Self::import_contact`] for a contact parsed from an invite link,
+    /// saying whether the link was **signed** by the key it names.
+    ///
+    /// An unsigned (v1) link may add a new contact, but never change an
+    /// existing one (APP-15): it proves nothing about who wrote it — the
+    /// fingerprint and public key it carries are public — so letting it refresh
+    /// a known contact let anyone repoint a verified contact's address and
+    /// rename them. Only a signed link, which only that key's owner can make,
+    /// refreshes one.
+    pub fn import_contact_from_link(&mut self, mut contact: Contact, signed: bool) -> Result<Uuid> {
         contact.fingerprint = contact
             .fingerprint
             .as_deref()
@@ -72,7 +89,17 @@ impl ChatManager {
                 .find(|c| same_fingerprint(c.fingerprint.as_deref(), fp))
                 .map(|c| c.id)
             {
-                // Same peer: refresh reachability, keep everything trust-related.
+                if !signed {
+                    let known = self.contacts.get(&existing).map(|c| c.name.clone());
+                    anyhow::bail!(
+                        "This is an unsigned (old-style) invite for {}, who is already in your \
+                         contacts. An unsigned link cannot change an existing contact — ask them \
+                         for a new link from an up-to-date app.",
+                        known.unwrap_or_default()
+                    );
+                }
+                // Same peer, possibly a fresher address or relay token. Update
+                // the reachability details and keep everything trust-related.
                 let name = contact.name.clone();
                 if let Some(current) = self.contacts.get_mut(&existing) {
                     current.name = name;
@@ -270,7 +297,13 @@ impl ChatManager {
         contact.fingerprint = Some(fingerprint.to_string());
         // The public key the invite carried belongs to the old fingerprint.
         contact.public_key = None;
-        contact.trust_state = TrustState::Unverified;
+        // The user just compared the safety code for the new key, so a
+        // contact they had marked Trusted stays Trusted; anything else goes
+        // back to Unverified for `promote_contact_verified` to record the
+        // acceptance. (Resetting Trusted demoted it to Verified on accept.)
+        if contact.trust_state != TrustState::Trusted {
+            contact.trust_state = TrustState::Unverified;
+        }
     }
 
     /// Associate a contact with a one-to-one chat.

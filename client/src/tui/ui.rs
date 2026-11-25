@@ -43,6 +43,18 @@ pub fn ui(f: &mut Frame, app: &mut TuiApp) {
         render_command_suggestions(f, app, r.input);
     }
     overlays::render_overlay(f, app, f.area());
+    if app.monochrome {
+        strip_colour(f.buffer_mut());
+    }
+}
+
+/// `NO_COLOR`: drop every cell's colour after drawing, keeping its emphasis.
+/// Done once over the finished frame rather than at each of the many styling
+/// sites, so a new widget cannot forget it (TUI-21).
+fn strip_colour(buf: &mut ratatui::buffer::Buffer) {
+    for cell in buf.content.iter_mut() {
+        cell.set_fg(Color::Reset).set_bg(Color::Reset);
+    }
 }
 
 /// Floating autocomplete menu shown above the command box while typing a `:`command.
@@ -211,15 +223,34 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         if msg.from_me && msg.delivered {
             content.push_str(" ✓");
         }
-        plain_texts.push(format!("{}{}{}", ts, prefix, content));
+        // One screen line per line of the message: ratatui drops a `\n`
+        // inside a span, which glued "a\nb" into "ab" (TUI-09). The first
+        // carries the time and sender; the rest are indented under it — and
+        // the text the scroll height is measured on is indented the same way.
+        let indent = " ".repeat(ts.chars().count() + prefix.chars().count());
+        plain_texts.push(format!(
+            "{}{}{}",
+            ts,
+            prefix,
+            content.replace('\n', &format!("\n{indent}"))
+        ));
+        let mut segments = content.split('\n');
+        let first = segments.next().unwrap_or_default().to_string();
+        let rest: Vec<String> = segments.map(str::to_string).collect();
         lines.push(Line::from(vec![
             Span::styled(ts, Style::default().fg(Color::DarkGray)),
             Span::styled(
                 prefix,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(content),
+            Span::raw(first),
         ]));
+        for segment in rest {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::raw(segment),
+            ]));
+        }
     }
 
     let connected = app.chat_manager.is_connected(&chat_id);
@@ -266,35 +297,107 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     f.render_widget(para.scroll((app.message_scroll, 0)), area);
 }
 
-fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let focused = app.focus == TuiFocus::Input;
-    let (title, text, style, border) = if app.mode == TuiMode::Command {
+/// Lay the input box's text out in rows of at most `width` columns, and find
+/// the cursor — given as a char index into `text` — on them (TUI-20).
+///
+/// Rows are cut by **display width**, character by character, so this is
+/// exactly what is drawn: the box renders these rows itself rather than
+/// handing the text to a word-wrapper and guessing where the cursor went.
+/// Returns the rows and the cursor's (row, column).
+pub(crate) fn layout_input(text: &str, cursor: usize, width: u16) -> (Vec<String>, u16, u16) {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1) as usize;
+    let mut rows = vec![String::new()];
+    let mut col = 0usize;
+    let mut at: Option<(usize, usize)> = None;
+    for (i, c) in text.chars().enumerate() {
+        if i == cursor {
+            at = Some((rows.len() - 1, col));
+        }
+        if c == '\n' {
+            rows.push(String::new());
+            col = 0;
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if col + w > width && col > 0 {
+            rows.push(String::new());
+            col = 0;
+            // A cursor placed just before this char belongs on the new row.
+            if i == cursor {
+                at = Some((rows.len() - 1, 0));
+            }
+        }
+        rows.last_mut().expect("never empty").push(c);
+        col += w;
+    }
+    let (mut row, mut ccol) = at.unwrap_or((rows.len() - 1, col));
+    // An end cursor on a full row would sit on the border: start the next row.
+    if ccol >= width {
+        rows.push(String::new());
+        row += 1;
+        ccol = 0;
+    }
+    (rows, row as u16, ccol as u16)
+}
+
+/// The input box's text and cursor (char index), command prefix included —
+/// shared by the renderer and the hardware-cursor placement so they agree.
+pub(crate) fn input_text_and_cursor(app: &TuiApp) -> (String, usize) {
+    if app.mode == TuiMode::Command {
         (
-            " Command ",
             format!(":{}", app.command_field.text()),
+            app.command_field.cursor_index() + 1,
+        )
+    } else {
+        (
+            app.input_field.display_text(),
+            app.input_field.cursor_index(),
+        )
+    }
+}
+
+/// The input box's rows, the first one shown, and the cursor relative to it.
+pub(crate) fn input_view(app: &TuiApp, area: Rect) -> (Vec<String>, u16, (u16, u16)) {
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2).max(1);
+    let (text, cursor) = input_text_and_cursor(app);
+    let (rows, row, col) = layout_input(&text, cursor, inner_w);
+    // Keep the cursor's row in view: scroll just far enough down.
+    let offset = row.saturating_sub(inner_h - 1);
+    (rows, offset, (row - offset, col))
+}
+
+fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let (title, style, border) = if app.mode == TuiMode::Command {
+        (
+            " Command ".to_string(),
             Style::default().fg(Color::Yellow),
             Color::Yellow,
         )
-    } else if focused {
+    } else if app.focus == TuiFocus::Input {
         (
-            " Message [focus] Enter=send Ctrl+J=newline ",
-            app.input_field.display_text(),
+            " Message [focus] Enter=send Ctrl+J=newline ".to_string(),
             Style::default(),
             BRAND_ACCENT,
         )
     } else {
-        (
-            " Message ",
-            app.input_field.display_text(),
-            Style::default(),
-            Color::DarkGray,
-        )
+        (" Message ".to_string(), Style::default(), Color::DarkGray)
     };
 
-    let p = Paragraph::new(text)
+    // Rows are laid out here, not by a word-wrapper, so the scroll offset
+    // and the cursor are computed on exactly what is drawn (TUI-20).
+    let (rows, offset, _) = input_view(app, area);
+    let lines: Vec<Line> = rows.into_iter().map(Line::from).collect();
+    let p = Paragraph::new(lines)
         .style(style)
-        .block(block(title, border))
-        .wrap(Wrap { trim: false });
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .title(title),
+        )
+        .scroll((offset, 0));
     f.render_widget(p, area);
 }
 
@@ -381,6 +484,38 @@ fn segment_rows(seg: &str, width: usize) -> u16 {
 }
 
 #[cfg(test)]
+mod input_layout_tests {
+    use super::layout_input;
+
+    /// TUI-20: rows are cut at the box width — by display width, so a wide
+    /// character never straddles the border — and the cursor is found on
+    /// them, not on the logical line.
+    #[test]
+    fn input_rows_wrap_at_the_box_width_and_carry_the_cursor() {
+        let (rows, row, col) = layout_input("abcdefgh", 8, 3);
+        assert_eq!(rows, ["abc", "def", "gh"]);
+        assert_eq!((row, col), (2, 2), "cursor after the last char");
+
+        let (_, row, col) = layout_input("abcdefgh", 4, 3);
+        assert_eq!((row, col), (1, 1), "cursor before 'e'");
+
+        // A full last row puts an end cursor at the start of the next one,
+        // never on the border.
+        let (rows, row, col) = layout_input("abcdef", 6, 3);
+        assert_eq!((row, col), (2, 0));
+        assert_eq!(rows.len(), 3);
+
+        // Hard newlines start rows; a wide char that would cross the edge
+        // moves down whole.
+        let (rows, _, _) = layout_input("ab\nc", 0, 10);
+        assert_eq!(rows, ["ab", "c"]);
+        let (rows, row, col) = layout_input("ab界", 3, 3);
+        assert_eq!(rows, ["ab", "界"]);
+        assert_eq!((row, col), (1, 2));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{render_text, ui, wrapped_rows, MAX_RENDER_TEXT_BYTES};
     use crate::logbuf::LogBuffer;
@@ -397,6 +532,50 @@ mod tests {
     fn draw(app: &mut TuiApp, width: u16, height: u16) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal.draw(|f| ui(f, app)).expect("draw");
+    }
+
+    /// TUI-09: a message was one `Line` with the text in a single `Span`, and
+    /// ratatui drops control characters inside a span — so "line one\nline
+    /// two" rendered as "line oneline two". Each line of a message is its own
+    /// line on screen.
+    #[test]
+    fn a_multi_line_message_keeps_its_lines() {
+        let mut app = app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        app.chat_manager.get_chat_mut(chat).unwrap().messages.push(
+            messenger_core::types::Message {
+                id: Uuid::new_v4(),
+                from_me: false,
+                content: messenger_core::types::MessageContent::Text {
+                    text: "first line\nsecond line".into(),
+                },
+                timestamp: chrono::Utc::now(),
+                delivered: false,
+            },
+        );
+        app.tick();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal.draw(|f| ui(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("first line"))
+            .expect("first line shown");
+        assert!(
+            !rows[first].contains("second line"),
+            "joined: {}",
+            rows[first]
+        );
+        assert!(
+            rows.get(first + 1)
+                .is_some_and(|r| r.contains("second line")),
+            "the second line is not below the first: {rows:#?}"
+        );
     }
 
     #[test]
@@ -450,6 +629,182 @@ mod tests {
             app.overlay = ov;
             draw(&mut app, 100, 30);
         }
+    }
+
+    fn screen(app: &mut TuiApp, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|f| ui(f, app)).expect("draw");
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// The transfers overlay is the only place the TUI shows a transfer's
+    /// state, and the only one where an offer waiting for :accept says so.
+    /// Each status reads as itself, progress is a percentage of the size, the
+    /// direction is drawn, and the selection marker sits on the chosen row.
+    #[test]
+    fn the_transfers_overlay_says_what_each_transfer_is_doing() {
+        use messenger_core::types::{FileTransferState, TransferDirection, TransferStatus};
+        let mut app = app();
+        let chat = Uuid::new_v4();
+        let rows = [
+            (
+                "offer.pdf",
+                TransferStatus::AwaitingAcceptance,
+                TransferDirection::Incoming,
+                0,
+            ),
+            (
+                "half.bin",
+                TransferStatus::InProgress,
+                TransferDirection::Outgoing,
+                512,
+            ),
+            (
+                "broke.iso",
+                TransferStatus::Failed("disk full".into()),
+                TransferDirection::Incoming,
+                10,
+            ),
+        ];
+        for (i, (name, status, direction, received)) in rows.into_iter().enumerate() {
+            app.chat_manager
+                .insert_transfer_for_test(FileTransferState {
+                    id: Uuid::from_u128(i as u128 + 1),
+                    chat_id: chat,
+                    filename: name.into(),
+                    size: 1024,
+                    received,
+                    status,
+                    seq: 0,
+                    direction,
+                });
+        }
+        app.overlay = TuiOverlay::Transfers;
+        let shown = screen(&mut app, 160, 40);
+        let row = |name: &str| {
+            shown
+                .iter()
+                .find(|r| r.contains(name))
+                .unwrap_or_else(|| panic!("{name} not shown:\n{}", shown.join("\n")))
+                .clone()
+        };
+        assert!(row("offer.pdf").contains("[awaiting approval — :accept / :decline]"));
+        assert!(row("half.bin").contains("[50%]"), "{}", row("half.bin"));
+        assert!(row("half.bin").contains('⬆') && row("offer.pdf").contains('⬇'));
+        assert!(row("broke.iso").contains("failed: disk full"));
+
+        let marked: Vec<_> = shown.iter().filter(|r| r.contains('▶')).collect();
+        assert_eq!(marked.len(), 1, "one selected row");
+        app.transfer_sel = 2;
+        let shown = screen(&mut app, 160, 40);
+        assert!(shown.iter().any(|r| r.contains("▶ ⬇ broke.iso")));
+        // A selection past the end (the list shrank) still marks a real row.
+        app.transfer_sel = 99;
+        let shown = screen(&mut app, 160, 40);
+        assert_eq!(shown.iter().filter(|r| r.contains('▶')).count(), 1);
+    }
+
+    /// What each of these overlay states *says*, not only that it draws:
+    /// `renders_every_overlay_without_panic` passes for an overlay that
+    /// renders nothing at all.
+    #[test]
+    fn overlays_say_what_the_state_they_show_is() {
+        use crate::app::party_manager::PartyStatus;
+        use crate::app::FingerprintWarning;
+        let make = app;
+        let joined = |rows: &[String]| rows.join("\n");
+        let prompt = |sas: &str, warning| TuiOverlay::FingerprintVerify {
+            fingerprint: "ab".repeat(32),
+            peer_name: "Peer".into(),
+            sas: sas.into(),
+            chat_id: Uuid::new_v4(),
+            warning,
+        };
+
+        // :help <command> shows that command, not the list.
+        let mut app = make();
+        app.help_topic = Some("send".into());
+        app.overlay = TuiOverlay::Help;
+        let shown = joined(&screen(&mut app, 120, 40));
+        assert!(
+            shown.contains(":send <path>") && shown.contains("Command name: send"),
+            "{shown}"
+        );
+
+        // A changed key and a key that is not the invite's each lead with a
+        // warning naming what was expected.
+        for (warning, says) in [
+            (
+                FingerprintWarning::KeyChanged {
+                    previous: "cd".repeat(32),
+                    repoints: None,
+                },
+                "key has CHANGED (was cdcdcdcdcdcdcdcd…)",
+            ),
+            (
+                FingerprintWarning::KeyChanged {
+                    previous: "cd".repeat(32),
+                    repoints: Some("Bob".into()),
+                },
+                "key saved for Bob",
+            ),
+            (
+                FingerprintWarning::ContactAddressMismatch {
+                    contact_id: Uuid::new_v4(),
+                    contact_name: "Carol".into(),
+                    expected: "ab".repeat(32),
+                },
+                "from Carol's address",
+            ),
+            (
+                FingerprintWarning::InviteMismatch {
+                    contact_id: Uuid::new_v4(),
+                    contact_name: "Alice".into(),
+                    expected: "ef".repeat(32),
+                },
+                "NOT the key in Alice's invite (expected efefefefefefefef…)",
+            ),
+        ] {
+            let mut app = make();
+            app.overlay = prompt("12-34-56 🐶 🐱 🦊", Some(warning));
+            let shown = joined(&screen(&mut app, 160, 50));
+            assert!(shown.contains(says), "{says}:\n{shown}");
+            assert!(shown.contains("Read this code aloud"));
+        }
+
+        // A legacy peer has no safety code: the prompt falls back to the
+        // grid and says so, rather than showing an empty code to compare.
+        let mut app = make();
+        app.overlay = prompt("", None);
+        let shown = joined(&screen(&mut app, 160, 50));
+        assert!(
+            shown.contains("safety grid / fingerprint matches"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Read this code aloud") && !shown.contains("WARNING"));
+
+        // A refused join says why in the Communities pane.
+        let mut app = make();
+        let (server, _, _out, _keep) = app.party_manager.add_joined_server_for_test("srv:1");
+        app.party_manager
+            .server_mut_for_test(server)
+            .unwrap()
+            .status = PartyStatus::Rejected("wrong password".into());
+        app.overlay = TuiOverlay::Party;
+        let shown = joined(&screen(&mut app, 160, 50));
+        assert!(shown.contains("rejected: wrong password"), "{shown}");
+
+        // Setting a password is two steps, and the second says it is the second.
+        let mut app = make();
+        app.overlay = TuiOverlay::Password {
+            mode: PasswordMode::Set,
+        };
+        assert!(joined(&screen(&mut app, 120, 40)).contains("at least 12 characters"));
+        app.new_password_first = Some(zeroize::Zeroizing::new("first attempt".into()));
+        assert!(joined(&screen(&mut app, 120, 40)).contains("Type the same password again"));
     }
 
     #[test]

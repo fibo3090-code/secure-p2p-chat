@@ -20,6 +20,40 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# SECURITY.md lists every accepted advisory with the path that pulls it in, for
+# readers who will never open deny.toml. It drifted (audit DOC-11): it kept a
+# family upstream had withdrawn and missed five live acceptances. Both lists
+# must name the same IDs. Needs nothing but python, so it runs before the
+# cargo-deny check below can skip.
+python3 - <<'DOCS'
+import re, sys
+deny = open("deny.toml", encoding="utf-8").read()
+block = re.search(r"ignore\s*=\s*\[(.*?)\n\]", deny, re.S)
+accepted = set(re.findall(r"RUSTSEC-\d{4}-\d{4}", re.sub(r"#[^\n]*", "", block.group(1) if block else "")))
+doc = open("SECURITY.md", encoding="utf-8").read()
+# Only the accepted list counts: the rest of the file may name an advisory in
+# the past tense ("rsa 0.10 fixes RUSTSEC-2023-0071"), which is history, not
+# an acceptance.
+listed = re.search(r"Known-accepted.*?(?=\n(?:- |#)|\Z)", doc, re.S)
+if not listed:
+    print("SECURITY.md has no 'Known-accepted' advisory list", file=sys.stderr)
+    sys.exit(1)
+doc = listed.group(0)
+# Shorthand like RUSTSEC-2026-0194/0195 names both.
+documented = set()
+for year, first, rest in re.findall(r"RUSTSEC-(\d{4})-(\d{4})((?:/\d{4})*)", doc):
+    documented.add(f"RUSTSEC-{year}-{first}")
+    documented.update(f"RUSTSEC-{year}-{n}" for n in rest.split("/") if n)
+undocumented = sorted(accepted - documented)
+stale = sorted(documented - accepted)
+if undocumented or stale:
+    if undocumented:
+        print("SECURITY.md does not explain these accepted advisories:", *undocumented, file=sys.stderr)
+    if stale:
+        print("SECURITY.md lists advisories deny.toml no longer accepts:", *stale, file=sys.stderr)
+    sys.exit(1)
+DOCS
+
 if ! command -v cargo-deny >/dev/null 2>&1; then
     echo "cargo-deny is not installed; skipping the stale-advisory check" >&2
     exit 0

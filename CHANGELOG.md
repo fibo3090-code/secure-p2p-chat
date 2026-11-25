@@ -13,6 +13,33 @@ predate tagged releases.
 
 ### Security
 
+- A peer whose identity key is weaker than 2048-bit RSA is refused, and
+  Ed25519 signatures are checked strictly (a weak key could otherwise make one
+  signature valid for any message).
+
+- An old-style (unsigned) invite link can no longer change a contact you
+  already have. Anyone can write such a link for a known person, and importing
+  one used to replace that contact's name and address.
+
+- Opening a file a contact sent now asks first unless it is a picture, PDF,
+  plain text, audio or video. Previously only a fixed list of program types
+  asked, and it missed disk images, macro-enabled Office documents, HTML and
+  several Windows and macOS launchers, which opened on one click. Received
+  files are also marked as downloaded from the Internet (Windows) or
+  quarantined (macOS), so the system's own checks apply when they are opened.
+
+- Notifications no longer show the message text by default — only who wrote
+  it. Notification text is kept by the operating system and can appear on the
+  lock screen, outside the app's encryption. Settings → "What notifications
+  show" (or `:set notification-content` in the terminal) offers full text or
+  nothing at all.
+- The connection password is no longer sent to the host. The client proves it
+  knows the password with a value bound to that one connection, so someone
+  posing as the host — before you have compared the safety code — no longer
+  learns it. A host on an older version that asks for a password is refused,
+  with a message to update it; older clients can still connect to an updated
+  host.
+
 - Dialling a contact imported from an invite now checks the key that answers
   against the one the invite named (audit CRYPTO-04). A different key gets a
   warning in the verification prompt itself — "this is not the key in Alice's
@@ -22,7 +49,124 @@ predate tagged releases.
   conversation whose key changed now says so in the prompt too, not only in a
   toast.
 
+### Fixed
+
+- Relay with hole punching on Windows: a failed punch attempt ran about
+  1.5 s past its time limit before falling back to the relay, because a
+  connection attempt still in flight at the deadline was waited out. It now
+  stops at the deadline.
+
+- Community server: a member who started a large upload and then sent
+  nothing kept holding the server's upload budget, so a few such uploads
+  blocked everyone else's. An upload that sends nothing for two minutes is
+  now dropped.
+
+- Desktop: a received `.csv` now asks before it opens, like other types
+  that are not known to be display-only — it usually opens in a spreadsheet,
+  where a cell can run a command. `.xht`, `.shtml`, `.svgz` and `.sldm` are
+  treated as able to run code.
+- Community server: a data directory it may write but does not own (a
+  root-owned Docker volume, say) no longer stops it from starting after the
+  upgrade that made the directory owner-only. It starts and logs a warning
+  saying to restrict the directory.
+
+- Hosting: a saved contact who connected to you with a different key — a new
+  device, or someone intercepting them — got a fresh conversation and a
+  prompt that looked like a stranger's first connection. When the connection
+  comes from that contact's address, the prompt now warns that it is not
+  their key. Accepting does not change the key saved for them. The desktop
+  verification dialog no longer treats "could not look this conversation up"
+  as a first meeting, and a contact you marked Trusted stays Trusted when you
+  accept their new key. A key change that also contradicts a contact's invite
+  now says, before you accept, that the contact will be moved to the new key.
+
+- A file still arriving when the sender started another one used to vanish
+  from the transfer list without a word. It still stops — one file at a time
+  per sender — but a warning now names the file that was interrupted.
+
+- A community server that cannot write a message to its database (a full
+  disk, say) now refuses it, so the sender's app takes it back off the screen.
+  It used to confirm the message and lose it at the next restart. A refused file
+  or share also leaves nothing behind: it used to stay counted against the
+  sender's storage, and the retry was refused as "already shared there".
+- The desktop app's diagnostics bundle now contains its recent log (scrubbed
+  of addresses and identifiers), and a crash leaves a report in the app's data
+  folder. Before, a release build's log went nowhere and the bundle said so.
+- The terminal client's message and command boxes scroll with the cursor, and
+  the cursor follows wrapped lines; text past the third row used to be hidden.
+- The terminal client's fingerprint and confirmation text is readable on a
+  light background (it was white), and `NO_COLOR` is honoured.
+- The terminal client now says when history cannot be saved to disk (once,
+  until a save works again) instead of only logging it, and refuses a
+  community upload over the size limit before reading the file.
+- `--relay-server` now logs to stderr (filtered by `RUST_LOG`); it printed
+  nothing at all, not even that it was listening. A relay token passed on the
+  command line is no longer written into the event log.
+- Opening the desktop app a second time no longer starts a second copy over
+  the same data. The two copies each rewrote the whole message history from
+  their own memory, so the one that saved last erased what only the other had
+  received. The second copy now says the app is already running and touches
+  nothing.
+- Unlocking no longer freezes the desktop window while the password is
+  checked; the key is derived in the background. Setting or changing the
+  password is about twice as fast: the key is derived once instead of twice,
+  and the four Argon2 lanes now run in parallel.
+- Relay with hole punching: over a slow link one side could end up on the
+  direct connection and the other bridged to a closed one, so neither could
+  talk. The relay server's verdict now decides for both. A peer can no longer
+  point the punch at the host's own loopback or link-local services — also
+  when written as an IPv4-mapped IPv6 address such as `[::ffff:127.0.0.1]` —
+  and connections to the punch port that say nothing no longer delay it.
+- Terminal client: a command given more words than it takes ignored the rest
+  silently, so `:connect 10.0.0.5 9000` dialled port 12345. It now says which
+  word was unexpected and shows the usage.
+- Hosting behind a double or carrier-grade NAT left the router forwarding the
+  port to this machine for an hour, although the mapping was rejected as
+  unreachable: the router was asked for the forward before its external
+  address was checked. It is checked first now, and a network with no NAT-PMP
+  gateway is detected in about 3 seconds instead of 15.
+- A session dropped with "Decryption failed" when both people sent at once
+  — chatting or transferring files in both directions — at a key rotation.
+  The host could start a second rotation before the peer had switched to the
+  first, discarding the key the peer's in-flight messages used. It now waits.
+- Connecting to a contact imported from an invite now checks the key that
+  answers against the one the invite named, and warns when they differ instead
+  of showing an ordinary first-contact prompt; such a key is never accepted
+  silently as some other peer you know.
+- A contact whose saved address had gone stale was never reached even when it
+  had a relay route; the relay is now tried when no direct address answers.
+- A session ended if the two people compared the safety code more than five
+  minutes apart: the side that accepted first timed out waiting for the other.
+- The connection password was not asked for when hosting through a relay.
+- Relay server: a host that disconnected while waiting kept its token for five
+  minutes, so its own reconnect was refused; and a few addresses could fill
+  the rendezvous table and lock every other host out.
+- Hole punching: a stranger who reached a peer's punch port could echo its
+  hello back and take over the connection attempt, so the punch and the relay
+  fallback both failed. The hello tag is now bound to each side's role;
+  peers on the older version are bridged through the relay instead.
+- A damaged `identity.json` (a nonce of the wrong length) crashed the unlock
+  instead of reporting an unreadable identity.
+- Desktop: `set_password` on an unlocked app re-protected the identity under
+  any new password without asking for the current one; it is now first-setup
+  only. A second unlock (a double-submitted form) reloaded the history over
+  messages not yet saved, dropping them.
+- Desktop, Communities: text typed in a direct message stayed in the box after
+  switching to a channel, and Enter posted it there — drafts are now per
+  conversation. A slow history response could show one channel's messages
+  under another's name. Read marks were lost on every restart, so the whole
+  history came back badged.
+- Desktop: a link whose text hid a right-to-left override displayed as a
+  different address from the one it opened; links now end at any invisible
+  formatting character, and names and message text are bidi-isolated. Text
+  dialogs open with the field focused again, and return focus to what opened
+  them.
+
 ### Changed
+
+- The community server and the relay server shut down cleanly on Ctrl+C or
+  SIGTERM (what `docker stop` and systemd send), logging that a stop was
+  requested, instead of being killed mid-write.
 
 - **Desktop app redesign.** The shell, conversation list and thread, every
   full-width page and the main dialogs were reworked against today's best chat
@@ -79,6 +223,16 @@ predate tagged releases.
     - Settings is centred like the other pages.
   - **Offline:** a failed Reconnect says why and what the other person needs to
     do.
+
+
+- The test suite was audited and restructured: the client's 21 integration
+  test binaries are one, with one shared harness; tests that could not fail
+  (Mutex and `HashMap` round-trips, assertion-free checks, negative checks
+  that only waited) were removed or rewritten against a barrier; the key
+  schedule is pinned by known answers; TUI tests no longer touch the real
+  data directory; a flaky test now fails CI. The Rust suite runs in about 30 s
+  instead of 44 s with the desktop bridge included.
+
 
 ### Dependencies
 

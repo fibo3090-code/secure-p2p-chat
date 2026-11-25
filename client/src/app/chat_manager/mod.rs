@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::core::ProtocolMessage;
 use crate::network::{
-    generate_relay_token, run_client_session_multi, run_client_session_via_relay, run_host_session,
-    run_host_session_via_relay,
+    generate_relay_token, run_client_session_direct_or_relay, run_client_session_via_relay,
+    run_host_session, run_host_session_via_relay,
 };
 use crate::transfer::IncomingFileSync;
 use crate::types::*;
@@ -40,6 +40,7 @@ pub(crate) const FILE_LANE_CAPACITY: usize = 8;
 
 impl SessionHandle {
     /// Test-support constructor whose bulk file lane is inert (receiver dropped).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test_control(from_app_tx: mpsc::UnboundedSender<ProtocolMessage>) -> Self {
         let (file_tx, _file_rx) = mpsc::channel(1);
         Self {
@@ -97,6 +98,10 @@ pub enum FingerprintWarning {
     KeyChanged {
         /// The fingerprint the conversation stored.
         previous: String,
+        /// The contact this session was dialled as, when the new key also
+        /// contradicts that contact's invite: accepting repoints the contact
+        /// to the new key, and the prompt must say so before the user agrees.
+        repoints: Option<String>,
     },
     /// The peer was dialled as a contact whose invite named a different key.
     ///
@@ -107,6 +112,19 @@ pub enum FingerprintWarning {
         contact_id: Uuid,
         contact_name: String,
         /// The fingerprint the contact's invite named.
+        expected: String,
+    },
+    /// Listener side (no invite to compare with): the connection comes from
+    /// the address of exactly one saved contact, but presents a key that
+    /// contact does not hold and nothing here trusts. It may be their new
+    /// device; it is also what someone intercepting them looks like. Unlike
+    /// an invite mismatch, accepting it does **not** repoint the contact: an
+    /// address is weaker evidence than an invite, and the session keeps its
+    /// own conversation.
+    ContactAddressMismatch {
+        contact_id: Uuid,
+        contact_name: String,
+        /// The fingerprint the contact holds.
         expected: String,
     },
 }
@@ -120,6 +138,10 @@ pub(super) struct ExpectedPeer {
     pub(super) contact_name: String,
     pub(super) fingerprint: String,
 }
+
+/// Safety-code prompts that may wait at once. A real user verifies one or two
+/// peers at a time; past this a caller is refused, not queued (audit NET-05).
+pub const MAX_QUEUED_PROMPTS: usize = 8;
 
 /// Main chat manager - orchestrates sessions, messages, and file transfers
 #[derive(Default)]
@@ -154,6 +176,11 @@ pub struct ChatManager {
     /// Held incoming offers whose `FileEnd` already arrived (value: its wire
     /// seq, for the receipt), until accepted or declined.
     pending_file_end: HashMap<Uuid, u64>,
+    /// Incoming transfers being written to disk off the manager (PERF-07):
+    /// every byte has arrived, `finalize` (fsync + rename) is running on a
+    /// blocking thread, and its outcome comes back on `finalized`.
+    finalizing: std::collections::HashSet<Uuid>,
+    finalized: files::FinalizeLane,
     /// chat id -> the incoming transfer its wire is streaming into (set by
     /// `FileMeta`, cleared by `FileEnd`/`FileCancel`). `FileChunk` carries no
     /// transfer id, so this — never "the active transfer" — routes chunks.
@@ -188,9 +215,15 @@ pub struct ChatManager {
     /// The port the live listener actually bound (may differ from
     /// `config.listen_port`); what "share this address" must use.
     pub hosting_port: Option<u16>,
-    /// Optional P2P connection password (required when hosting, supplied when
-    /// connecting), verified inside the tunnel.
+    /// Optional P2P connection password *required from peers when hosting*.
+    /// Only the hosting paths (and auto-rehost) read it. Verified inside the
+    /// encrypted tunnel.
     pub connection_password: Option<String>,
+    /// The password this app answers with when it *dials*. Kept apart from
+    /// the host's: one shared field sent the hosting password to every host
+    /// dialled, and a dial without a password cleared it — so the next
+    /// auto-rehost listened with none (TAURI-03).
+    pub dial_password: Option<String>,
     /// While locked there is no auto-rehost, so no new peer joins.
     pub conversation_locked: bool,
     /// External `host:port` from UPnP, preferred over the LAN address in invites.
@@ -329,6 +362,19 @@ impl ChatManager {
             *slot = request;
             return;
         }
+        // Anyone can complete a handshake with a throwaway key; an unbounded
+        // queue let one machine bury the real prompts (audit NET-05).
+        if self.fingerprint_verification_requests.len() >= MAX_QUEUED_PROMPTS {
+            tracing::warn!(peer = %request.peer_name, "Too many unverified connections; refused one");
+            self.answer_fingerprint_check(request.session_id, false);
+            self.add_toast(
+                ToastLevel::Warning,
+                format!(
+                    "Refused a connection: {MAX_QUEUED_PROMPTS} others are already waiting to be verified"
+                ),
+            );
+            return;
+        }
         self.fingerprint_verification_requests.push_back(request);
     }
 
@@ -353,9 +399,22 @@ impl ChatManager {
     /// Set the optional P2P connection password (before `start_host` /
     /// `connect_to_host`).
     pub fn set_connection_password(&mut self, password: Option<String>) {
+        let password = password.filter(|p| !p.is_empty());
+        self.dial_password = password.clone();
+        self.connection_password = password;
+    }
+
+    /// Set only the password this app's listener requires.
+    pub fn set_host_password(&mut self, password: Option<String>) {
         self.connection_password = password.filter(|p| !p.is_empty());
     }
 
+    /// Set only the password this app answers with when it dials.
+    pub fn set_dial_password(&mut self, password: Option<String>) {
+        self.dial_password = password.filter(|p| !p.is_empty());
+    }
+
+    /// Whether a connection password is currently configured.
     pub fn has_connection_password(&self) -> bool {
         self.connection_password.is_some()
     }
@@ -403,17 +462,28 @@ impl ChatManager {
     }
 
     /// Test helper: a local chat without a network session.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_local_chat_for_test(&mut self, id: Uuid, title: String) {
         self.chats
             .insert(id, Chat::new(id, title, ChatKind::Dm, Transport::Direct));
     }
 
+    /// Test helper: record (or replace, by id) a transfer, as if its frames had
+    /// arrived. Lets a front-end test check what it does with a transfer in
+    /// each state without streaming one over a real session.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_transfer_for_test(&mut self, transfer: FileTransferState) {
+        self.active_transfers.insert(transfer.id, transfer);
+    }
+
     /// Test helper: inject a mock session.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn add_session_for_test(&mut self, chat_id: Uuid, handle: SessionHandle) {
         self.sessions.insert(chat_id, handle);
     }
 
     /// Test helper: inject a fingerprint-confirmation channel.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn add_fingerprint_confirm_sender_for_test(
         &mut self,
         chat_id: Uuid,
@@ -422,7 +492,15 @@ impl ChatManager {
         self.fingerprint_confirm_senders.insert(chat_id, tx);
     }
 
+    /// Test helper: deliver a session event as if the session layer had sent
+    /// it (for tests outside this crate; `inject_session_event` is internal).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn handle_session_event_for_test(&mut self, session_id: Uuid, event: SessionEvent) {
+        self.handle_session_event(session_id, event);
+    }
+
     /// Test helper: queue a TOFU prompt the way a handshake would.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn queue_fingerprint_prompt_for_test(&mut self, prompt: PendingFingerprint) {
         self.queue_fingerprint_request(prompt);
     }
@@ -467,13 +545,26 @@ impl ChatManager {
         if !self.should_notify_for(chat_id) {
             return;
         }
-        let title = self
+        let (title, body) = self.notification_text(chat_id, body);
+        self.show_notification(&title, &body);
+    }
+
+    /// The title and body a notification for `chat_id` shows, by the user's
+    /// `notification_content` setting — split from showing it so it can be
+    /// tested.
+    pub(super) fn notification_text(&self, chat_id: Uuid, body: &str) -> (String, String) {
+        use crate::types::NotificationContent;
+        let sender = self
             .chats
             .get(&chat_id)
             .map(|c| c.title.as_str())
             .filter(|t| !t.is_empty())
             .unwrap_or("New message");
-        self.show_notification(title, body);
+        match self.config.notification_content {
+            NotificationContent::Full => (sender.to_string(), body.to_string()),
+            NotificationContent::SenderOnly => (sender.to_string(), "New message".to_string()),
+            NotificationContent::Hidden => ("P2PEM".to_string(), "New message".to_string()),
+        }
     }
 
     pub fn show_notification(&self, title: &str, body: &str) {
@@ -550,6 +641,22 @@ impl ChatManager {
         self.awaiting_ack.retain(|(sid, _), _| *sid != session_id);
     }
 
+    /// Close a conversation's session and keep the conversation — its history,
+    /// title and trust. Runs the same path as a connection that dropped, so no
+    /// part of the teardown can be forgotten. Returns whether a session was
+    /// open. (The TUI's `:disconnect` used to delete the conversation and its
+    /// history instead, irreversibly — TUI-15.)
+    pub fn disconnect_chat(&mut self, chat_id: Uuid) -> bool {
+        let session = self.session_for_chat(chat_id);
+        if !self.sessions.contains_key(&session) {
+            return false;
+        }
+        self.abort_session_task(session);
+        self.handle_session_event(session, SessionEvent::Disconnected);
+        true
+    }
+
+    /// Remove a listening placeholder chat together with its session.
     pub(super) fn remove_host_placeholder(&mut self, id: Uuid) {
         self.chats.remove(&id);
         self.teardown_session(id);
@@ -604,6 +711,10 @@ impl ChatManager {
         self.teardown_session(session_id);
         self.chat_id_mapping
             .retain(|incoming, session| *incoming != chat_id && *session != session_id);
+        // The contact stays; its link to a conversation that no longer exists
+        // does not, or the next connect aims at a dead chat id (APP-17).
+        self.contact_to_chat
+            .retain(|_, chat| *chat != chat_id && !incoming.contains(chat));
 
         self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
         tracing::debug!(remaining_chats = %self.chats.len(), remaining_sessions = %self.sessions.len(), "Chat deleted");
@@ -617,6 +728,10 @@ impl ChatManager {
             sessions = %self.sessions.len(),
             "Clearing all history and state"
         );
+        // Every session task, the listener's included, is aborted below; the
+        // hosting flags must go with it or auto-rehost reopens the port at
+        // once (APP-16). `stop_hosting` also releases the UPnP mapping.
+        self.stop_hosting();
         self.chats.clear();
         self.contacts.clear();
         self.contact_to_chat.clear();
@@ -714,6 +829,12 @@ impl ChatManager {
         }
         for dir in dirs.iter().filter(|d| d.is_dir()) {
             std::fs::remove_dir_all(dir)?;
+        }
+        // The desktop's single-instance lock file. Best effort: it is still
+        // held by this process, which some platforms refuse to unlink, and a
+        // stray empty lock file is no reason to fail a wipe that has worked.
+        if !data_dir.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(data_dir.join(".lock"));
         }
         if !data_dir.as_os_str().is_empty() && data_dir.is_dir() {
             match std::fs::remove_dir(data_dir) {

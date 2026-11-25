@@ -78,6 +78,10 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
     setHostToken("");
     setImportLink("");
     setHostAddr(null);
+    // The link names this device's addresses and display name, which change;
+    // cached for the whole session it went stale (UI-07). Fetched again on
+    // the next open.
+    setMyLink("");
   }, [open]);
 
   useEffect(() => {

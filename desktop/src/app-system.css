@@ -1195,3 +1195,9 @@ details[open]>summary::before{transform:rotate(45deg);vertical-align:3px}
 .composer-notice-why{color:var(--faint)}
 .card-details>summary{display:flex;align-items:center}
 .card-details[open]{gap:12px}
+/* Peer-supplied strings (message text, names, titles) are bidi-isolated, so a
+   right-to-left override in one cannot reorder the timestamp, label or name
+   beside it — "Verify <name>" must read as what it is (UI-11). */
+.msg-text, .conv-name, .chat-head-name, .msg-author, .modal-title, .contact-card-name {
+  unicode-bidi: isolate;
+}

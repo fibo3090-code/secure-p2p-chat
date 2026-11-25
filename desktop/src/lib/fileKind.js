@@ -3,18 +3,14 @@
 // and stays there: this module only lets the card say so *before* the click,
 // so a `holiday.jpg.exe` stops looking exactly like `roadmap.pdf`.
 //
-// `RISKY_EXTENSIONS` mirrors the bridge's list; `fileKind.test.js` reads the
-// Rust source and fails if the two drift apart. A mismatch here could only ever
-// under-warn on the card — the guard dialog still fires — but a card that says
-// "document" about something the OS will execute is the exact confusion this
-// exists to remove.
-export const RISKY_EXTENSIONS = [
-  "exe", "com", "scr", "pif", "bat", "cmd", "msi", "msp", "msc", "cpl", "hta",
-  "vbs", "vbe", "jse", "wsf", "wsh", "ps1", "psm1", "reg", "lnk", "url", "scf",
-  "inf", "chm", "application", "gadget",
-  "jar", "js", "py", "pl", "rb", "php",
-  "sh", "bash", "zsh", "command", "desktop", "run", "appimage", "app", "pkg", "deb", "rpm",
-];
+// The list of extensions the OS would execute is the bridge's own
+// (`RISKY_EXTENSIONS` in bridge.js, which `bridge.test.js` compares with
+// chats.rs). This module used to keep a second copy, which fell behind the
+// first as soon as the list grew: a card calling a `.dmg` a "DMG file" while
+// the click asked "this is a program — open anyway?".
+import { RISKY_EXTENSIONS } from "./bridge.js";
+
+export { RISKY_EXTENSIONS };
 
 const KINDS = [
   [/^(png|jpe?g|gif|webp|bmp|heic|svg|tiff?)$/, "Image", "fileImage"],
@@ -42,7 +38,7 @@ export function splitName(name) {
 export function fileKind(name) {
   const { ext } = splitName(name);
   const e = ext.toLowerCase();
-  if (RISKY_EXTENSIONS.includes(e)) return { label: "Program", icon: "fileWarn", risky: true, ext: e };
+  if (RISKY_EXTENSIONS.has(e)) return { label: "Program", icon: "fileWarn", risky: true, ext: e };
   for (const [re, label, icon] of KINDS) if (re.test(e)) return { label, icon, risky: false, ext: e };
   return { label: e ? e.toUpperCase() : "File", icon: "file", risky: false, ext: e };
 }

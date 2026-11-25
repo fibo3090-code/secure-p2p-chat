@@ -61,10 +61,12 @@ core/src/
   types.rs        shared application data structures
   util.rs         helpers and parsing utilities
   core/
+    mod.rs
     crypto.rs
     framing.rs
     protocol.rs
   network/
+    mod.rs          session runners re-exported for the apps
     discovery.rs    optional mDNS advertisement/browse
     nat.rs          local/public endpoint candidates for hole punching
     punch.rs        TCP simultaneous-open hole punching
@@ -72,17 +74,19 @@ core/src/
     relay.rs        rendezvous, hole-punch coordination, bridged fallback
     session.rs
   identity/
-    mod.rs
+    mod.rs          identity keypair, Argon2-wrapped private key, history key
+    invite.rs       invite links (v1–v4): build, sign, parse, verify
   party/
     mod.rs          Party application protocol (shared by client + server)
   transfer/
-    receiver.rs
+    mod.rs
+    receiver.rs     incoming file spool, size checks, finalize
 
 client/src/
   main.rs         entry point: terminal UI + relay-server mode
   lib.rs          client exports; re-exports messenger-core
   support.rs      diagnostics export and panic/crash support
-  logbuf.rs       bounded in-process tracing buffer (log overlay + diagnostics)
+  logbuf.rs       bounded in-process tracing buffer (Ctrl+L copy + diagnostics)
   colorgrid.rs    fingerprint safety-grid colours as plain (r,g,b) — toolkit-agnostic
   app/
     chat_manager/   ChatManager split by concern:
@@ -91,25 +95,37 @@ client/src/
       contacts.rs     contact CRUD, auto-reconnect, group-chat creation
       events.rs       session-event pump (poll + handle)
       files.rs        file transfers (validate, send, receive, wire confirm)
-      invites.rs      invite links (v1/v2/v3) + QR codes
+      invites.rs      invite links + QR codes
       text.rs         text send/chunk/reassembly, typing indicators
       tests.rs        ChatManager unit tests
+      adversarial_tests.rs  hostile-peer inputs against the manager
     party_manager.rs  Party server client-side state and operations
     persistence.rs
+    saved_parties.rs  parties.json (pinned community fingerprints), shared by both shells
   tui/
-    app.rs          state machine, key routing, command execution
+    mod.rs          terminal setup, the event loop, launch flags
+    app/            state machine and key routing (mod.rs) + command
+                    execution by area: cmd_connect, cmd_contacts, cmd_misc,
+                    cmd_party
+    downloads.rs    community downloads written off the UI loop
     command.rs      command language (TuiCommand) + parser + registry
     input.rs        EditableField (cursor-aware UTF-8 text editing)
     overlays.rs     modal overlays (verify, contacts, settings, etc.)
     ui.rs           frame composition (chat list, messages, toasts)
-client/tests/      integration tests (link against the client lib)
+client/tests/it/   the client integration suite: one binary, shared harness in common.rs
 
 server/src/
   main.rs         binary entry point: argument parsing and bind
   lib.rs          run_accept_loop + the module tree, so a test can stand a real
                   server up in process
-  state.rs        PartyState: members + roles, channels + access, DM threads,
-                  history, file blobs/references, quotas, audit log, persistence
+  state/          PartyState
+    mod.rs          members + roles, channels + access, DM threads, audit
+    blobs.rs        file blobs/references, uploads, quotas
+    db.rs           SQLite persistence (party.db)
+    history.rs      resident history tail + paging
+    write_rate.rs   per-member write rate limits
+    tests.rs
+  adversarial_tests.rs  hostile-client inputs against the dispatcher
   dispatch.rs     request → response/broadcast routing
   hub.rs          cross-connection broadcast fan-out
   connection.rs   per-connection handshake + serve loop
@@ -302,11 +318,13 @@ These are real limitations, not hidden assumptions:
 - direct P2P has **no offline delivery**: both peers must be online at once. Only the community server buffers history
 - discovery subsystem is optional and not privacy-neutral
 - two front-ends (Tauri/React desktop, ratatui TUI) share backend state but not identical UX depth; the desktop app is the product and the TUI is for headless/terminal use
-- the desktop crate's *bridge* is tested over mock IPC, but the webview itself cannot be driven headlessly here — rendering is verified by `npm run build` + `npm test` over the frontend's pure logic
+- the desktop crate's *bridge* is tested over mock IPC; the frontend by vitest (pure logic + jsdom component tests) and Playwright smoke tests in headless Chromium. The real Tauri webview, native dialogs and OS notifications are not driven by any test
 - there is no mobile client
 - **history writes are O(total history) per change.** The whole `HistoryFile` is
-  re-serialized, encrypted, and rewritten whenever the conversation surface
-  changes, which for an active chat means once per message. Compact JSON keeps
+  re-serialized, encrypted, and rewritten on every save. Saves are coalesced —
+  the desktop writes at most once per `HISTORY_SAVE_MIN_INTERVAL` (3 s), the
+  TUI autosaves only when the persisted signature moved — but each one still
+  costs the whole history. Compact JSON keeps
   the constant factor down, and the write is atomic + `fsync`ed, but the cost
   still grows with history size and there is no retention policy or incremental
   format. A per-conversation or append-only store is the real fix

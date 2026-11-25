@@ -12,7 +12,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 use zeroize::Zeroizing;
 
 use crate::core::{
-    cross_sign_ed25519, derive_ed25519_subkey, derive_session_key, ed25519_public_from_bytes,
+    cross_sign_ed25519, derive_ed25519_subkey, ed25519_public_from_bytes,
     ed25519_signature_from_bytes, fingerprint_pubkey, generate_ephemeral_keypair,
     negotiate_signature_scheme, parse_x25519_public, pem_decode_public, pem_encode_public,
     recv_packet, rsa_sign_pss, rsa_verify_pss, send_packet, sign_ed25519, verify_ed25519,
@@ -120,6 +120,7 @@ where
         stream,
         &tunnel.cipher,
         &tunnel.transport_aad,
+        tunnel.peer_version,
         connection_password,
     )
     .await?;
@@ -166,7 +167,10 @@ pub async fn run_host_session(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, addr) = match accepted {
-                    Ok(pair) => pair,
+                    Ok(pair) => {
+                        pair.0.set_nodelay(true).ok(); // Every frame is small and latency-bound; see NET-04 in `framing.rs`.
+                        pair
+                    }
                     Err(e) => {
                         // A transient EMFILE must not end hosting; back off
                         // briefly so it cannot spin either.
@@ -252,7 +256,10 @@ pub async fn connect_first_reachable(
     let mut last_err: Option<anyhow::Error> = None;
     for (i, (host, port)) in targets.iter().enumerate() {
         match tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), *port))).await {
-            Ok(Ok(stream)) => return Ok((stream, host.clone(), *port)),
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true).ok(); // Every frame is small and latency-bound; see NET-04 in `framing.rs`.
+                return Ok((stream, host.clone(), *port));
+            }
             Ok(Err(e)) => {
                 tracing::warn!(host = %host, port = %port, error = %e, "Candidate address refused/unreachable");
                 last_err = Some(e.into());
@@ -317,7 +324,63 @@ pub async fn run_client_session_multi(
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()> {
-    let (mut stream, host, port) = connect_first_reachable(targets, &to_app_tx).await?;
+    run_client_session_direct_or_relay(
+        targets,
+        None,
+        privkey,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+        confirm_rx,
+        chat_id,
+        connection_password,
+    )
+    .await
+}
+
+/// As [`run_client_session_multi`], with a relay route to fall back to when
+/// **no** direct candidate accepts a connection — a contact's saved address
+/// goes stale when the peer changes networks, and failing direct-only never
+/// tried the route that would have worked (audit NET-12). Only a failure to
+/// *open* a direct connection falls through: a session that connected and
+/// then ended is not redialled through the relay. `relay` is
+/// `(server, token)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_client_session_direct_or_relay(
+    targets: &[(String, u16)],
+    relay: Option<(String, String)>,
+    privkey: RsaPrivateKey,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
+    confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
+    connection_password: Option<String>,
+) -> Result<()> {
+    let (mut stream, host, port) = match connect_first_reachable(targets, &to_app_tx).await {
+        Ok(connected) => connected,
+        Err(direct) => {
+            let Some((server, token)) = relay else {
+                return Err(direct);
+            };
+            tracing::info!(error = %direct, relay = %server, "no direct route; falling back to the relay");
+            let _ = to_app_tx.send(SessionEvent::Warning(format!(
+                "Could not reach them directly ({direct}); trying the relay {server}…"
+            )));
+            return crate::network::relay::run_client_session_via_relay(
+                &server,
+                &token,
+                privkey,
+                to_app_tx,
+                from_app_rx,
+                file_rx,
+                confirm_rx,
+                chat_id,
+                connection_password,
+            )
+            .await;
+        }
+    };
     tracing::info!("Connected to {}:{}", host, port);
 
     run_client_session_over_stream(
@@ -347,6 +410,40 @@ pub struct EstablishedTunnel {
     /// Whether the client committed to its ephemeral key first (both peers v4+). Without
     /// it a MITM can grind keys until both SAS codes match, so the SAS is a weak check.
     pub sas_committed: bool,
+    /// The protocol version the peer announced. The connection-password gate
+    /// reads it: from [`PASSWORD_PROOF_VERSION`] the password is proved, never
+    /// sent.
+    pub peer_version: u32,
+}
+
+/// First protocol version whose client proves the connection password
+/// instead of sending it (audit CRYPTO-05).
+pub const PASSWORD_PROOF_VERSION: u32 = 5;
+
+/// Domain separator for the connection-password proof.
+const PASSWORD_PROOF_LABEL: &[u8] = b"p2pem-v5-connection-password-proof";
+
+/// What a v5+ client sends in place of the connection password.
+///
+/// The gate runs before the user has compared the safety code, so the host it
+/// talks to may not be the host at all. The password used to cross in clear
+/// (inside the tunnel, but to whoever is on the other end of it): anyone
+/// impersonating the host collected it from every client and used it on the
+/// real one. This value is HKDF-SHA256 with the label and the handshake
+/// transcript as salt and the password as input keying material — so an HMAC
+/// keyed by the transcript — and only someone who knows the password *and*
+/// shares this transcript can produce it. A man in the middle runs two
+/// handshakes with two transcripts and cannot relay it; a fake host can only
+/// try guesses offline. Frozen by a known-answer test.
+pub fn password_proof(password: &str, transcript: &[u8]) -> [u8; 32] {
+    let mut salt = Vec::with_capacity(PASSWORD_PROOF_LABEL.len() + transcript.len());
+    salt.extend_from_slice(PASSWORD_PROOF_LABEL);
+    salt.extend_from_slice(transcript);
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), password.as_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(b"client", &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
 }
 
 /// First protocol version in which the client commits to its ephemeral key.
@@ -554,6 +651,32 @@ fn derive_tunnel_keys(
     client_ephemeral: &[u8],
     us: NonceRole,
 ) -> Result<TunnelKeys> {
+    let shared = crate::core::crypto::contributory_shared_secret(our_secret, their_public)?;
+    let keys = tunnel_keys_from_shared(
+        shared.as_bytes(),
+        host_version,
+        client_version,
+        host_ephemeral,
+        client_ephemeral,
+        us,
+    )?;
+    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
+    Ok(keys)
+}
+
+/// Everything [`derive_tunnel_keys`] does after the X25519 agreement: the
+/// transcript hash (salt), the session key (HKDF-SHA256 with [`HKDF_INFO`]),
+/// and the two labelled AADs. A separate step so it can be pinned by a known
+/// answer on a fixed shared secret — an `EphemeralSecret` cannot be fixed, and
+/// both peers computing the same wrong thing passes every other test.
+fn tunnel_keys_from_shared(
+    shared: &[u8],
+    host_version: &[u8],
+    client_version: &[u8],
+    host_ephemeral: &[u8],
+    client_ephemeral: &[u8],
+    us: NonceRole,
+) -> Result<TunnelKeys> {
     let mut transcript = Vec::with_capacity(
         host_version.len() + client_version.len() + host_ephemeral.len() + client_ephemeral.len(),
     );
@@ -563,19 +686,16 @@ fn derive_tunnel_keys(
     transcript.extend_from_slice(client_ephemeral);
     let salt = Sha256::digest(&transcript);
 
-    let aes_key = Zeroizing::new(derive_session_key(
-        our_secret,
-        their_public,
+    let aes_key = Zeroizing::new(crate::core::crypto::derive_from_shared(
+        shared,
         Some(&salt),
         HKDF_INFO,
-    )?);
-    let keys = TunnelKeys {
+    ));
+    Ok(TunnelKeys {
         cipher: AesCipher::new_with_role(&aes_key[..], us)?,
         identity_proof_aad: labeled_aad(b"identity-proof", &salt),
         transport_aad: labeled_aad(b"transport", &salt),
-    };
-    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
-    Ok(keys)
+    })
 }
 
 /// Sign our ephemeral key with our identity and send the proof, encrypted.
@@ -643,6 +763,7 @@ impl TunnelKeys {
         peer: &IdentityProof,
         scheme: SignatureScheme,
         sas_committed: bool,
+        peer_version: u32,
     ) -> Result<EstablishedTunnel> {
         // Parsed by the same strict decoder `verify_identity_proof` used, so
         // the fingerprint names exactly the key the signature was checked with.
@@ -655,6 +776,7 @@ impl TunnelKeys {
             transport_aad: self.transport_aad,
             signature_scheme: scheme,
             sas_committed,
+            peer_version,
         })
     }
 }
@@ -729,7 +851,7 @@ where
     )
     .await?;
     let client_proof = recv_identity_proof(stream, &keys, &client_ephemeral, scheme, US).await?;
-    keys.established(&client_proof, scheme, committed)
+    keys.established(&client_proof, scheme, committed, peer_version)
 }
 
 /// Client side of the handshake; mirror of [`host_handshake`]. The host proves its
@@ -793,7 +915,7 @@ where
         scheme,
     )
     .await?;
-    keys.established(&host_proof, scheme, committed)
+    keys.established(&host_proof, scheme, committed, peer_version)
 }
 
 /// Constant-time password comparison, so a wrong connection password cannot be
@@ -824,6 +946,7 @@ async fn host_password_gate<S>(
     stream: &mut S,
     cipher: &AesCipher,
     aad: &[u8],
+    peer_version: u32,
     expected: Option<&str>,
 ) -> Result<()>
 where
@@ -836,7 +959,15 @@ where
         .decrypt_from_peer(&resp_ct, Some(aad))
         .ok_or_else(|| anyhow!("Failed to decrypt password response"))?;
     if let Some(pw) = expected {
-        if !constant_time_eq(&resp, pw.as_bytes()) {
+        let admitted = if peer_version >= PASSWORD_PROOF_VERSION {
+            constant_time_eq(&resp, &password_proof(pw, aad))
+        } else {
+            // A client from before the proof sends the password itself.
+            // Accepting it exposes nobody but that client, which already
+            // sends it to whoever answers.
+            constant_time_eq(&resp, pw.as_bytes())
+        };
+        if !admitted {
             return Err(PasswordRefused.into());
         }
     }
@@ -848,6 +979,7 @@ async fn client_password_gate<S>(
     stream: &mut S,
     cipher: &AesCipher,
     aad: &[u8],
+    peer_version: u32,
     password: Option<&str>,
 ) -> Result<()>
 where
@@ -860,14 +992,24 @@ where
     let required = flag.first().copied() == Some(1);
     // Always reply (even empty) so the host's receive completes and both sides
     // converge on the same outcome.
-    let payload: Vec<u8> = if required {
-        password.map(|p| p.as_bytes().to_vec()).unwrap_or_default()
-    } else {
-        Vec::new()
+    let proves = peer_version >= PASSWORD_PROOF_VERSION;
+    let payload: Vec<u8> = match password {
+        Some(p) if required && proves => password_proof(p, aad).to_vec(),
+        // Nothing to say, or a host from before the proof, which wants the
+        // password itself — before the user has checked who it is. Not sent:
+        // anyone posing as this host would collect it (CRYPTO-05).
+        _ => Vec::new(),
     };
     send_packet(stream, &cipher.encrypt(&payload, Some(aad))).await?;
     if required && password.is_none() {
         return Err(anyhow!("This host requires a connection password"));
+    }
+    if required && !proves {
+        return Err(anyhow!(
+            "This host runs an older version that asks for the connection password in a way \
+             that would hand it to anyone posing as the host, so it was not sent. Update the \
+             app on the host."
+        ));
     }
     Ok(())
 }
@@ -977,6 +1119,7 @@ where
             stream,
             &tunnel.cipher,
             &tunnel.transport_aad,
+            tunnel.peer_version,
             connection_password.as_deref(),
         )
         .await,
@@ -1028,6 +1171,7 @@ where
             stream,
             &tunnel.cipher,
             &tunnel.transport_aad,
+            tunnel.peer_version,
             connection_password.as_deref(),
         )
         .await,
@@ -1180,8 +1324,17 @@ where
         }
     }
 
+    /// A rotation is due once enough frames or time have passed — and only
+    /// once the previous one has *completed*: a frame from the peer has
+    /// decrypted under the current key, which is what clears `prev_cipher`.
+    /// Rotating again before that discards the one retained key the peer's
+    /// in-flight frames still use, and the session dies on "Decryption
+    /// failed" (CRYPTO-06; both directions count toward the threshold, so
+    /// crossing traffic reached it within one round trip). The peer's
+    /// keep-alive bounds how long a rotation can be held back.
     fn rekey_due(&self) -> bool {
         self.is_rekey_initiator
+            && self.prev_cipher.is_none()
             && (self.messages_since_rekey >= REKEY_MESSAGE_COUNT
                 || self.last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL)
     }
@@ -1415,9 +1568,19 @@ where
     let mut pending_read = Box::pin(read_frame(reader));
     let mut inbox = std::collections::VecDeque::new();
 
-    // Silence from the peer, measured from the last frame *received*, so our own sends
-    // and keep-alives do not re-arm it.
-    let idle = tokio::time::sleep(recv_idle_timeout);
+    // Silence from the peer, measured from the last frame *received*. It used to
+    // be a timeout around each individual read, restarted on every iteration —
+    // so our own sends and keep-alive ticks kept re-arming it, and a peer that
+    // had gone away without closing the socket was never detected.
+    //
+    // Until the peer's FIRST frame, the limit is its whole confirmation window
+    // plus one idle window. Both sides enter this loop only after their own
+    // user accepts the safety code, and the other may still be reading the
+    // prompt — it sends nothing until it has answered. Arming the plain idle
+    // timer here ended the session whenever two people compared the code more
+    // than five minutes apart (audit NET-10). A peer that rejects closes the
+    // socket, which is seen at once; one that vanished is still bounded.
+    let idle = tokio::time::sleep(FINGERPRINT_CONFIRM_TIMEOUT + recv_idle_timeout);
     tokio::pin!(idle);
 
     loop {
@@ -1500,8 +1663,12 @@ where
 }
 
 /// Read a duration override (whole seconds) from an environment variable, falling back
-/// to `default` when unset or invalid. Test hook only.
+/// to `default` when unset or invalid. Test hook, read in debug builds only: in a
+/// release binary it would let the environment shorten a real session's timeouts.
 fn duration_from_env(var: &str, default: std::time::Duration) -> std::time::Duration {
+    if !cfg!(debug_assertions) {
+        return default;
+    }
     std::env::var(var)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1512,11 +1679,91 @@ fn duration_from_env(var: &str, default: std::time::Duration) -> std::time::Dura
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{generate_rsa_keypair, IdentityProof};
+    use crate::core::{derive_session_key, generate_rsa_keypair, IdentityProof};
     use crate::RSA_KEY_BITS;
 
     fn pem_of(key: &RsaPrivateKey) -> String {
         pem_encode_public(&RsaPublicKey::from(key)).unwrap()
+    }
+
+    /// The production tunnel derivation, pinned end to end on a fixed shared
+    /// secret: transcript order (host version, client version, host
+    /// ephemeral, client ephemeral), SHA-256 salt, HKDF-SHA256 with the real
+    /// `HKDF_INFO`, and the `label || 0 || salt` AADs. The expected values were
+    /// computed with Python's hashlib/hmac, not with the crates under test.
+    /// Two peers built from the same code agree on any change to these, so
+    /// only a known answer can catch one (#213 review: the crypto.rs KAT used
+    /// another info string and no transcript).
+    #[test]
+    fn the_tunnel_keys_are_pinned_by_a_known_answer() {
+        let keys = tunnel_keys_from_shared(
+            &[0x33; 32],
+            &[0, 0, 0, 5],
+            &[0, 0, 0, 4],
+            &[0x11; 32],
+            &[0x22; 32],
+            NonceRole::Host,
+        )
+        .unwrap();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let salt = "0ea5d6c6ba86e73b050d50bae96cd5c9ad6d5a19ca0ea9a8e6212e528d0c1f9c";
+        assert_eq!(
+            hex(&keys.cipher.get_current_key()),
+            "4601cd53641bf59f0cf97ace5265af30f261ea6cc4f0dc48836f8f39d81acac2"
+        );
+        assert_eq!(
+            hex(&keys.transport_aad),
+            format!("{}00{salt}", hex(b"transport"))
+        );
+        assert_eq!(
+            hex(&keys.identity_proof_aad),
+            format!("{}00{salt}", hex(b"identity-proof"))
+        );
+        // Both roles hold the same key; only the nonce space differs.
+        let client = tunnel_keys_from_shared(
+            &[0x33; 32],
+            &[0, 0, 0, 5],
+            &[0, 0, 0, 4],
+            &[0x11; 32],
+            &[0x22; 32],
+            NonceRole::Client,
+        )
+        .unwrap();
+        assert_eq!(
+            client.cipher.get_current_key(),
+            keys.cipher.get_current_key()
+        );
+    }
+
+    /// The version goes on the wire as a plaintext big-endian u32, and it is
+    /// the one thing an older peer reads before deciding how to talk to us.
+    /// Two peers built from the same code agree on any value, so only a known
+    /// answer catches it drifting: big-endian, high bytes zero, equal to
+    /// `PROTOCOL_VERSION` (bump that, not this encoding, to change it).
+    /// The plaintext version check is the first thing either side does, and
+    /// the downgrade floor: anything before v3 (no ECDH-first handshake) is
+    /// refused, naming the other side from our role, while v3 and the current
+    /// version pass. A packet that is not exactly four bytes is refused too.
+    #[test]
+    fn peers_before_v3_are_refused_and_named() {
+        let packet = |v: u32| v.to_be_bytes();
+        for (us, them) in [(NonceRole::Host, "Client"), (NonceRole::Client, "Host")] {
+            let err = check_peer_version(&packet(2), us).unwrap_err().to_string();
+            assert_eq!(err, format!("{them} version 2 too old (need v3+)"));
+            assert_eq!(check_peer_version(&packet(3), us).unwrap(), 3);
+            let current = PROTOCOL_VERSION as u32;
+            assert_eq!(check_peer_version(&packet(current), us).unwrap(), current);
+            for bad in [&[0u8, 0, 3][..], &[0, 0, 0, 3, 0]] {
+                assert!(check_peer_version(bad, us).is_err(), "{bad:?} accepted");
+            }
+        }
+    }
+
+    #[test]
+    fn our_version_goes_on_the_wire_as_a_big_endian_u32() {
+        let v = PROTOCOL_VERSION as u32;
+        assert!(v < 256, "update this known answer for a version over 255");
+        assert_eq!(our_version_bytes(), [0, 0, 0, v as u8]);
     }
 
     fn identity_proof(pem: String, signature: Vec<u8>, scheme: SignatureScheme) -> IdentityProof {
@@ -1649,6 +1896,241 @@ mod tests {
         ));
     }
 
+    /// CRYPTO-06: the host does not start a rotation while the previous one
+    /// is open — it still holds the old key because no frame from the peer
+    /// has decrypted under the new one. The first such frame releases it, so
+    /// rotations are held back, never skipped.
+    #[tokio::test]
+    async fn a_rekey_waits_until_the_peer_has_switched_to_the_last_one() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx);
+
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        assert!(transport.rekey_due(), "the threshold makes a rotation due");
+        transport.rekey().await.unwrap();
+        assert!(transport.prev_cipher.is_some(), "the old key is retained");
+
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        assert!(
+            !transport.rekey_due(),
+            "a second rotation started before the peer switched would drop the key its in-flight frames use"
+        );
+
+        // A frame from the client under the new key: the client has switched.
+        let client =
+            AesCipher::new_with_role(&transport.cipher.get_current_key(), NonceRole::Client)
+                .unwrap();
+        let ping = ProtocolMessage::Ping { seq: 1 };
+        let frame = client.encrypt(&ping.to_plain_bytes(), Some(&aad));
+        assert!(matches!(
+            transport.receive(&frame).unwrap(),
+            Received::Continue
+        ));
+        assert!(transport.prev_cipher.is_none());
+        assert!(transport.rekey_due(), "the held rotation is released");
+    }
+
+    /// When a rotation is due, from both directions: a fresh host transport is
+    /// not (rotating every frame would be its own failure), nor one message
+    /// short of `REKEY_MESSAGE_COUNT`; the count or `REKEY_TIME_INTERVAL`
+    /// elapsed makes it due; and the client, which never initiates, never is.
+    #[test]
+    fn a_rekey_is_due_by_count_or_by_time_and_only_on_the_host() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx.clone());
+        assert!(!transport.rekey_due(), "a fresh session rotates at once");
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT - 1;
+        assert!(!transport.rekey_due(), "rotated a message early");
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        assert!(transport.rekey_due());
+
+        transport.messages_since_rekey = 0;
+        let Some(long_ago) = std::time::Instant::now().checked_sub(REKEY_TIME_INTERVAL) else {
+            return; // a machine up for less than the interval cannot express it
+        };
+        transport.last_rekey_time = long_ago;
+        assert!(
+            transport.rekey_due(),
+            "the time interval does not trigger a rotation"
+        );
+
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, aad, tx);
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        transport.last_rekey_time = long_ago;
+        assert!(!transport.rekey_due(), "the client initiated a rotation");
+    }
+
+    /// Every frame sent counts toward the rotation threshold. Received frames
+    /// count too, which is why the end-to-end rekey tests could not tell: a
+    /// sender whose own frames did not count still rotated on the peer's.
+    #[tokio::test]
+    async fn each_frame_sent_counts_toward_the_next_rekey() {
+        let key: [u8; 32] = rand::random();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, b"aad".to_vec(), tx);
+        for sent in 1..=3 {
+            transport
+                .send(ProtocolMessage::Ping { seq: 0 })
+                .await
+                .unwrap();
+            assert_eq!(transport.messages_since_rekey, sent);
+        }
+    }
+
+    /// Delivery receipts are matched on the wire sequence `send` reports: a
+    /// whole text, the *final* chunk of a long one, and a file's `FileEnd`
+    /// each report the seq they went out with; a middle chunk or a ping
+    /// reports nothing, or the receipt FIFO would fall out of step.
+    #[tokio::test]
+    async fn send_reports_the_seq_of_each_frame_that_completes_a_message() {
+        let key: [u8; 32] = rand::random();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, b"aad".to_vec(), tx);
+        let chunk = |chunk_index| ProtocolMessage::TextChunk {
+            message_id: uuid::Uuid::nil(),
+            chunk_index,
+            total_chunks: 2,
+            text_part: "x".into(),
+            timestamp: 0,
+            seq: 0,
+        };
+        let frames = [
+            ProtocolMessage::Text {
+                text: "hi".into(),
+                timestamp: 0,
+                seq: 0,
+            },
+            chunk(0),
+            chunk(1),
+            ProtocolMessage::Ping { seq: 0 },
+            ProtocolMessage::FileEnd { seq: 0 },
+        ];
+        for frame in frames {
+            transport.send(frame).await.unwrap();
+        }
+        let reported: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| format!("{e:?}"))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                format!("{:?}", SessionEvent::TextSendComplete { seq: 1 }),
+                format!("{:?}", SessionEvent::TextSendComplete { seq: 3 }),
+                format!("{:?}", SessionEvent::FileSendComplete { seq: 5 }),
+            ]
+        );
+    }
+
+    /// One read of the model "socket": the next queued frame.
+    async fn next_frame(
+        mut rx: mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>,
+    ) -> (
+        mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>,
+        std::io::Result<Vec<u8>>,
+    ) {
+        let frame = rx.recv().await.expect("the test queued enough frames");
+        (rx, frame)
+    }
+
+    /// While a write is blocked (the peer's buffer full), reading continues
+    /// — or crossing transfers deadlock — but only up to
+    /// `MAX_FRAMES_HELD_DURING_WRITE` frames, and not past a read error: a
+    /// peer that never reads must not make us buffer without bound, and
+    /// nothing after a broken frame is trustworthy. The write's own output
+    /// is returned once it completes.
+    #[tokio::test]
+    async fn reading_while_writing_is_bounded_and_stops_at_an_error() {
+        use std::collections::VecDeque;
+        let run = |frames: Vec<std::io::Result<Vec<u8>>>| async move {
+            let (tx, rx) = mpsc::unbounded_channel();
+            for f in frames {
+                tx.send(f).unwrap();
+            }
+            let mut read = Box::pin(next_frame(rx));
+            let mut inbox = VecDeque::new();
+            let blocked = std::future::pending::<()>();
+            let held = tokio::time::timeout(
+                Duration::from_millis(200),
+                write_while_reading(blocked, &mut read, next_frame, &mut inbox),
+            )
+            .await;
+            assert!(held.is_err(), "a blocked write returned");
+            inbox
+        };
+        let ok = |i: u8| Ok(vec![i]);
+
+        let inbox = run((0..MAX_FRAMES_HELD_DURING_WRITE as u8 + 4)
+            .map(ok)
+            .collect())
+        .await;
+        assert_eq!(
+            inbox.len(),
+            MAX_FRAMES_HELD_DURING_WRITE,
+            "held past the cap, or never read"
+        );
+
+        let broken = std::io::Error::other("bad frame");
+        let inbox = run(vec![ok(1), Err(broken), ok(2), ok(3)]).await;
+        assert_eq!(inbox.len(), 2, "kept reading after a read error");
+        assert!(inbox[1].is_err());
+
+        // A write that completes is returned, frames read meanwhile kept.
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ok(9)).unwrap();
+        let mut read = Box::pin(next_frame(rx));
+        let mut inbox = VecDeque::new();
+        let write = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            "written"
+        };
+        let out = write_while_reading(write, &mut read, next_frame, &mut inbox).await;
+        assert_eq!(out, "written");
+        assert_eq!(inbox.len(), 1);
+    }
+
+    /// A keep-alive is a frame like any other: it takes the next wire seq, or
+    /// the peer's replay check would drop a second ping as a repeat. And on
+    /// the receiving side, a message counts toward the next rekey while a
+    /// keep-alive ping does not (an idle session must not rotate on pings).
+    #[tokio::test]
+    async fn keep_alives_take_a_seq_and_only_real_frames_count_toward_a_rekey() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, aad.clone(), tx);
+        transport.keep_alive().await.unwrap();
+        transport.keep_alive().await.unwrap();
+        assert_eq!(transport.sent_seq, 2);
+        let counted = transport.messages_since_rekey;
+
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let frame = |msg: ProtocolMessage| host.encrypt(&msg.to_plain_bytes(), Some(&aad));
+        transport
+            .receive(&frame(ProtocolMessage::Ping { seq: 1 }))
+            .unwrap();
+        assert_eq!(
+            transport.messages_since_rekey, counted,
+            "a ping counted toward a rekey"
+        );
+        let text = ProtocolMessage::Text {
+            text: "hi".into(),
+            timestamp: 0,
+            seq: 2,
+        };
+        transport.receive(&frame(text)).unwrap();
+        assert_eq!(transport.messages_since_rekey, counted + 1);
+    }
+
     /// EXT-01: a client's `Rekey` must not move the host's key.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
@@ -1741,6 +2223,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_first_reachable_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (stream, _, _) = connect_first_reachable(&[("127.0.0.1".to_string(), port)], &events)
+            .await
+            .unwrap();
+        assert!(
+            stream.nodelay().unwrap(),
+            "NET-04: Nagle left on a session socket"
+        );
+        let reusable = crate::network::punch::connect_reusable("127.0.0.1", port)
+            .await
+            .unwrap();
+        assert!(
+            reusable.nodelay().unwrap(),
+            "NET-04: Nagle left on the relay socket"
+        );
+    }
+
+    #[tokio::test]
     async fn connect_first_reachable_errors_when_all_dead() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let targets = vec![("127.0.0.1".to_string(), dead_port().await)];
@@ -1780,6 +2283,70 @@ mod tests {
         assert!(
             saw_error,
             "a decryption failure must be surfaced to the app"
+        );
+        drop(peer_stream);
+    }
+
+    /// Dead-peer detection, which nothing tested: once the peer has spoken,
+    /// silence longer than the idle window ends the session with an error the
+    /// app can show — a peer that vanished without closing its socket (a
+    /// laptop lid, a dropped Wi-Fi) must not leave a conversation reading as
+    /// connected. The longer first-frame window (NET-10) must not leak past
+    /// the first frame. Timers shrunk with the debug-only hooks.
+    #[tokio::test]
+    async fn a_peer_that_goes_silent_after_speaking_is_detected() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("P2PEM_TEST_IDLE_TIMEOUT_SECS");
+                std::env::remove_var("P2PEM_TEST_KEEPALIVE_SECS");
+            }
+        }
+        let _restore = Restore;
+        std::env::set_var("P2PEM_TEST_IDLE_TIMEOUT_SECS", "2");
+        std::env::set_var("P2PEM_TEST_KEEPALIVE_SECS", "60");
+
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport".to_vec();
+        let ours = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let theirs = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (loop_stream, mut peer_stream) = tokio::io::duplex(4096);
+        let (to_app_tx, mut to_app_rx) = mpsc::unbounded_channel();
+        let (_from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        let (_file_tx, file_rx) = mpsc::channel(1);
+        let loop_aad = aad.clone();
+        let handle = tokio::spawn(async move {
+            run_message_loop(loop_stream, ours, loop_aad, to_app_tx, from_app_rx, file_rx).await
+        });
+
+        // The peer speaks once, then says nothing more — socket still open.
+        let ping = ProtocolMessage::Ping { seq: 1 };
+        send_packet(
+            &mut peer_stream,
+            &theirs.encrypt(&ping.to_plain_bytes(), Some(&aad)),
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .expect("a silent peer was never detected")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1500),
+            "the session ended before the idle window ran out"
+        );
+        let mut idle_reported = false;
+        while let Ok(ev) = to_app_rx.try_recv() {
+            if let SessionEvent::Error(e) = ev {
+                idle_reported |= e.contains("idle timeout");
+            }
+        }
+        assert!(
+            idle_reported,
+            "the idle timeout was not reported to the app"
         );
         drop(peer_stream);
     }
@@ -1887,6 +2454,198 @@ mod tests {
         assert_eq!(host.peer_fingerprint, expected_client_fp);
     }
 
+    /// The proof is what a v5 client and host both compute; if either side's
+    /// label, salt or info drifted, every password-protected connection would
+    /// fail. Pinned by a known answer computed with Python's `hmac` (HKDF by
+    /// hand), not by comparing the function with itself.
+    #[test]
+    fn the_password_proof_matches_its_known_answer() {
+        let transcript: Vec<u8> = (0u8..32).collect();
+        assert_eq!(
+            hex::encode(password_proof("correct horse battery staple", &transcript)),
+            "ee5b734bce4cb7dec82ea3decfcf34c7f5bfc1473b1b254d91638b2021da9151"
+        );
+        assert_ne!(
+            password_proof("correct horse battery staple", &transcript[1..]),
+            password_proof("correct horse battery staple", &transcript),
+            "bound to the transcript"
+        );
+    }
+
+    /// Both halves of a handshake, with the streams kept for what follows it.
+    async fn tunnels_with_streams(
+        host_version: u32,
+        client_version: u32,
+    ) -> (
+        (EstablishedTunnel, tokio::io::DuplexStream),
+        (EstablishedTunnel, tokio::io::DuplexStream),
+    ) {
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
+        let host = tokio::spawn(async move {
+            let t = host_handshake_as(
+                &mut host_stream,
+                &host_priv,
+                uuid::Uuid::new_v4(),
+                host_version.to_be_bytes(),
+            )
+            .await
+            .unwrap();
+            (t, host_stream)
+        });
+        let client = client_handshake_as(
+            &mut client_stream,
+            &client_priv,
+            uuid::Uuid::new_v4(),
+            client_version.to_be_bytes(),
+        )
+        .await
+        .unwrap();
+        (host.await.unwrap(), (client, client_stream))
+    }
+
+    /// The host's side of the gate, played by hand: ask for a password and
+    /// return exactly what the client sent back.
+    async fn ask_for_password(
+        tunnel: &EstablishedTunnel,
+        stream: &mut tokio::io::DuplexStream,
+    ) -> Vec<u8> {
+        send_packet(
+            stream,
+            &tunnel.cipher.encrypt(&[1], Some(&tunnel.transport_aad)),
+        )
+        .await
+        .unwrap();
+        let ct = recv_packet_with_timeout(stream).await.unwrap();
+        tunnel
+            .cipher
+            .decrypt_from_peer(&ct, Some(&tunnel.transport_aad))
+            .unwrap()
+    }
+
+    /// CRYPTO-05: the gate runs before the user has compared the safety code,
+    /// so whoever answers may be posing as the host. It used to receive the
+    /// password in clear. Now it receives a proof bound to its own transcript:
+    /// no password, nothing it can replay to the real host.
+    #[tokio::test]
+    async fn a_host_nobody_has_verified_never_receives_the_password() {
+        // Generated, not written out: a literal password in a test reads as
+        // a hard-coded credential to code scanning. ('static: it moves into
+        // the client task.)
+        let password: &'static str = format!("pw-{}", uuid::Uuid::new_v4()).leak();
+        let v = PROTOCOL_VERSION as u32;
+        let ((fake, mut fake_stream), (client, mut client_stream)) =
+            tunnels_with_streams(v, v).await;
+        let gate = tokio::spawn(async move {
+            client_password_gate(
+                &mut client_stream,
+                &client.cipher,
+                &client.transport_aad,
+                client.peer_version,
+                Some(password),
+            )
+            .await
+        });
+        let got = ask_for_password(&fake, &mut fake_stream).await;
+        gate.await.unwrap().unwrap();
+
+        assert!(
+            !got.windows(password.len())
+                .any(|w| w == password.as_bytes()),
+            "the password crossed the wire"
+        );
+        assert_eq!(got, password_proof(password, &fake.transport_aad));
+        // And it is useless on any other connection.
+        let ((other, _), _) = tunnels_with_streams(v, v).await;
+        assert_ne!(got, password_proof(password, &other.transport_aad));
+    }
+
+    /// A host from before the proof asks for the password itself. Sending it
+    /// would undo the fix — a fake host need only claim to be old — so the
+    /// client refuses, sends nothing, and says why.
+    #[tokio::test]
+    async fn an_older_host_asking_for_the_password_is_not_given_it() {
+        let ((old_host, mut host_stream), (client, mut client_stream)) =
+            tunnels_with_streams(4, PROTOCOL_VERSION as u32).await;
+        assert_eq!(client.peer_version, 4);
+        let gate = tokio::spawn(async move {
+            client_password_gate(
+                &mut client_stream,
+                &client.cipher,
+                &client.transport_aad,
+                client.peer_version,
+                Some(format!("pw-{}", uuid::Uuid::new_v4()).as_str()),
+            )
+            .await
+        });
+        let got = ask_for_password(&old_host, &mut host_stream).await;
+        let err = gate.await.unwrap().unwrap_err().to_string();
+        // Says what went wrong without printing anything derived from what was
+        // received: a failure must not put a secret in the log.
+        assert!(
+            got.is_empty(),
+            "the client answered a pre-v5 host's password request"
+        );
+        assert!(err.contains("Update the app on the host"), "{err}");
+    }
+
+    /// The host side: a current client proves, an older one still sends the
+    /// password itself and is still let in, and a wrong answer either way is
+    /// refused.
+    #[tokio::test]
+    async fn the_host_admits_the_right_password_from_old_and_new_clients_only() {
+        let password = format!("pw-{}", uuid::Uuid::new_v4());
+        let password = password.as_str();
+        for (client_version, right, wrong) in [
+            (
+                PROTOCOL_VERSION as u32,
+                None,                         // the proof, computed below from the transcript
+                password.as_bytes().to_vec(), // plaintext is not a proof
+            ),
+            (
+                4,
+                Some(password.as_bytes().to_vec()),
+                format!("{password}-wrong").into_bytes(),
+            ),
+        ] {
+            for answer_right in [true, false] {
+                let ((host, mut host_stream), (client, mut client_stream)) =
+                    tunnels_with_streams(PROTOCOL_VERSION as u32, client_version).await;
+                let answer = if answer_right {
+                    right
+                        .clone()
+                        .unwrap_or_else(|| password_proof(password, &client.transport_aad).to_vec())
+                } else {
+                    wrong.clone()
+                };
+                let client_side = tokio::spawn(async move {
+                    let _flag = recv_packet_with_timeout(&mut client_stream).await.unwrap();
+                    send_packet(
+                        &mut client_stream,
+                        &client.cipher.encrypt(&answer, Some(&client.transport_aad)),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let res = host_password_gate(
+                    &mut host_stream,
+                    &host.cipher,
+                    &host.transport_aad,
+                    host.peer_version,
+                    Some(password),
+                )
+                .await;
+                client_side.await.unwrap();
+                assert_eq!(
+                    res.is_ok(),
+                    answer_right,
+                    "client v{client_version}, right answer: {answer_right}"
+                );
+            }
+        }
+    }
+
     /// Run both handshake halves announcing the given versions.
     async fn handshake_pair(
         host_version: u32,
@@ -1941,6 +2700,53 @@ mod tests {
                 crate::core::derive_sas(&host.transport_aad),
                 crate::core::derive_sas(&client.transport_aad)
             );
+        }
+    }
+
+    /// CRYPTO-02, the half the UI sees: the weak-code warning is sent before the
+    /// verification prompt for a peer without the commitment, and never for a
+    /// current one (a warning on every connection would teach people to ignore
+    /// it). The user rejects at the prompt, so the message loop never starts.
+    #[tokio::test]
+    async fn only_an_uncommitted_peer_gets_the_weak_code_warning() {
+        for (peer_version, warned) in [(PROTOCOL_VERSION as u32, false), (3, true)] {
+            let (host, _client) = handshake_pair(PROTOCOL_VERSION as u32, peer_version).await;
+            let tunnel = host.unwrap();
+            let (to_app_tx, mut to_app_rx) = mpsc::unbounded_channel();
+            let (_from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+            let (_file_tx, file_rx) = mpsc::channel(1);
+            let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+            confirm_tx.send(false).unwrap();
+            let (mut stream, _other) = tokio::io::duplex(64);
+            let prompt = SessionEvent::Ready; // stands in for the prompt
+            let result = verify_then_run(
+                &mut stream,
+                tunnel,
+                prompt,
+                uuid::Uuid::new_v4(),
+                to_app_tx,
+                from_app_rx,
+                file_rx,
+                confirm_rx,
+            )
+            .await;
+            assert!(result.is_err(), "a rejected peer was let through");
+            let events: Vec<_> = std::iter::from_fn(|| to_app_rx.try_recv().ok()).collect();
+            let warnings: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, SessionEvent::Warning(w) if w == LEGACY_SAS_WARNING))
+                .collect();
+            assert_eq!(
+                warnings.len(),
+                usize::from(warned),
+                "peer v{peer_version}: {events:?}"
+            );
+            if warned {
+                assert!(
+                    matches!(events.first(), Some(SessionEvent::Warning(_))),
+                    "the warning must come before the prompt: {events:?}"
+                );
+            }
         }
     }
 

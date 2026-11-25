@@ -26,6 +26,39 @@ use uuid::Uuid;
 mod blobs;
 mod db;
 mod history;
+/// Make `data_dir` owner-only (SRV-11), or say loudly why it could not be.
+///
+/// A failure is a warning, not a refusal to start: a directory the server may
+/// write but does not own (a root-owned Docker volume reached through group
+/// permissions, say) answers `chmod` with EPERM, and failing there stopped an
+/// upgraded server from starting at all. Returns whether the mode is now
+/// owner-only.
+fn restrict_data_dir(data_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)) {
+            let mode = std::fs::metadata(data_dir)
+                .map(|m| format!("{:o}", m.permissions().mode() & 0o777))
+                .unwrap_or_else(|_| "unknown".to_string());
+            tracing::warn!(
+                dir = %data_dir.display(),
+                mode = %mode,
+                error = %e,
+                "could not make the data directory owner-only; it holds every message in \
+                 plaintext, so restrict it yourself (chmod 700, owned by the server's user)"
+            );
+            return false;
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests;
 mod write_rate;
@@ -48,6 +81,11 @@ const MAX_TOTAL_BLOB_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// to fill the server-wide ceiling cannot deny the feature to everyone else.
 /// Admins are exempt — they are the ones who clean up.
 const MAX_MEMBER_BLOB_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+
+/// Bytes every chunked upload in flight may declare, together. Their spools
+/// are held in memory until they finish, so without this one server's RAM was
+/// bounded only by members × 4 × 100 MiB (audit SRV-07).
+const MAX_UPLOAD_SPOOL_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 /// Most audit entries retained in memory and returned to an admin.
 const MAX_AUDIT_ENTRIES: usize = 1000;
 /// Most channels one server will hold (any member may create a public one).
@@ -268,11 +306,21 @@ struct PendingUpload {
     /// knows under the lock whether the content is already held (and needs no
     /// reservation) without a 100 MiB pass.
     hasher: BlobHasher,
+    /// When the upload was offered or last received a chunk: one that goes
+    /// quiet past `upload_idle_timeout` is dropped (see `expire_idle_uploads`).
+    last_active: std::time::Instant,
 }
 
 /// Uploads one member may have in flight at once (each up to
 /// [`MAX_PARTY_FILE_BYTES`]).
 pub const MAX_CONCURRENT_UPLOADS: usize = 4;
+
+/// How long a chunked upload may go without a chunk before it stops holding
+/// spool budget. The budget counts *declared* sizes, so without this four
+/// members who each offered a 128 MiB upload and then sent nothing blocked
+/// chunked uploads for everyone, indefinitely. A live upload sends a chunk
+/// every few milliseconds; two minutes covers a stalled network.
+pub const UPLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One recorded governance action.
 #[derive(Clone)]
@@ -323,6 +371,10 @@ pub struct PartyState {
     reservations: HashMap<Uuid, Reservation>,
     /// Per-member ceiling on distinct uploaded bytes. Admins are exempt.
     max_member_blob_bytes: u64,
+    /// See `MAX_UPLOAD_SPOOL_BYTES`.
+    max_upload_spool_bytes: u64,
+    /// See [`UPLOAD_IDLE_TIMEOUT`].
+    upload_idle_timeout: std::time::Duration,
     /// Ceiling on the total bytes of distinct blobs the store will hold.
     max_blob_bytes: u64,
     /// Most members this server registers (see [`MAX_MEMBERS`]).
@@ -375,6 +427,8 @@ impl PartyState {
             uploads: HashMap::new(),
             reservations: HashMap::new(),
             max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
+            max_upload_spool_bytes: MAX_UPLOAD_SPOOL_BYTES,
+            upload_idle_timeout: UPLOAD_IDLE_TIMEOUT,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             max_members: MAX_MEMBERS,
             resident_history: RESIDENT_HISTORY,
@@ -392,6 +446,16 @@ impl PartyState {
     /// Override the per-member storage allowance (bytes of distinct content).
     pub fn set_max_member_blob_bytes(&mut self, bytes: u64) {
         self.max_member_blob_bytes = bytes;
+    }
+
+    /// Override the server-wide budget for upload bytes in flight (tests).
+    pub fn set_max_upload_spool_bytes(&mut self, bytes: u64) {
+        self.max_upload_spool_bytes = bytes;
+    }
+
+    /// Override how long an upload may go without a chunk (tests).
+    pub fn set_upload_idle_timeout(&mut self, timeout: std::time::Duration) {
+        self.upload_idle_timeout = timeout;
     }
 
     /// Override how many of each thread's newest envelopes stay in memory on
@@ -451,6 +515,12 @@ impl PartyState {
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        // Owner-only, and on every load so a directory an older version made
+        // is closed too. `party.db` holds every message and DM in plaintext,
+        // and under a 022 umask it and every blob were world-readable on a
+        // shared host (SRV-11). The directory's mode covers everything in it,
+        // including files created later under the default umask.
+        restrict_data_dir(data_dir);
         let blob_dir = data_dir.join(BLOB_DIR);
         std::fs::create_dir_all(&blob_dir)?;
         let conn = Connection::open(data_dir.join(DB_FILE))?;
@@ -1129,7 +1199,6 @@ impl PartyState {
         validate_message_text(&text)?;
         self.member_can_post_to_channel(sender, channel)?;
         self.append_channel_message(sender, channel, MessagePayload::Text(text))
-            .ok_or_else(|| "unknown channel".to_string())
     }
 
     /// How long the community keeps messages and shared files (`--retain-days`,
@@ -1188,29 +1257,40 @@ impl PartyState {
         report
     }
 
-    /// Append a message to `channel` under the next sequence number, keep it
-    /// in memory (subject to the resident cap) and persist it. `None` for an
-    /// unknown channel. Every channel message — text, file, re-share — is
-    /// appended here, so numbering has one source.
+    /// Append a message to `channel` under the next sequence number: persist
+    /// it, then keep it in memory (subject to the resident cap). Every channel
+    /// message — text, file, re-share — is appended here, so numbering has one
+    /// source.
+    ///
+    /// **Persisted first** (QUAL-05): a row that cannot be written refuses the
+    /// message, leaving memory and the sequence untouched, instead of a
+    /// confirmation for something the next restart would lose.
     fn append_channel_message(
         &mut self,
         sender: Uuid,
         channel: Uuid,
         payload: MessagePayload,
-    ) -> Option<Envelope> {
+    ) -> Result<Envelope, String> {
         let (tier, cap) = (self.tier, self.history_cap());
-        let chan = self.channel_mut(channel)?;
+        let seq = self
+            .channel_mut(channel)
+            .ok_or_else(|| "unknown channel".to_string())?
+            .history
+            .next_seq();
         let envelope = Envelope {
             tier,
             sender,
             channel,
-            seq: chan.history.next_seq(),
+            seq,
             timestamp: current_timestamp_millis(),
             payload,
         };
-        chan.history.push(envelope.clone(), cap);
-        self.persist_message(&envelope);
-        Some(envelope)
+        self.persist_message(&envelope)?;
+        self.channel_mut(channel)
+            .expect("checked above")
+            .history
+            .push(envelope.clone(), cap);
+        Ok(envelope)
     }
 
     /// The DM twin of [`Self::append_channel_message`], creating the thread
@@ -1220,26 +1300,32 @@ impl PartyState {
         sender: Uuid,
         thread_id: Uuid,
         payload: MessagePayload,
-    ) -> Envelope {
+    ) -> Result<Envelope, String> {
         let (tier, cap) = (self.tier, self.history_cap());
-        let thread = self
+        let seq = self
             .dm_threads
-            .entry(thread_id)
-            .or_insert_with(|| DmThread {
-                id: thread_id,
-                history: History::new(),
-            });
+            .get(&thread_id)
+            .map_or_else(|| History::new().next_seq(), |t| t.history.next_seq());
         let envelope = Envelope {
             tier,
             sender,
             channel: thread_id,
-            seq: thread.history.next_seq(),
+            seq,
             timestamp: current_timestamp_millis(),
             payload,
         };
-        thread.history.push(envelope.clone(), cap);
-        self.persist_dm(thread_id, &envelope);
-        envelope
+        // Persisted first, as for channels; a refused first message does not
+        // leave an empty thread behind either.
+        self.persist_dm(thread_id, &envelope)?;
+        self.dm_threads
+            .entry(thread_id)
+            .or_insert_with(|| DmThread {
+                id: thread_id,
+                history: History::new(),
+            })
+            .history
+            .push(envelope.clone(), cap);
+        Ok(envelope)
     }
 
     /// One page of a thread's history after `since_seq`: from memory when the
@@ -1286,9 +1372,15 @@ impl PartyState {
         if !self.is_member(to) {
             return Err("recipient is not a member of this server".to_string());
         }
+        // A Guest is read-only everywhere, DMs included: demotion is the one
+        // moderation tool, and it did not stop DM spam (SRV-08). Files and
+        // shares already checked this; text did not.
+        if !self.role_of(from).can_write() {
+            return Err("your role on this server is read-only".to_string());
+        }
         validate_message_text(&text)?;
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        Ok(self.append_dm_message(from, thread_id, MessagePayload::Text(text)))
+        self.append_dm_message(from, thread_id, MessagePayload::Text(text))
     }
 
     /// Direct-message history for a thread strictly after `since_seq`, paged the

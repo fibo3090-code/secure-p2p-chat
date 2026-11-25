@@ -164,15 +164,23 @@ export function Modal({ open, onClose, children, width = 460, title, icon, sub, 
   const subId = useId();
   const ref = useRef(null);
   // Whatever had focus before the dialog opened, so it can be handed back.
+  // Read while rendering the opening frame, not in the effect below: by the
+  // time an effect runs, React has already applied any `autoFocus` inside the
+  // dialog, and the "opener" would be that field — gone once the dialog is.
   const returnTo = useRef(null);
+  const [wasOpen, setWasOpen] = useState(false);
+  if (open !== wasOpen) {
+    if (open && typeof document !== "undefined") returnTo.current = document.activeElement;
+    setWasOpen(open);
+  }
 
   useEffect(() => {
     if (!open) return undefined;
-    returnTo.current = document.activeElement;
     // Focus the dialog itself rather than its first control: a confirmation
     // dialog must not open with the destructive button already focused, one
-    // Space away from firing.
-    ref.current?.focus();
+    // Space away from firing. A field the dialog asked to focus (`autoFocus`)
+    // keeps it — taking it back made every text dialog need an extra Tab.
+    if (!ref.current?.contains(document.activeElement)) ref.current?.focus();
     return () => {
       // Hand focus back to what opened the dialog, so a keyboard user is not
       // dumped at the top of the document.

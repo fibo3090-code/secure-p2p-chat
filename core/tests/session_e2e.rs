@@ -356,23 +356,87 @@ async fn missing_connection_password_is_rejected() {
 /// keep-alive against a 3 s idle timeout, then 6 s of silence.
 #[tokio::test]
 async fn idle_session_survives_past_the_idle_timeout() {
-    // Read at loop startup, so set before connecting. nextest runs each test in
-    // its own process, so this cannot leak.
+    // Read at message-loop startup, so set before the pair connects, and
+    // removed when the test ends — under nextest each test is its own process,
+    // but under plain `cargo test` the rest of this binary would inherit a 3 s
+    // idle timeout.
+    struct ShortTimers;
+    impl Drop for ShortTimers {
+        fn drop(&mut self) {
+            std::env::remove_var("P2PEM_TEST_KEEPALIVE_SECS");
+            std::env::remove_var("P2PEM_TEST_IDLE_TIMEOUT_SECS");
+        }
+    }
+    let _restore = ShortTimers;
     std::env::set_var("P2PEM_TEST_KEEPALIVE_SECS", "1");
     std::env::set_var("P2PEM_TEST_IDLE_TIMEOUT_SECS", "3");
 
     let (mut host, mut client) = connect_pair().await;
     reach_ready(&mut host, &mut client).await;
+    // One frame each way first. Until a side has received a frame its idle
+    // deadline is the 30-minute verification window plus the idle timeout
+    // (NET-10), so sleeping straight after `Ready` passed with keep-alive
+    // switched off entirely; it is the short timer this has to outlive.
+    host.send(text("hello", 1, 1));
+    assert_eq!(next_text(&mut client.events, "client").await, "hello");
+    client.send(text("hi", 1, 1));
+    assert_eq!(next_text(&mut host.events, "host").await, "hi");
 
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
     // Still alive in both directions (a fired idle timer would surface as
     // Error/Disconnected and fail next_text).
-    host.send(text("still here", 1, 1));
+    host.send(text("still here", 2, 1));
     assert_eq!(next_text(&mut client.events, "client").await, "still here");
     client.send(text("me too", 2, 1));
     assert_eq!(next_text(&mut host.events, "host").await, "me too");
 
+    host.handle.abort();
+    client.handle.abort();
+}
+
+/// NET-10: the two people compare the safety code at their own pace. The
+/// first to accept enters its message loop and its idle timer starts, while
+/// the other is still reading the prompt and sends nothing — so confirming
+/// more than the idle window apart (five minutes in production, comparing a
+/// code over the phone) used to end the session on "Receive idle timeout"
+/// before the second side had even answered. Shrunk here to a 3 s window
+/// and a 6 s gap with the debug-only timer hooks.
+#[tokio::test]
+async fn confirming_the_safety_code_minutes_apart_keeps_the_session() {
+    struct ShortTimers;
+    impl Drop for ShortTimers {
+        fn drop(&mut self) {
+            std::env::remove_var("P2PEM_TEST_KEEPALIVE_SECS");
+            std::env::remove_var("P2PEM_TEST_IDLE_TIMEOUT_SECS");
+        }
+    }
+    let _restore = ShortTimers;
+    std::env::set_var("P2PEM_TEST_KEEPALIVE_SECS", "1");
+    std::env::set_var("P2PEM_TEST_IDLE_TIMEOUT_SECS", "3");
+
+    let (mut host, mut client) = connect_pair().await;
+    wait_until(&mut host.events, "host prompt", awaiting_confirmation).await;
+    wait_until(&mut client.events, "client prompt", awaiting_confirmation).await;
+
+    host.confirm.send(true).unwrap();
+    // Twice the idle window before the other side answers.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    client.confirm.send(true).unwrap();
+
+    let text = |t: &str| ProtocolMessage::Text {
+        text: t.into(),
+        timestamp: 0,
+        seq: 0,
+    };
+    host.outbound.send(text("to client")).unwrap();
+    client.outbound.send(text("to host")).unwrap();
+    for (peer, label) in [(&mut client, "client"), (&mut host, "host")] {
+        match next_message(&mut peer.events, label).await {
+            ProtocolMessage::Text { text, .. } => assert_eq!(text, format!("to {label}")),
+            other => panic!("{label} expected text, got {other:?}"),
+        }
+    }
     host.handle.abort();
     client.handle.abort();
 }
@@ -393,6 +457,55 @@ async fn messages_keep_flowing_across_a_rekey() {
             next_text(&mut client.events, "client").await,
             format!("msg-{i}")
         );
+    }
+
+    host.handle.abort();
+    client.handle.abort();
+}
+
+/// CRYPTO-06: several rekeys under traffic crossing in both directions.
+///
+/// Only the host initiates a rekey, and only one previous key is retained to
+/// decrypt frames the client sent before it switched. Both directions count
+/// toward the threshold, so with the client streaming too the host can start
+/// a *second* rekey before any frame under the first has come back — which
+/// discards the key the client's in-flight frames still use, and the session
+/// dies on "Decryption failed". One-way tests cannot see this: with one
+/// direction quiet, every rekey completes before the next is due.
+#[tokio::test]
+async fn several_rekeys_under_crossing_traffic_lose_nothing() {
+    let (mut host, mut client) = connect_pair().await;
+    reach_ready(&mut host, &mut client).await;
+
+    // ~1000 frames against a 100-message threshold: about ten rekeys.
+    const COUNT: usize = 500;
+    for i in 0..COUNT {
+        for (peer, side) in [(&host, "host"), (&client, "client")] {
+            peer.outbound
+                .send(ProtocolMessage::Text {
+                    text: format!("{side}-{i}"),
+                    timestamp: i as u64,
+                    seq: 0,
+                })
+                .unwrap();
+        }
+    }
+    for (peer, from, label) in [
+        (&mut client, "host", "client"),
+        (&mut host, "client", "host"),
+    ] {
+        for i in 0..COUNT {
+            match next_message(&mut peer.events, label).await {
+                ProtocolMessage::Text { text, .. } => {
+                    assert_eq!(
+                        text,
+                        format!("{from}-{i}"),
+                        "{label} lost or reordered a frame"
+                    )
+                }
+                other => panic!("{label} expected text {i}, got {other:?}"),
+            }
+        }
     }
 
     host.handle.abort();

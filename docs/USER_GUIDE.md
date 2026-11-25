@@ -344,6 +344,10 @@ Rules:
 - outgoing files must exist locally
 - cloud-only placeholders must be downloaded first
 - received files are stored in the configured download directory
+- unless auto-accept is on, an incoming file waits for you to accept it. While
+  it waits, what has arrived so far sits in the download directory as a
+  hidden-in-plain-sight `tmp_…` file (at most 64 MiB per conversation); it gets
+  its real name only when you accept, and is deleted if you decline
 
 If you see transfer problems:
 
@@ -393,11 +397,16 @@ command — so you can drive the whole app from the keyboard (or script it).
 - `Ctrl+L` — copy the event log to the clipboard
 - `Esc` — close an overlay / leave command mode / focus the chat list
 - `q` — quit (asks to confirm) when the input is not focused
+- `Ctrl+C` — quit from anywhere (asks to confirm; `Ctrl+C` again confirms)
 - `?` — open the help overlay
 - The message view auto-scrolls to the newest message; scroll up to read
   back, and it re-sticks to the bottom when you return there.
 
 Chat-list markers: `H` hosting · `●` connected · `○` offline · `*` unread.
+
+Set `NO_COLOR=1` to draw without colour (bold and reverse video are kept). The
+safety-code digits and emoji, and the fingerprint text, carry everything you
+need to verify a contact; the coloured grid is only a visual aid.
 
 ### Command autocomplete
 
@@ -443,8 +452,10 @@ Connections
   :connect <host[:port]>                    connect to a hosting peer
   :host-relay <relay[:port]> [token]        host via a relay (copies an invite)
   :connect-relay <relay[:port]> <token>     connect through a relay
-  :disconnect                               remove / disconnect the selected chat
+  :disconnect                               close the selected chat's connection (history kept)
   :stop-host                                stop listening
+  :connection-password [password]           set/clear the P2P connection password
+  :lock <on|off>                            refuse (on) or allow (off) new connections to this chat
 
 Contacts & invites
   :contacts                                 open the contacts list
@@ -462,6 +473,8 @@ Messaging & files
   :rename <title>                           rename the selected chat
   :delete                                   delete the selected chat
   :clear-history                            erase all chats and contacts
+  :accept                                   accept the incoming file offer
+  :decline                                  decline the incoming file offer
 
 Party servers
   :party-connect <host[:port]> <username> [password]
@@ -472,6 +485,16 @@ Party servers
   :party-dm <username|#> <message>          direct-message a Party member
   :party-create-channel <name>              create a Party channel
   :party-status                             show joined Party servers
+  :party-send-file <path>                   share a file in the current channel
+  :party-files                              refresh the shared-file list and your storage
+  :party-download <name|hash>               save a shared file to your download folder
+  :party-delete-file <name|hash>            delete a file you shared (any, as an admin)
+  :party-role <username> <guest|member|admin>
+                                             change a member's role (admins)
+  :party-channel-access <#channel> <public|private|locked|announce> [members…]
+                                             change who can read and post (admins)
+  :party-delete-channel <#channel>          delete a channel and its history (admins)
+  :party-audit                              show the community's activity log (admins)
 
 Identity & security
   :identity                                 show your fingerprint + safety grid
@@ -480,6 +503,9 @@ Identity & security
   :set-password <password>                  set a password on an unprotected identity
   :change-password <current> <new>          change your password
   :history-reset                            set an unreadable history file aside
+  :name <name>                              change your display name
+  :backup <path>                            export an encrypted identity backup
+  :wipe <password>                          delete identity, history and communities here, then quit
 
 Settings & app
   :settings                                 open the settings panel
@@ -490,8 +516,10 @@ Settings & app
   :quit                                     save and exit (alias :q, :q! to skip confirm)
 ```
 
-`:set` keys: `download-dir`, `listen-port`, `notifications`, `typing`,
-`auto-accept`, `auto-host`, `mdns`, `theme` (`light|dark|midnight|forest|rose`).
+`:set` keys: `download-dir`, `listen-port`, `notifications`,
+`notification-content` (`full|sender|hidden`), `typing`, `auto-accept`,
+`auto-host` (host on the configured port once unlocked), `upnp`. LAN discovery
+(`mdns`) and themes are desktop-app features; the terminal client has neither.
 Booleans accept `on`/`off`. Example: `:set notifications off`.
 
 History is saved automatically (encrypted) on a timer and on exit.
@@ -568,7 +596,7 @@ The app also supports panic/crash logging to help support and debugging.
 
 - check the connection status
 - reconnect manually if needed
-- inspect the log terminal or TUI diagnostics output
+- copy the event log (`Ctrl+L` in the terminal client) or export a diagnostics bundle (`:diagnostics`, or Settings → Diagnostics in the desktop app); a relay server logs to its stderr, filtered by `RUST_LOG`
 - if one side is much older, large-message chunking compatibility may be involved
 
 ### Fingerprint changed

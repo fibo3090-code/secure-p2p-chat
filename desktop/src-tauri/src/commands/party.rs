@@ -3,6 +3,8 @@
 //! fingerprint pinning. Params are single words (Tauri arg-naming footgun).
 use crate::*;
 use messenger_core::party::{ChannelKind, FilePermissions, Role, UploadTarget};
+use p2pem_classic::app::party_manager::{PartyDial, PartyManager};
+use p2pem_classic::app::saved_parties::{load_saved_parties, save_saved_parties, SavedParty};
 
 #[derive(Serialize)]
 pub(crate) struct PartyMemberDto {
@@ -315,11 +317,22 @@ pub(crate) async fn party_join(
         .map(|p| p.fingerprint)
         .or_else(|| fingerprint.filter(|f| !f.trim().is_empty()));
 
-    let mut party = state.party.lock().await;
-    let outcome = party
-        .connect_and_join(&address, &username, password, &pk, pinned.as_deref())
+    // Dial with no lock held: the poll loop takes the community lock first
+    // every tick, and holding it across a connect to an address that never
+    // answers stopped every session event, toast and save for up to
+    // PARTY_CONNECT_TIMEOUT (TAURI-04). Only attaching the result needs it.
+    let dialled = PartyManager::dial(&address, &pk, pinned.as_deref())
         .await
         .map_err(|e| e.to_string())?;
+    let mut party = state.party.lock().await;
+    let outcome = match dialled {
+        PartyDial::NeedsVerification { fingerprint, sas } => {
+            PartyJoinOutcome::NeedsVerification { fingerprint, sas }
+        }
+        PartyDial::Verified(verified) => party
+            .attach(&address, &username, password, *verified)
+            .map_err(|e| e.to_string())?,
+    };
 
     let (sid, fingerprint) = match outcome {
         PartyJoinOutcome::NeedsVerification { fingerprint, sas } => {
@@ -472,88 +485,7 @@ pub(crate) async fn party_clear_error(
     Ok(())
 }
 
-/// A joined community, persisted (no password) for one-click rejoin; the
-/// pinned fingerprint refuses a different identity at the same address.
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct SavedParty {
-    pub(crate) address: String,
-    pub(crate) username: String,
-    #[serde(default)]
-    pub(crate) name: String,
-    #[serde(default)]
-    pub(crate) fingerprint: String,
-}
-
-/// Load the saved communities. Missing is an empty list (first run); an
-/// unreadable file is an error, because silently dropping the pins would turn
-/// the next join back into an unverified first contact.
-fn load_saved_parties(path: &Path) -> Result<Vec<SavedParty>, String> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(format!(
-                "Could not read your saved communities ({}): {e}. \
-                 Not joining, because the fingerprints that protect those \
-                 connections are stored there.",
-                path.display()
-            ))
-        }
-    };
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str(&raw).map_err(|e| {
-        format!(
-            "Your saved communities file ({}) is damaged: {e}. \
-             It holds the fingerprints that protect those connections, so \
-             joining is refused until it is repaired or removed.",
-            path.display()
-        )
-    })
-}
-
-/// Save the saved communities atomically (like `identity.json`): a torn file
-/// is indistinguishable from one with no pins.
-fn save_saved_parties(path: &Path, list: &[SavedParty]) {
-    match serde_json::to_string_pretty(list) {
-        Ok(json) => {
-            if let Err(e) = messenger_core::util::write_file_atomic(path, json.as_bytes()) {
-                tracing::warn!("saving communities list failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("serializing communities list failed: {e}"),
-    }
-}
-
-/// Insert or update the entry for `address` (case-insensitive). A load failure
-/// aborts: rewriting from an empty list would destroy every other pin.
-pub(crate) fn upsert_saved_party(path: &Path, entry: SavedParty) {
-    let mut list = match load_saved_parties(path) {
-        Ok(list) => list,
-        Err(e) => {
-            tracing::error!("{e}");
-            return;
-        }
-    };
-    match list
-        .iter_mut()
-        .find(|p| p.address.eq_ignore_ascii_case(&entry.address))
-    {
-        Some(existing) => {
-            existing.username = entry.username;
-            if !entry.name.is_empty() {
-                existing.name = entry.name;
-            }
-            if !entry.fingerprint.is_empty() {
-                existing.fingerprint = entry.fingerprint;
-            }
-        }
-        None => list.push(entry),
-    }
-    save_saved_parties(path, &list);
-}
-
+/// The saved communities, for the join screen's one-click rejoin list.
 #[tauri::command]
 pub(crate) async fn party_saved(
     state: tauri::State<'_, Bridge>,
@@ -763,17 +695,28 @@ fn parse_ids(ids: &[String]) -> Result<Vec<Uuid>, String> {
 async fn pick_upload<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
 ) -> Result<Option<(String, String, Vec<u8>)>, String> {
-    let picked =
-        crate::native_file_dialog(window, |d| d.set_title("Share a file").pick_file()).await?;
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Open {
+            title: "Share a file",
+        },
+    )
+    .await?;
     let Some(path) = picked else {
         return Ok(None);
     };
+    read_upload(&path).await.map(Some)
+}
+
+/// Read a file chosen for a community upload, refusing it on size *before*
+/// reading. Split from [`pick_upload`] so the cap is testable without a dialog.
+pub(crate) async fn read_upload(path: &Path) -> Result<(String, String, Vec<u8>), String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let mime = messenger_core::util::guess_mime(&path).to_string();
-    let size = tokio::fs::metadata(&path)
+    let mime = messenger_core::util::guess_mime(path).to_string();
+    let size = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Could not read {}: {e}", path.display()))?
         .len();
@@ -786,10 +729,10 @@ async fn pick_upload<R: tauri::Runtime>(
             messenger_core::util::format_size(cap)
         ));
     }
-    let data = tokio::fs::read(&path)
+    let data = tokio::fs::read(path)
         .await
         .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-    Ok(Some((name, mime, data)))
+    Ok((name, mime, data))
 }
 
 /// Pick a file and post it to a channel; cancelling is a no-op.
@@ -826,6 +769,37 @@ pub(crate) async fn party_send_file_dm<R: tauri::Runtime>(
     with_party(&state, |p| p.send_file_dm(sid, peer, name, mime, data)).await
 }
 
+/// Ask the server for a file and wait, bounded, for its bytes. Split from
+/// [`party_download_file`] so it is testable without the save dialog.
+///
+/// The party lock is released BEFORE awaiting, so the poll loop can lock the
+/// manager, drain the FileData response, and complete us. A bare `rx.await`
+/// would hang forever if the server accepted the request and never answered:
+/// the click does nothing, with no error and no way to tell it from a slow
+/// link. Outer error: the sender was dropped (connection torn down). Inner
+/// error: the server refused (file gone / not permitted).
+pub(crate) async fn fetch_party_file(
+    party: &Arc<Mutex<PartyManager>>,
+    sid: Uuid,
+    hash: String,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    let rx = party
+        .lock()
+        .await
+        .request_download(sid, hash)
+        .map_err(|e| e.to_string())?;
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(data))) => Ok(data),
+        Ok(Ok(Err(reason))) => Err(reason),
+        Ok(Err(_)) => Err("download failed: the connection closed".to_string()),
+        Err(_) => Err(format!(
+            "download timed out after {}s — the community server did not send the file",
+            timeout.as_secs()
+        )),
+    }
+}
+
 /// How long to wait for a requested file, so a server that never answers gives
 /// an error rather than a click that does nothing forever.
 const PARTY_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -843,28 +817,20 @@ pub(crate) async fn party_download_file<R: tauri::Runtime>(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
-    // The lock is released before awaiting, so the poll loop can complete us.
-    let rx = with_party(&state, |p| p.request_download(sid, hash)).await?;
-    // Outer error: connection torn down. Inner error: the server refused.
-    let data = match tokio::time::timeout(PARTY_DOWNLOAD_TIMEOUT, rx).await {
-        Ok(Ok(Ok(data))) => data,
-        Ok(Ok(Err(reason))) => return Err(reason),
-        Ok(Err(_)) => return Err("download failed: the connection closed".to_string()),
-        Err(_) => {
-            return Err(format!(
-                "download timed out after {}s — the community server did not send the file",
-                PARTY_DOWNLOAD_TIMEOUT.as_secs()
-            ))
-        }
-    };
-    // Another member chose this name: sanitize it (`../`, device names, bidi
-    // overrides) before it pre-fills the save dialog.
+    let data = fetch_party_file(&state.party, sid, hash, PARTY_DOWNLOAD_TIMEOUT).await?;
+    // Another member chose this name. Sanitize it before it reaches the save
+    // dialog, as the TUI does: a dialog pre-filled with `../` segments, a
+    // Windows device name or a U+202E override (`photo_gnp.exe` rendering as
+    // `photo_exe.png`) is inviting the user to confirm something they cannot
+    // see.
     let suggested = messenger_core::util::sanitize_filename(&name);
-    let picked = crate::native_file_dialog(window, move |d| {
-        d.set_title("Save file")
-            .set_file_name(suggested)
-            .save_file()
-    })
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Save {
+            title: "Save file",
+            file_name: suggested,
+        },
+    )
     .await?;
     let Some(path) = picked else {
         return Ok(());

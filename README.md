@@ -98,10 +98,10 @@ cargo nextest run --workspace --profile ci && cargo test --workspace --doc \
   && (cd desktop && npm run lint && npm test)
 ```
 
-The terminal UI is fully featured and keyboard-driven: press `:` for an
-autocomplete command menu, or `:help` for the full reference. Every action —
-connecting, verification, contacts, invites, file transfer, settings — is
-reachable without leaving the terminal. See
+The terminal UI is keyboard-driven: press `:` for an autocomplete command
+menu, or `:help` for the full reference. Connecting, verification, contacts,
+invites, file transfer and settings are all reachable without leaving the
+terminal; LAN discovery and themes are desktop-only. See
 [docs/USER_GUIDE.md](docs/USER_GUIDE.md#tui-reference).
 
 ## Platform notes

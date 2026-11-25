@@ -83,7 +83,13 @@ impl TuiApp {
                     v.push(ext);
                 }
                 if let Some(ip) = crate::util::primary_local_ipv4() {
-                    let lan = format!("{}:{}", ip, self.chat_manager.config.listen_port);
+                    // The port actually hosted, not the configured one:
+                    // after `:host 9000` the link named 12345 (TUI-23).
+                    let port = self
+                        .chat_manager
+                        .hosting_port
+                        .unwrap_or(self.chat_manager.config.listen_port);
+                    let lan = format!("{ip}:{port}");
                     if !v.contains(&lan) {
                         v.push(lan);
                     }
@@ -108,7 +114,8 @@ impl TuiApp {
         match self.chat_manager.parse_invite_link(&link) {
             Ok(contact) => {
                 let name = contact.name.clone();
-                if let Err(e) = self.chat_manager.import_contact(contact) {
+                let signed = crate::app::ChatManager::invite_link_is_signed(&link);
+                if let Err(e) = self.chat_manager.import_contact_from_link(contact, signed) {
                     self.toast(ToastLevel::Error, e.to_string());
                     return;
                 }

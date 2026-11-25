@@ -44,6 +44,10 @@ pub enum TuiOverlay {
     },
     ConfirmQuit,
     ConfirmClearHistory,
+    /// `:delete` on a conversation: deleting its history cannot be undone.
+    ConfirmDeleteChat {
+        chat_id: uuid::Uuid,
+    },
     /// `:wipe` after the password checked out; only Ctrl+Y proceeds.
     ConfirmWipe,
 }
@@ -140,9 +144,9 @@ fn render_grid_and_hex(f: &mut Frame, fingerprint: &str, grid: Rect, hex: Rect) 
         .collect();
     f.render_widget(Paragraph::new(lines), grid);
     f.render_widget(
-        Paragraph::new(fingerprint.to_string())
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::White)),
+        // The terminal's own foreground: white was white-on-white on a light
+        // theme, and this is the backstop for the safety code (TUI-21).
+        Paragraph::new(fingerprint.to_string()).wrap(Wrap { trim: true }),
         hex,
     );
 }
@@ -180,6 +184,13 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             f,
             "Quit?",
             "Save history and exit? (y = quit, n = cancel)",
+            area,
+        ),
+        TuiOverlay::ConfirmDeleteChat { .. } => render_confirm(
+            f,
+            "Delete this conversation?",
+            "Its messages are deleted from this device and cannot be recovered. \
+             (y = delete, n = cancel)",
             area,
         ),
         TuiOverlay::ConfirmClearHistory => render_confirm(
@@ -243,6 +254,7 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
             ("↑/↓", "select chat / scroll messages / command history"),
             ("PgUp/PgDn", "scroll messages"),
             ("Ctrl+L", "copy logs to clipboard"),
+            ("Ctrl+C", "quit (asks; Ctrl+C again to confirm)"),
             ("y / n", "confirm / cancel in confirm overlays"),
             (
                 "Ctrl+Y / Ctrl+N",
@@ -284,10 +296,18 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
 /// The text the fingerprint prompt leads with when it is not a first use.
 pub(crate) fn fingerprint_warning_text(warning: &FingerprintWarning) -> String {
     match warning {
-        FingerprintWarning::KeyChanged { previous } => format!(
-            "⚠ WARNING: this conversation's key has CHANGED (was {}…). It may be a new device — or someone intercepting the connection. Reject unless the codes match.",
-            short_fingerprint(previous)
-        ),
+        FingerprintWarning::KeyChanged { previous, repoints } => {
+            let mut text = format!(
+                "⚠ WARNING: this conversation's key has CHANGED (was {}…). It may be a new device — or someone intercepting the connection. Reject unless the codes match.",
+                short_fingerprint(previous)
+            );
+            if let Some(contact) = repoints {
+                text.push_str(&format!(
+                    " It is not the key in {contact}'s invite either: accepting replaces the key saved for {contact}."
+                ));
+            }
+            text
+        }
         FingerprintWarning::InviteMismatch {
             contact_name,
             expected,
@@ -296,6 +316,16 @@ pub(crate) fn fingerprint_warning_text(warning: &FingerprintWarning) -> String {
             "⚠ WARNING: this is NOT the key in {}'s invite (expected {}…). Someone may be intercepting the connection. Reject unless the codes match.",
             contact_name,
             short_fingerprint(expected)
+        ),
+        FingerprintWarning::ContactAddressMismatch {
+            contact_name,
+            expected,
+            ..
+        } => format!(
+            "⚠ WARNING: this connection comes from {}'s address but does NOT present their key (expected {}…). It may be their new device — or someone intercepting them. Reject unless the codes match; accepting does not change {}'s saved key.",
+            contact_name,
+            short_fingerprint(expected),
+            contact_name
         ),
     }
 }
@@ -437,9 +467,7 @@ fn render_settings(f: &mut Frame, app: &mut TuiApp, full: Rect) {
         format!("typing         {}", on_off(cfg.enable_typing_indicators)),
         format!("auto-accept    {}", on_off(cfg.auto_accept_files)),
         format!("auto-host      {}", on_off(cfg.auto_host_on_startup)),
-        format!("mdns           {}", on_off(cfg.enable_mdns)),
         format!("upnp           {}", on_off(cfg.enable_upnp)),
-        format!("theme          {:?}", cfg.theme),
     ];
     let list = highlight_list(rows.map(ListItem::new));
     f.render_stateful_widget(list, inner, &mut app.settings_list_state);
@@ -799,8 +827,12 @@ fn render_password(f: &mut Frame, app: &TuiApp, mode: PasswordMode, full: Rect) 
         PasswordMode::Unlock => {
             "Your identity is encrypted. Enter your password to unlock messaging and history."
         }
+        PasswordMode::Set if app.new_password_first.is_some() => {
+            "Type the same password again to confirm it. There is no way to recover it."
+        }
         PasswordMode::Set => {
-            "Protect your private key with a password. You'll need it on next launch."
+            "Protect your private key with a password (at least 12 characters). \
+             You'll need it on next launch, and it cannot be recovered."
         }
     };
     let rows = Layout::vertical([
@@ -826,8 +858,7 @@ fn render_confirm(f: &mut Frame, title: &str, message: &str, full: Rect) {
     f.render_widget(
         Paragraph::new(message)
             .wrap(Wrap { trim: false })
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::White)),
+            .alignment(Alignment::Center),
         inner,
     );
 }

@@ -8,7 +8,7 @@
 //!
 //! Ignored by default — it is a probe, not a test. Run with:
 //!
-//!   cargo test --release -p p2pem-classic --test history_scaling_probe \
+//!   cargo test --release -p p2pem-classic --test it probes:: \
 //!       -- --ignored --nocapture
 //!
 //! **`--release`, not optionally.** The numbers are here so a product decision

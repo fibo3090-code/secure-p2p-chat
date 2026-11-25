@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. v3: ECDH-first handshake; v4 adds the ephemeral-key commitment that
 /// makes the SAS sound (audit CRYPTO-02). v3 peers are still accepted, with a warning.
-pub const PROTOCOL_VERSION: u8 = 4;
+/// v5: a connection password is proven (`password_proof`), never sent (audit CRYPTO-05).
+pub const PROTOCOL_VERSION: u8 = 5;
 
 /// Protocol messages exchanged between peers
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -699,19 +700,131 @@ mod tests {
         }
     }
 
+    /// Every per-field cap, pinned from both sides. Checking only "cap + 1 is
+    /// refused" passes for a cap set too *low* — a decoder that refused every
+    /// near-limit frame would drop real messages and still be green — so each
+    /// limit is asserted as "exactly at the cap decodes, one past it does not".
     #[test]
-    fn oversized_payloads_are_rejected() {
-        assert!(decode(&file_meta("x", crate::MAX_FILE_SIZE + 1)).is_none());
-        assert!(decode(&ProtocolMessage::FileChunk {
-            chunk: vec![0u8; crate::FILE_CHUNK_SIZE + 1],
+    fn every_field_cap_admits_its_limit_and_refuses_one_past_it() {
+        let text = |n: usize| ProtocolMessage::Text {
+            text: "a".repeat(n),
+            timestamp: 1,
             seq: 1,
-        })
-        .is_none());
-        // EphemeralKey over the 256-byte cap.
-        assert!(decode(&ProtocolMessage::EphemeralKey {
+        };
+        let text_chunk = |n: usize| ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 0,
+            total_chunks: 1,
+            text_part: "a".repeat(n),
+            timestamp: 1,
+            seq: 1,
+        };
+        let file_meta = |size: u64| ProtocolMessage::FileMeta {
+            filename: "x".to_string(),
+            size,
+            seq: 1,
+        };
+        let file_chunk = |n: usize| ProtocolMessage::FileChunk {
+            chunk: vec![0u8; n],
+            seq: 1,
+        };
+        let cases: [(&str, ProtocolMessage, ProtocolMessage); 4] = [
+            (
+                "Text",
+                text(crate::MAX_TEXT_MESSAGE_BYTES),
+                text(crate::MAX_TEXT_MESSAGE_BYTES + 1),
+            ),
+            (
+                "TextChunk",
+                text_chunk(crate::TEXT_CHUNK_BYTES),
+                text_chunk(crate::TEXT_CHUNK_BYTES + 1),
+            ),
+            (
+                "FileMeta",
+                file_meta(crate::MAX_FILE_SIZE),
+                file_meta(crate::MAX_FILE_SIZE + 1),
+            ),
+            (
+                "FileChunk",
+                file_chunk(crate::FILE_CHUNK_SIZE),
+                file_chunk(crate::FILE_CHUNK_SIZE + 1),
+            ),
+        ];
+        for (what, at_cap, over) in cases {
+            assert_eq!(
+                ProtocolMessage::from_plain_bytes(&at_cap.to_plain_bytes()).as_ref(),
+                Some(&at_cap),
+                "{what} at its cap must decode unchanged"
+            );
+            assert!(
+                ProtocolMessage::from_plain_bytes(&over.to_plain_bytes()).is_none(),
+                "{what} one past its cap must be refused"
+            );
+        }
+
+        // EphemeralKey longer than the 256-byte cap must not decode.
+        let bad_eph = ProtocolMessage::EphemeralKey {
             public_key: vec![0u8; 300],
-        })
-        .is_none());
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&bad_eph.to_plain_bytes()).is_none());
+    }
+
+    /// The legacy ASCII arms carry the same caps as the binary ones: a legacy
+    /// peer is still a remote peer.
+    #[test]
+    fn legacy_arms_enforce_the_binary_arms_limits() {
+        // A legacy text frame far past the cap.
+        let mut huge_text = b"TEXT:1:".to_vec();
+        huge_text.extend(std::iter::repeat_n(b'a', crate::MAX_TEXT_MESSAGE_BYTES + 1));
+        assert!(ProtocolMessage::from_plain_bytes(&huge_text).is_none());
+        // The cap is on the whole frame and inclusive: exactly at it decodes.
+        let mut at_cap = b"TEXT:1:".to_vec();
+        at_cap.resize(crate::MAX_TEXT_MESSAGE_BYTES, b'a');
+        assert!(
+            matches!(
+                ProtocolMessage::from_plain_bytes(&at_cap),
+                Some(ProtocolMessage::Text { .. })
+            ),
+            "a legacy text frame of exactly the cap was refused"
+        );
+        at_cap.push(b'a');
+        assert!(ProtocolMessage::from_plain_bytes(&at_cap).is_none());
+
+        // A legacy ephemeral key must be exactly 32 bytes, neither side of it.
+        for len in [31usize, 33, 8 * 1024 * 1024] {
+            let mut frame = b"EPHEMERAL_KEY:".to_vec();
+            frame.extend(std::iter::repeat_n(b'A', len));
+            assert!(
+                ProtocolMessage::from_plain_bytes(&frame).is_none(),
+                "a {len}-byte legacy ephemeral key was accepted"
+            );
+        }
+        let mut exact = b"EPHEMERAL_KEY:".to_vec();
+        exact.extend_from_slice(&[7u8; 32]);
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(&exact),
+            Some(ProtocolMessage::EphemeralKey {
+                public_key: vec![7u8; 32]
+            })
+        );
+
+        // A legacy FILE_META sanitises its name exactly as the binary arm does,
+        // and a non-numeric size is refused rather than defaulted.
+        match ProtocolMessage::from_plain_bytes(b"FILE_META|0|../../evil|100") {
+            Some(ProtocolMessage::FileMeta { filename, size, .. }) => {
+                assert_eq!(filename, crate::util::sanitize_filename("../../evil"));
+                assert_eq!(size, 100);
+            }
+            other => panic!("legacy FILE_META should parse and sanitise, got {other:?}"),
+        }
+        assert!(ProtocolMessage::from_plain_bytes(b"FILE_META|0|name|not_a_number").is_none());
+        // The declared size is capped at MAX_FILE_SIZE, inclusive.
+        let meta = |size: u64| format!("FILE_META|0|name|{size}").into_bytes();
+        assert!(ProtocolMessage::from_plain_bytes(&meta(crate::MAX_FILE_SIZE)).is_some());
+        assert!(
+            ProtocolMessage::from_plain_bytes(&meta(crate::MAX_FILE_SIZE + 1)).is_none(),
+            "a legacy offer over MAX_FILE_SIZE was accepted"
+        );
     }
 
     /// `total_chunks` must be non-zero and capped (it sizes the reassembly buffer, so
@@ -724,6 +837,152 @@ mod tests {
         assert!(decode(&text_chunk(0, crate::MAX_TEXT_CHUNKS + 1, x())).is_none());
         assert!(decode(&text_chunk(0, u32::MAX, x())).is_none());
         assert!(decode(&text_chunk(0, crate::MAX_TEXT_CHUNKS, x())).is_some());
+    }
+
+    /// Frames are logged (`?msg` at debug), and the log goes into clipboard
+    /// copies and diagnostics bundles. The hand-written `Debug` is what keeps
+    /// message text and key material out of it: text is redacted and key
+    /// bytes are reported by length only. Every variant is formatted, so a new
+    /// one cannot fall back to a derived `Debug` unnoticed.
+    #[test]
+    fn debug_output_never_carries_message_text_or_key_bytes() {
+        let secret = "the launch code is 0000";
+        let key = vec![0xAB; 32];
+        let frames = [
+            ProtocolMessage::Version { version: 5 },
+            ProtocolMessage::EphemeralKey {
+                public_key: key.clone(),
+            },
+            ProtocolMessage::SupportedSignatureSchemes {
+                schemes: vec![1, 2],
+            },
+            ProtocolMessage::Text {
+                text: secret.into(),
+                timestamp: 1,
+                seq: 2,
+            },
+            ProtocolMessage::TextChunk {
+                message_id: Uuid::nil(),
+                chunk_index: 0,
+                total_chunks: 2,
+                text_part: secret.into(),
+                timestamp: 1,
+                seq: 3,
+            },
+            ProtocolMessage::FileMeta {
+                filename: "plan.pdf".into(),
+                size: 9,
+                seq: 4,
+            },
+            ProtocolMessage::FileChunk {
+                chunk: secret.as_bytes().to_vec(),
+                seq: 5,
+            },
+            ProtocolMessage::FileEnd { seq: 6 },
+            ProtocolMessage::FileCancel { seq: 7 },
+            ProtocolMessage::Ping { seq: 8 },
+            ProtocolMessage::TypingStart { seq: 9 },
+            ProtocolMessage::TypingStop { seq: 10 },
+            ProtocolMessage::Rekey {
+                nonce: key.clone(),
+                seq: 11,
+            },
+            ProtocolMessage::Ack {
+                acked_seq: 3,
+                seq: 12,
+            },
+        ];
+        let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        for frame in &frames {
+            let shown = format!("{frame:?}");
+            assert!(!shown.contains(secret), "{shown}");
+            assert!(!shown.contains("171, 171"), "key bytes in {shown}");
+            assert!(
+                !shown.to_lowercase().contains(&key_hex),
+                "key hex in {shown}"
+            );
+        }
+        let shown = |i: usize| format!("{:?}", frames[i]);
+        assert!(shown(3).contains("REDACTED") && shown(4).contains("REDACTED"));
+        assert!(shown(1).contains("public_key_len: 32"), "{}", shown(1));
+        assert!(shown(12).contains("nonce_len: 32"), "{}", shown(12));
+        assert!(shown(6).contains("chunk_len: 23"), "{}", shown(6));
+        // What is not secret stays useful for debugging.
+        assert!(shown(5).contains("plan.pdf") && shown(13).contains("acked_seq: 3"));
+    }
+
+    /// The legacy ASCII `FILE_CHUNK:<seq>:<bytes>` arm: the bytes are taken
+    /// verbatim (binary, so never text-decoded), capped at `FILE_CHUNK_SIZE`
+    /// like the binary arm, and a frame with no separator or a bad sequence is
+    /// refused rather than defaulted.
+    #[test]
+    fn legacy_file_chunks_parse_and_are_capped() {
+        let mut frame = b"FILE_CHUNK:12:".to_vec();
+        frame.extend_from_slice(&[0xFF, 0x00, b':', 0x80]);
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(&frame),
+            Some(ProtocolMessage::FileChunk {
+                chunk: vec![0xFF, 0x00, b':', 0x80],
+                seq: 12
+            })
+        );
+        let mut full = b"FILE_CHUNK:1:".to_vec();
+        full.extend(std::iter::repeat_n(7u8, crate::FILE_CHUNK_SIZE));
+        assert!(ProtocolMessage::from_plain_bytes(&full).is_some());
+        full.push(7);
+        assert!(
+            ProtocolMessage::from_plain_bytes(&full).is_none(),
+            "an oversized chunk was accepted"
+        );
+        for bad in [
+            &b"FILE_CHUNK:12"[..],
+            b"FILE_CHUNK:x:abc",
+            b"FILE_CHUNK:-1:abc",
+            b"FILE_CHUNK::abc",
+        ] {
+            assert!(
+                ProtocolMessage::from_plain_bytes(bad).is_none(),
+                "{:?} parsed",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// The advertised signature-scheme list is capped at 8 entries (two exist):
+    /// a list of exactly 8 decodes, 9 is refused rather than passed on to the
+    /// negotiation.
+    #[test]
+    fn the_signature_scheme_list_is_capped_at_eight() {
+        let schemes = |n: usize| ProtocolMessage::SupportedSignatureSchemes {
+            schemes: vec![1; n],
+        };
+        assert_eq!(decode(&schemes(8)), Some(schemes(8)));
+        assert_eq!(
+            decode(&schemes(9)),
+            None,
+            "a 9-entry scheme list was accepted"
+        );
+    }
+
+    /// A legacy numeric field is bounded at the longest decimal `u64` (20 bytes)
+    /// before it is parsed: `u64::MAX` itself still decodes, but anything longer
+    /// is refused — including padding that `trim` would otherwise have parsed
+    /// down to a number, so the decoder accepts nothing its encoder cannot make.
+    #[test]
+    fn legacy_number_fields_are_capped_at_the_longest_u64() {
+        let max = format!("PING:{}", u64::MAX);
+        assert_eq!(max.len() - "PING:".len(), 20);
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(max.as_bytes()),
+            Some(ProtocolMessage::Ping { seq: u64::MAX })
+        );
+        let padded = format!("PING:{}7", " ".repeat(20));
+        assert!(
+            ProtocolMessage::from_plain_bytes(padded.as_bytes()).is_none(),
+            "a 21-byte padded number was accepted"
+        );
+        let padded = format!("FILE_END:{}9", " ".repeat(40));
+        assert!(ProtocolMessage::from_plain_bytes(padded.as_bytes()).is_none());
     }
 
     #[test]

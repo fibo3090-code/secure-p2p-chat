@@ -146,7 +146,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         ":connect-relay <relay[:port]> <token>",
         "Connect to a peer through a relay",
     ),
-    ("disconnect", ":disconnect", "Disconnect / remove the selected chat"),
+    ("disconnect", ":disconnect", "Close the selected chat's connection (the chat and its history are kept)"),
     ("stop-host", ":stop-host", "Stop listening (tear down the host)"),
     (
         "connection-password",
@@ -264,7 +264,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Show the community's activity log (admins only)",
     ),
     ("rename", ":rename <title>", "Rename the selected chat"),
-    ("delete", ":delete", "Delete the selected chat"),
+    ("delete", ":delete", "Delete the selected chat and its history (asks first)"),
     ("clear-history", ":clear-history", "Erase all chats and contacts"),
     (
         "history-reset",
@@ -334,6 +334,9 @@ struct Args<'a> {
     words: std::str::SplitWhitespace<'a>,
     /// Everything after the command word, spaces preserved (trimmed).
     rest: &'a str,
+    /// Set once a free-text argument has taken the rest of the line, after
+    /// which leftover words are that text, not extra arguments.
+    took_rest: std::cell::Cell<bool>,
 }
 
 impl<'a> Args<'a> {
@@ -359,12 +362,29 @@ impl<'a> Args<'a> {
 
     /// The whole remainder of the line (it may contain spaces), required.
     fn text(&self) -> Result<String, String> {
+        self.took_rest.set(true);
         non_empty(self.rest, || self.usage())
+    }
+
+    /// Everything after the first `n` words, spaces inside kept — for a
+    /// secret, which may be a passphrase. Taking one word cut
+    /// `correct horse battery staple` down to `correct` (TUI-11).
+    fn rest_after(&self, n: usize) -> Option<String> {
+        self.took_rest.set(true);
+        let mut rest = self.rest;
+        for _ in 0..n {
+            rest = rest.trim_start();
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            rest = &rest[end..];
+        }
+        let rest = rest.trim();
+        (!rest.is_empty()).then(|| rest.to_string())
     }
 
     /// The required remainder after `first` (already taken with
     /// [`Self::word`]), for `<target> <free text>` commands.
     fn text_after(&self, first: &str) -> Result<String, String> {
+        self.took_rest.set(true);
         non_empty(self.rest[first.len()..].trim(), || self.usage())
     }
 }
@@ -375,6 +395,22 @@ fn non_empty(s: &str, usage: impl FnOnce() -> String) -> Result<String, String> 
     } else {
         Ok(s.to_string())
     }
+}
+
+/// What of `raw` may go into the command history: the line itself, or — for
+/// a command that carries a secret — the line without it. Recalling a typed
+/// password with ↑, or reading it off the screen later, was TUI-11.
+pub fn history_entry(raw: &str) -> String {
+    let line = raw.trim().trim_start_matches(':').trim();
+    let mut words = line.split_whitespace();
+    let cmd = words.next().unwrap_or_default();
+    let keep = match cmd {
+        "unlock" | "set-password" | "change-password" | "connection-password" => 0,
+        "party-connect" => 2,
+        _ => return raw.to_string(),
+    };
+    let kept: Vec<&str> = std::iter::once(cmd).chain(words.take(keep)).collect();
+    format!(":{}", kept.join(" "))
 }
 
 /// Parse a raw command-line string (with or without the leading `:`).
@@ -391,9 +427,10 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         cmd,
         words,
         rest: input[cmd.len()..].trim(),
+        took_rest: std::cell::Cell::new(false),
     };
 
-    Ok(match cmd {
+    let parsed = match cmd {
         "host" => C::Host(
             a.next()
                 .map(|p| {
@@ -418,7 +455,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         },
         "disconnect" => C::Disconnect,
         "stop-host" => C::StopHost,
-        "connection-password" => C::ConnectionPassword(a.opt_string()),
+        "connection-password" => C::ConnectionPassword(a.rest_after(0)),
         "lock" => C::Lock(parse_bool(a.word()?)?),
 
         "contacts" => C::Contacts,
@@ -451,7 +488,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "party-connect" => C::PartyConnect {
             address: a.word()?.to_string(),
             username: a.word()?.to_string(),
-            password: a.opt_string(),
+            password: a.rest_after(2),
         },
         "party-trust" => C::PartyTrust,
         "party-post" => C::PartyPost(a.text()?),
@@ -480,7 +517,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "party-channel-access" => C::PartyChannelAccess {
             channel: a.word()?.trim_start_matches('#').to_string(),
             kind: a.word()?.to_ascii_lowercase(),
-            members: a.words.map(str::to_string).collect(),
+            members: a.words.by_ref().map(str::to_string).collect(),
         },
 
         "rename" => C::Rename(a.text()?),
@@ -497,8 +534,8 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
             "reject" | "n" | "deny" => C::Verify(false),
             other => return Err(format!("Expected accept or reject, got '{}'", other)),
         },
-        "unlock" => C::Unlock(a.opt_string()),
-        "set-password" => C::SetPassword(a.word()?.to_string()),
+        "unlock" => C::Unlock(a.rest_after(0)),
+        "set-password" => C::SetPassword(a.rest_after(0).ok_or_else(|| a.usage())?),
         "change-password" => C::ChangePassword {
             current: a.word()?.to_string(),
             new: a.word()?.to_string(),
@@ -519,7 +556,15 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "quit" | "q" => C::Quit,
         "quit!" | "q!" => C::ForceQuit,
         _ => return Err(format!("Unknown command: {}. Try :help", cmd)),
-    })
+    };
+    // A word nothing consumed is a mistake to report, never to drop: with the
+    // port written after a space, `:connect 10.0.0.5 9000` dialled 12345.
+    if !a.took_rest.get() {
+        if let Some(extra) = a.next() {
+            return Err(format!("Unexpected '{extra}'. {}", a.usage()));
+        }
+    }
+    Ok(parsed)
 }
 
 /// Valid keys for `:set`, exposed for validation and help.
@@ -527,11 +572,11 @@ pub fn settings_keys() -> &'static [&'static str] {
     &[
         "download-dir",
         "notifications",
+        "notification-content",
         "typing",
-        "mdns",
         "auto-accept",
-        "theme",
         "auto-host",
+        "upnp",
         "listen-port",
     ]
 }
@@ -540,6 +585,33 @@ pub use parse_bool as parse_setting_bool;
 
 #[cfg(test)]
 mod tests {
+    /// DOC-09: the user guide's command reference had fallen 15 commands
+    /// behind `COMMANDS` (and described `:disconnect` as deleting the chat).
+    /// Every command the TUI accepts is documented, and nothing documented is
+    /// missing from the TUI.
+    #[test]
+    fn the_user_guide_documents_every_command() {
+        let guide = include_str!("../../../docs/USER_GUIDE.md");
+        let documented: std::collections::BTreeSet<&str> = guide
+            .lines()
+            .filter_map(|l| l.strip_prefix("  :"))
+            .filter_map(|l| l.split([' ', '!']).next())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let known: std::collections::BTreeSet<&str> =
+            super::COMMANDS.iter().map(|(name, _, _)| *name).collect();
+        let undocumented: Vec<_> = known.difference(&documented).collect();
+        let unknown: Vec<_> = documented.difference(&known).collect();
+        assert!(
+            undocumented.is_empty(),
+            "missing from docs/USER_GUIDE.md: {undocumented:?}"
+        );
+        assert!(
+            unknown.is_empty(),
+            "documented but not a command: {unknown:?}"
+        );
+    }
+
     use super::*;
     use TuiCommand as C;
 
@@ -549,6 +621,70 @@ mod tests {
 
     fn err(raw: &str) -> bool {
         parse_command(raw).is_err()
+    }
+
+    /// TUI-11: a secret is the rest of the line (a passphrase has spaces), and
+    /// the command history keeps the line without it.
+    #[test]
+    fn a_password_is_the_rest_of_the_line_and_never_reaches_history() {
+        assert_eq!(
+            parse_command(":set-password correct horse battery staple").unwrap(),
+            TuiCommand::SetPassword("correct horse battery staple".into())
+        );
+        assert_eq!(
+            parse_command(":unlock  two words ").unwrap(),
+            TuiCommand::Unlock(Some("two words".into()))
+        );
+        assert_eq!(
+            parse_command(":party-connect host:1 ada pass with spaces").unwrap(),
+            TuiCommand::PartyConnect {
+                address: "host:1".into(),
+                username: "ada".into(),
+                password: Some("pass with spaces".into())
+            }
+        );
+        assert_eq!(parse_command(":unlock").unwrap(), TuiCommand::Unlock(None));
+        assert!(parse_command(":set-password").is_err());
+
+        for (typed, kept) in [
+            (":unlock hunter2 hunter2", ":unlock"),
+            (":set-password correct horse", ":set-password"),
+            (":change-password old new", ":change-password"),
+            (":connection-password s3cret", ":connection-password"),
+            (
+                ":party-connect host:1 ada s3cret",
+                ":party-connect host:1 ada",
+            ),
+            (":connect 10.0.0.1:9000", ":connect 10.0.0.1:9000"),
+        ] {
+            assert_eq!(history_entry(typed), kept, "{typed}");
+        }
+    }
+
+    /// A word the parser does not use must be an error, not dropped. With the
+    /// port written after a space, `:connect 10.0.0.5 9000` dialled the
+    /// default port 12345 and said nothing.
+    #[test]
+    fn a_word_left_over_is_an_error_not_ignored() {
+        for line in [
+            ":connect 10.0.0.5 9000",
+            ":host 9000 extra",
+            ":connect-relay relay.example:1 token extra",
+            ":stop-host now",
+            ":quit please",
+        ] {
+            let err = parse_command(line).expect_err(line);
+            assert!(err.contains("Usage"), "{line}: {err}");
+        }
+        // Free-text arguments still take the rest of the line.
+        assert!(parse_command(":set name Ada Lovelace").is_ok());
+        assert_eq!(
+            parse_command(":connect 10.0.0.5:9000").unwrap(),
+            TuiCommand::Connect {
+                host: "10.0.0.5".into(),
+                port: 9000
+            }
+        );
     }
 
     #[test]
@@ -746,6 +882,86 @@ mod tests {
             let err = parse_command(raw).unwrap_err();
             let (_, usage, _) = command_help(raw.split_whitespace().next().unwrap()).unwrap();
             assert_eq!(err, format!("Usage: {usage}"), "for {raw}");
+        }
+    }
+
+    #[test]
+    fn parses_explicit_ports_help_and_channel_aliases() {
+        assert_eq!(parse_command(":help").unwrap(), TuiCommand::Help(None));
+        assert_eq!(
+            parse_command(":connect 127.0.0.1:9001").unwrap(),
+            TuiCommand::Connect {
+                host: "127.0.0.1".into(),
+                port: 9001,
+            }
+        );
+        for alias in [":party-create-channel ops", ":party-channel ops"] {
+            assert_eq!(
+                parse_command(alias).unwrap(),
+                TuiCommand::PartyCreateChannel("ops".into()),
+                "{alias}"
+            );
+        }
+    }
+
+    /// A connect command is only ever built from something a socket can dial.
+    #[test]
+    fn a_connect_to_an_undialable_address_is_refused() {
+        for line in [
+            ":connect :abc",
+            ":connect host:0",
+            ":connect host:99999",
+            ":connect []:80",
+            ":connect http://example.com:80",
+        ] {
+            assert!(
+                !matches!(parse_command(line), Ok(TuiCommand::Connect { .. })),
+                "{line:?} produced a connect command"
+            );
+        }
+    }
+
+    /// Whatever is typed at the prompt, the parser answers with a command or
+    /// an error — never a panic.
+    #[test]
+    fn edge_inputs_are_answered_not_crashed_on() {
+        for line in [
+            "",
+            "::",
+            ": ",
+            ":connect :",
+            ":connect [",
+            ":host 99999",
+            ":host -1",
+            ":host abc",
+            ":set notifications maybe",
+            &format!(":rename {}", "😀".repeat(10_000)),
+            &":".repeat(10_000),
+            "\u{0}\u{1}\u{7f}",
+        ] {
+            let _ = parse_command(line);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1000))]
+
+        #[test]
+        fn any_typed_line_parses_or_errors(line in ".{0,200}") {
+            let _ = parse_command(&line);
+            let _ = parse_command(&format!(":{line}"));
+        }
+
+        /// Random text rarely spells a command, so walk the real command words
+        /// with arbitrary arguments rather than hoping to hit them.
+        #[test]
+        fn every_command_word_survives_any_arguments(
+            idx in 0usize..64,
+            args in "[ -~\u{00A0}-\u{FFFF}]{0,80}",
+        ) {
+            let words: Vec<&str> = COMMANDS.iter().map(|c| c.0).collect();
+            let word = words[idx % words.len()];
+            let _ = parse_command(&format!(":{word} {args}"));
         }
     }
 }

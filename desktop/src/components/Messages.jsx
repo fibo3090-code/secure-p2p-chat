@@ -14,7 +14,12 @@ const isImageName = (name) => IMAGE_RE.test(name || "");
 // Render message text with http(s) URLs clickable. Opening goes through the
 // bridge's open_url (scheme re-checked there) so links launch the system
 // browser, never navigate the webview. Trailing punctuation stays text.
-const URL_RE = /(https?:\/\/[^\s<>"']+)/gi;
+//
+// A URL ends at the first Unicode format character (\p{Cf}: bidi overrides and
+// isolates, zero-width characters). The text is the peer's, and an override
+// inside a link made `https://evil.example/\u202Emoc.knab` display as a
+// different address from the one it opened (UI-11).
+const URL_RE = /(https?:\/\/[^\s<>"'\p{Cf}]+)/giu;
 function LinkifiedText({ text }) {
   const parts = String(text ?? "").split(URL_RE);
   if (parts.length === 1) return <>{text}</>;
@@ -643,7 +648,12 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   const openFile = useCallback(async (m) => {
     try {
       const r = await api.openFile(contactId, m.id, false);
-      if (r && r.blocked) setRiskyOpen({ msg: m, kind: r.blocked, filename: r.filename || m.name });
+      // `opened === false`, not `blocked`: a file with no extension is held
+      // back with an empty kind, which is falsy. An answer that does not say
+      // whether it runs gets the stronger warning.
+      if (r && r.opened === false) {
+        setRiskyOpen({ msg: m, kind: r.blocked ?? "", runs: r.runs !== false, filename: r.filename || m.name });
+      }
     } catch (e) { toast(friendlyError(e), "error"); }
   }, [contactId]);
   const confirmRiskyOpen = async () => {
@@ -897,7 +907,33 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         </div>
       </div>}
 
-      {riskyOpen && (
+      {riskyOpen && !riskyOpen.runs && (
+        <Modal open onClose={() => setRiskyOpen(null)} width={440}
+          title="Open this file?" icon="alert">
+          <div className="creator-pane">
+            <p className="creator-lead">
+              <strong>{riskyOpen.filename}</strong>{" "}
+              {riskyOpen.kind
+                ? <>is a <code>.{riskyOpen.kind}</code> file.</>
+                : <>has no extension, so your system will guess what to open it with.</>}{" "}
+              Pictures, PDFs, text, audio and video open straight away; other
+              kinds of file can contain code that runs when they are opened —
+              macros, scripts, installers.
+            </p>
+            <p className="creator-lead">
+              It came from <strong>{contact.name}</strong>. Open it if you were
+              expecting it from them.
+            </p>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <Button icon="x" onClick={() => setRiskyOpen(null)}>Don't open</Button>
+              <Button variant="danger" icon="alert" onClick={confirmRiskyOpen}>
+                Open anyway
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {riskyOpen && riskyOpen.runs && (
         <Modal open onClose={() => setRiskyOpen(null)} width={440}
           title="This file will run as a program" icon="alert">
           <div className="creator-pane">

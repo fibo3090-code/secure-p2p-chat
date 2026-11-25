@@ -25,7 +25,71 @@ struct SpawnFileStream {
     failed: Arc<AtomicBool>,
 }
 
+/// The channel background finalizes report on. Its own type so the manager
+/// can keep deriving `Default`.
+pub(super) struct FinalizeLane {
+    tx: tokio::sync::mpsc::UnboundedSender<Finalized>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Finalized>,
+}
+
+impl Default for FinalizeLane {
+    fn default() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self { tx, rx }
+    }
+}
+
+/// The outcome of a background `finalize`, sent back to the manager.
+pub(super) struct Finalized {
+    transfer_id: Uuid,
+    ack_seq: Option<u64>,
+    result: Result<std::path::PathBuf, String>,
+}
+
+/// Holds a background `finalize` until released, so a test can observe the
+/// window between `FileEnd` and the file landing (PERF-07).
+#[cfg(test)]
+pub(super) static FINALIZE_GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+
 impl ChatManager {
+    /// Remove spools left in the download folder by an earlier run.
+    ///
+    /// A receive spools to `tmp_<uuid>_<name>` *in the download folder*,
+    /// because finalizing is a rename and a rename needs one filesystem. After
+    /// a crash, or an exit with an offer still held, nothing removed them:
+    /// peer-chosen bytes under a peer-chosen extension, where indexers,
+    /// thumbnailers and the user would find them (APP-07). Only names of that
+    /// exact shape are touched, and nothing at all while any receive is live.
+    /// Returns how many were removed.
+    pub fn sweep_orphaned_spools(&mut self) -> usize {
+        if !self.incoming_files.is_empty() {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.config.download_dir) else {
+            return 0;
+        };
+        let is_spool = |name: &str| {
+            name.strip_prefix("tmp_")
+                .and_then(|rest| rest.get(..36).zip(rest.get(36..37)))
+                .is_some_and(|(id, sep)| sep == "_" && Uuid::parse_str(id).is_ok())
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(is_spool)
+                && entry.file_type().is_ok_and(|t| t.is_file())
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "Removed spools left by an earlier run");
+        }
+        removed
+    }
+
     /// Send a file to a chat. Chunks stream from a spawned task, so this returns
     /// once `FileMeta` is queued; cancel with [`Self::cancel_transfer`].
     pub async fn send_file(&mut self, chat_id: Uuid, path: std::path::PathBuf) -> Result<()> {
@@ -53,21 +117,40 @@ impl ChatManager {
         let (filename, file_size) = Self::validate_outgoing_file(&path).await?;
         tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
-        // Placeholder seq (the session loop stamps the wire seq). FileMeta rides
-        // the file lane so it stays ahead of the chunks.
-        let chat = self
-            .chats
-            .get_mut(&chat_id)
-            .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
-        chat.send_seq += 1;
+        // Placeholder seq: the session loop stamps the real monotonic wire
+        // sequence onto every frame it writes. FileMeta rides the bounded `file`
+        // lane so it stays ordered ahead of the chunks the stream task queues.
+        if !self.chats.contains_key(&chat_id) {
+            bail!("Chat not found for sending file");
+        }
+        // `try_send`, never `send().await`: the caller holds the manager lock,
+        // and a lane still full from an earlier send behind a stalled peer
+        // parked the await — freezing every command and the poll loop with it
+        // (APP-02). A full lane is a moment's wait for the user, not a hang.
         file_tx
-            .send(ProtocolMessage::FileMeta {
+            .try_send(ProtocolMessage::FileMeta {
                 filename: filename.clone(),
                 size: file_size,
                 seq: 0,
             })
-            .await
-            .map_err(|_| anyhow!("Session closed before file metadata was queued"))?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => anyhow!(
+                    "The previous file is still being flushed to this peer — try again in a moment."
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow!("Session closed before file metadata was queued")
+                }
+            })?;
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.send_seq += 1;
+        }
+
+        let chat = self
+            .chats
+            .get_mut(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
+
+        // Add to local history.
         let message_id = Uuid::new_v4();
         chat.messages.push(Message::sent(
             message_id,
@@ -314,7 +397,13 @@ impl ChatManager {
             .filter_map(|(id, t)| {
                 (t.chat_id == chat_id
                     && t.direction == TransferDirection::Incoming
-                    && t.status.is_active())
+                    && t.status.is_active()
+                    // A held offer whose last byte arrived is complete on
+                    // disk and waits only for the user; failing it deleted a
+                    // finished download because the sender hung up (APP-05).
+                    && !self.pending_file_end.contains_key(id)
+                    // Every byte is in; only the write to disk is left.
+                    && !self.finalizing.contains(id))
                 .then_some(*id)
             })
             .collect();
@@ -454,7 +543,64 @@ impl ChatManager {
         let Some(incoming) = self.incoming_files.remove(&transfer_id) else {
             return;
         };
-        match incoming.finalize() {
+        // `finalize` is an fsync of up to `MAX_FILE_SIZE` and a rename: run
+        // inline it held the manager lock — every command and the poll loop —
+        // for as long as the disk took (PERF-07). Without a runtime (plain
+        // unit tests) there is nothing to hand it to, so it stays inline.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            let result = incoming.finalize().map_err(|e| e.to_string());
+            self.complete_finalized(Finalized {
+                transfer_id,
+                ack_seq,
+                result,
+            });
+            return;
+        };
+        self.finalizing.insert(transfer_id);
+        let done = self.finalized.tx.clone();
+        runtime.spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(gate) = FINALIZE_GATE.lock().unwrap().take() {
+                let _ = gate.recv();
+            }
+            let result = incoming.finalize().map_err(|e| e.to_string());
+            let _ = done.send(Finalized {
+                transfer_id,
+                ack_seq,
+                result,
+            });
+        });
+    }
+
+    /// Outcomes of background finalizes, applied on the poll that sees them.
+    pub(super) fn drain_finalized(&mut self) {
+        while let Ok(done) = self.finalized.rx.try_recv() {
+            self.complete_finalized(done);
+        }
+    }
+
+    /// Record a finished write: the file joins the conversation, or the
+    /// transfer fails with the reason.
+    fn complete_finalized(&mut self, done: Finalized) {
+        let Finalized {
+            transfer_id,
+            ack_seq,
+            result,
+        } = done;
+        self.finalizing.remove(&transfer_id);
+        // Cancelled while it was being written: honour the cancel, and do not
+        // leave a file behind that nothing in the app points at.
+        let still_wanted = self
+            .active_transfers
+            .get(&transfer_id)
+            .is_some_and(|t| t.status.is_active());
+        if !still_wanted {
+            if let Ok(path) = &result {
+                std::fs::remove_file(path).ok();
+            }
+            return;
+        }
+        match result {
             Ok(final_path) => {
                 if let Some(mut transfer) = self.active_transfers.remove(&transfer_id) {
                     transfer.status = TransferStatus::Completed;

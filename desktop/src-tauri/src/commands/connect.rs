@@ -21,7 +21,7 @@ pub(crate) async fn start_host(
     };
     let enable_mdns = {
         let mut mgr = state.manager.lock().await;
-        mgr.set_connection_password(password.filter(|p| !p.is_empty()));
+        mgr.set_host_password(password.filter(|p| !p.is_empty()));
         mgr.start_host(port, pk)
             .await
             .map(|_chat_id| ())
@@ -62,7 +62,8 @@ pub(crate) async fn connect_peer(
         .private_key()
         .map_err(|e| e.to_string())?;
     let mut mgr = state.manager.lock().await;
-    mgr.set_connection_password(password.filter(|p| !p.is_empty()));
+    // Only the dial password: this must not clear the host's (TAURI-03).
+    mgr.set_dial_password(password.filter(|p| !p.is_empty()));
     mgr.connect_to_host(&host, port, None, pk)
         .await
         .map(|_chat_id| ())

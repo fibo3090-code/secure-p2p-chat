@@ -4,8 +4,16 @@
 use super::*;
 
 impl ChatManager {
+    /// Feed one session event straight in, as the poll would. Lets the TUI's
+    /// own tests drive a held file offer without standing up a peer.
+    #[cfg(test)]
+    pub(crate) fn inject_session_event(&mut self, chat_id: Uuid, event: SessionEvent) {
+        self.handle_session_event(chat_id, event);
+    }
+
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
+        self.drain_finalized();
         self.cleanup_stale_incoming_text_messages();
         self.sync_outgoing_transfer_progress();
         self.poll_upnp_result();
@@ -55,6 +63,20 @@ impl ChatManager {
         peer_name: &str,
         sas: &str,
     ) {
+        self.handle_tofu_verification_from(session_id, fingerprint, peer_name, sas, None);
+    }
+
+    /// [`Self::handle_tofu_verification`] for an incoming connection, which
+    /// also knows where the connection came from (`peer_addr`, the listener's
+    /// label for it).
+    fn handle_tofu_verification_from(
+        &mut self,
+        session_id: Uuid,
+        fingerprint: &str,
+        peer_name: &str,
+        sas: &str,
+        peer_addr: Option<&str>,
+    ) {
         // On the host the fingerprint belongs to the incoming conversation.
         let chat_id = self.chat_for_session(session_id);
 
@@ -101,14 +123,25 @@ impl ChatManager {
             .filter(|known| *known != fingerprint)
             .map(|known| FingerprintWarning::KeyChanged {
                 previous: known.to_string(),
+                repoints: match &invite_mismatch {
+                    Some(FingerprintWarning::InviteMismatch { contact_name, .. }) => {
+                        Some(contact_name.clone())
+                    }
+                    _ => None,
+                },
             });
+        // Listener side: the only binding there is the key itself, so a
+        // contact arriving with another key read as a stranger's first
+        // connection. Its source address is the one other thing known.
+        let address_mismatch =
+            peer_addr.and_then(|addr| self.contact_address_mismatch(addr, fingerprint, chat_id));
         // Checked before every accepting branch on purpose: neither the
         // auto-trust setting nor the key being trusted in some *other*
         // conversation may wave through a key that contradicts what this
         // conversation, or the invite the user imported, says it should be.
-        if let Some(warning) = key_changed.or(invite_mismatch) {
+        if let Some(warning) = key_changed.or(invite_mismatch).or(address_mismatch) {
             let toast = match &warning {
-                FingerprintWarning::KeyChanged { previous } => {
+                FingerprintWarning::KeyChanged { previous, .. } => {
                     tracing::warn!(%chat_id, stored = %previous, new = %fingerprint, "FINGERPRINT MISMATCH");
                     "SECURITY WARNING: Peer fingerprint has changed!".to_string()
                 }
@@ -125,6 +158,22 @@ impl ChatManager {
                     );
                     format!(
                         "SECURITY WARNING: {} answered with a key that is not the one in their invite",
+                        contact_name
+                    )
+                }
+                FingerprintWarning::ContactAddressMismatch {
+                    contact_name,
+                    expected,
+                    ..
+                } => {
+                    tracing::warn!(
+                        %chat_id,
+                        expected = %expected,
+                        new = %fingerprint,
+                        "CONTACT KEY MISMATCH: a connection from a saved contact's address presented another key"
+                    );
+                    format!(
+                        "SECURITY WARNING: a connection from {}'s address presented a key that is not theirs",
                         contact_name
                     )
                 }
@@ -171,6 +220,57 @@ impl ChatManager {
         }
     }
 
+    /// The saved contact an incoming connection's source address belongs to,
+    /// when the key it presents is not that contact's — as a warning.
+    ///
+    /// Deliberately narrow, because an address is a hint, not an identity:
+    /// only a direct or hole-punched connection names a source (a relayed one
+    /// comes from the relay); addresses are compared as IP literals (no DNS);
+    /// exactly one contact may hold the address (several people behind one
+    /// NAT, or test peers on loopback, prove nothing); and a key this app
+    /// already trusts — in a conversation or on a contact — is never flagged,
+    /// so the warning fires once per new key, not on every reconnect.
+    fn contact_address_mismatch(
+        &self,
+        peer_addr: &str,
+        fingerprint: &str,
+        chat_id: Uuid,
+    ) -> Option<FingerprintWarning> {
+        let source = source_ip(peer_addr)?;
+        // Trusted anywhere — this conversation included, which is where a
+        // returning peer is routed — or held by any contact: not a stranger.
+        let this_chat_trusts_it = self
+            .chats
+            .get(&chat_id)
+            .is_some_and(|c| c.peer_fingerprint.as_deref() == Some(fingerprint));
+        if this_chat_trusts_it
+            || self.fingerprint_known_trusted(fingerprint, chat_id)
+            || self
+                .contacts
+                .values()
+                .any(|c| c.fingerprint.as_deref() == Some(fingerprint))
+        {
+            return None;
+        }
+        let mut at_address = self.contacts.values().filter(|c| {
+            c.trust_state != TrustState::Blocked
+                && c.candidate_addresses()
+                    .iter()
+                    .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
+                    .any(|a| canonical_ip(a.ip()) == source)
+        });
+        let contact = at_address.next()?;
+        if at_address.next().is_some() {
+            return None;
+        }
+        let expected = contact.fingerprint.clone()?;
+        Some(FingerprintWarning::ContactAddressMismatch {
+            contact_id: contact.id,
+            contact_name: contact.name.clone(),
+            expected,
+        })
+    }
+
     /// Has this fingerprint been *confirmed* outside `chat_id` — in another
     /// conversation, or on a `Verified`/`Trusted` contact? An imported invite
     /// alone (`Unverified`) must not pre-trust it.
@@ -185,7 +285,7 @@ impl ChatManager {
     }
 
     /// Tell a session task the outcome of its fingerprint check.
-    fn answer_fingerprint_check(&self, session_id: Uuid, accept: bool) {
+    pub(super) fn answer_fingerprint_check(&self, session_id: Uuid, accept: bool) {
         if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
             if let Err(e) = tx.send(accept) {
                 tracing::error!(%session_id, "Failed to answer the fingerprint check: {}", e);
@@ -206,6 +306,7 @@ impl ChatManager {
             SessionEvent::Connected { peer } => {
                 tracing::info!("Session {} connected to {}", chat_id, peer);
                 let hole_punched = is_hole_punched(&peer);
+                let relayed = peer.starts_with("relay:");
                 if hole_punched {
                     self.add_toast(
                         ToastLevel::Success,
@@ -221,8 +322,13 @@ impl ChatManager {
                         chat.title = peer;
                     }
                     chat.is_host_placeholder = false;
+                    // The label says which route won; a dial that fell back
+                    // from a dead direct address to the relay must not still
+                    // read as Direct.
                     if hole_punched {
                         chat.transport = Transport::Direct;
+                    } else if relayed {
+                        chat.transport = Transport::Relay;
                     }
                     // A new session restarts the wire seq; `recv_seq` must too.
                     chat.reset_sequences();
@@ -247,7 +353,13 @@ impl ChatManager {
                     &fingerprint,
                     &peer_addr,
                 );
-                self.handle_tofu_verification(chat_id, &fingerprint, &peer_addr, &sas);
+                self.handle_tofu_verification_from(
+                    chat_id,
+                    &fingerprint,
+                    &peer_addr,
+                    &sas,
+                    Some(&peer_addr),
+                );
             }
 
             SessionEvent::ShowFingerprintVerification {
@@ -316,8 +428,32 @@ impl ChatManager {
                 // host-side session id resolves to the transfer's conversation.
                 self.fail_incoming_transfers(chat_id, "connection lost");
 
+                // Incoming conversations this session opened that were never
+                // verified and hold nothing: a caller that hung up before the
+                // user accepted it. Kept, each throwaway key left a persisted
+                // "Peer ab12…" behind forever (audit NET-05). Resolved before
+                // the mapping goes — it is how they are found.
+                let abandoned: Vec<Uuid> = self
+                    .chat_id_mapping
+                    .iter()
+                    .filter(|(incoming, session)| **session == chat_id && **incoming != chat_id)
+                    .map(|(incoming, _)| *incoming)
+                    .filter(|incoming| {
+                        self.chats.get(incoming).is_some_and(|c| {
+                            c.peer_fingerprint.is_none()
+                                && c.messages.is_empty()
+                                && !c.title_is_custom
+                                && !c.is_host_placeholder
+                        }) && !self.contact_to_chat.values().any(|v| v == incoming)
+                    })
+                    .collect();
+
                 self.teardown_session(chat_id);
                 self.chat_id_mapping.retain(|_, v| *v != chat_id);
+                for incoming in abandoned {
+                    tracing::info!(%incoming, "Dropped an incoming conversation that was never verified");
+                    self.chats.remove(&incoming);
+                }
 
                 // A dead listener's placeholder would make `check_rehost_needed`
                 // think it is still hosting; drop it so auto-rehost rebinds.
@@ -560,9 +696,16 @@ impl ChatManager {
             tracing::warn!(%abandoned, "a new file offer arrived before the previous one finished");
             self.pending_file_end.remove(&abandoned);
             self.discard_spool(abandoned, "superseded");
-            self.set_transfer_status(
+            let filename = self.set_transfer_status(
                 abandoned,
                 TransferStatus::Failed("the sender started another file".to_string()),
+            );
+            // The new offer purges finished transfers from the list at once,
+            // so the failed row is never seen: without this the half-received
+            // file just vanished from the screen.
+            self.add_toast(
+                ToastLevel::Warning,
+                format!("File transfer interrupted (the sender started another file): {filename}"),
             );
         }
         let transfer_id = match self.start_receiving_file(chat_id, filename, size) {
@@ -624,6 +767,12 @@ impl ChatManager {
             }
             Err(e) => {
                 tracing::error!("Failed to write chunk: {}", e);
+                // Tell the sender, or it streams the rest of the file (up to
+                // MAX_FILE_SIZE) into nothing and then reports it sent; and
+                // close the stream, so its remaining chunks go nowhere
+                // (APP-04).
+                self.send_control(chat_id, ProtocolMessage::FileCancel { seq: 0 });
+                self.incoming_streams.remove(&chat_id);
                 self.set_transfer_status(transfer_id, TransferStatus::Failed(e.to_string()));
                 self.discard_spool(transfer_id, "write failed");
                 self.add_toast(ToastLevel::Error, format!("File transfer error: {}", e));
@@ -735,4 +884,22 @@ impl ChatManager {
 /// A `p2p:` peer label means the relay rendezvous hole punched a direct socket.
 fn is_hole_punched(peer: &str) -> bool {
     peer.starts_with("p2p:")
+}
+
+/// The source IP a listener's peer label names: `a.b.c.d:port` for a direct
+/// connection, `p2p:a.b.c.d:port` for a hole-punched one. A relayed
+/// connection (`relay:<server>`) comes from the relay, so it names nobody.
+fn source_ip(peer_label: &str) -> Option<std::net::IpAddr> {
+    let addr = peer_label.strip_prefix("p2p:").unwrap_or(peer_label);
+    let addr: std::net::SocketAddr = addr.parse().ok()?;
+    Some(canonical_ip(addr.ip()))
+}
+
+/// An IPv4-mapped IPv6 address is the IPv4 address it names (a dual-stack
+/// listener reports `::ffff:a.b.c.d` for an IPv4 caller).
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    }
 }

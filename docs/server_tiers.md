@@ -158,13 +158,14 @@ Worth being blunt, because "encrypt everything" sounds free and is not.
 
 **Kept at every tier:** who is a member, who posted in which channel and when,
 message sizes, file sizes, the channel list, role changes, the audit log,
-storage quotas, and the ability to delete a message or a file — deletion is a
-metadata operation and does not need the content.
+storage quotas, and the ability to delete a file or a whole channel — deletion is
+a metadata operation and does not need the content. (Deleting a single message,
+and removing or banning a member, do not exist yet; demoting a member to Guest
+makes them read-only.)
 
 **Lost on a sealed channel:** server-side search, moderation-by-reading, and
-any admin tool that inspects what was actually said. An admin can still remove a
-member, delete a channel, or delete a message they have been *shown*; they
-cannot go looking.
+any admin tool that inspects what was actually said. An admin can still demote a
+member to Guest, delete a channel, or delete a file; they cannot go looking.
 
 **Lost on sealed DMs:** the same, and it is the point.
 

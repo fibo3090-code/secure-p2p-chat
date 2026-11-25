@@ -72,7 +72,7 @@ impl std::fmt::Debug for VerifiedParty {
 }
 
 /// Connection lifecycle status for a joined server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PartyStatus {
     Connecting,
     Joined,
@@ -406,6 +406,8 @@ impl PartyManager {
         // Bounded: callers hold their UI loop or the party lock (TUI-08, APP-10).
         let client = tokio::time::timeout(PARTY_CONNECT_TIMEOUT, async {
             let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+            // Frames are small and latency-bound: no Nagle (audit NET-04).
+            stream.set_nodelay(true).ok();
             PartyClient::connect(stream, privkey, Uuid::new_v4()).await
         })
         .await
@@ -843,6 +845,61 @@ impl PartyManager {
         self.servers.remove(&server_id).is_some()
     }
 
+    /// A joined community with one public channel and no network behind it,
+    /// for shell tests (the TUI's). Returns its id, the channel's id, the
+    /// requests it would send, and a handle that keeps it "connected" while
+    /// held (its connection counts as closed once that is dropped).
+    #[cfg(test)]
+    pub(crate) fn add_joined_server_for_test(
+        &mut self,
+        address: &str,
+    ) -> (
+        Uuid,
+        Uuid,
+        mpsc::UnboundedReceiver<PartyRequest>,
+        Box<dyn std::any::Any>,
+    ) {
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let channel = Uuid::new_v4();
+        let conn = PartyServerConn {
+            address: address.to_string(),
+            username: "me".to_string(),
+            server_name: address.to_string(),
+            server_fingerprint: "FP".to_string(),
+            member_id: Some(Uuid::new_v4()),
+            status: PartyStatus::Joined,
+            channels: vec![messenger_core::party::ChannelInfo {
+                id: channel,
+                name: "general".to_string(),
+                kind: messenger_core::party::ChannelKind::Public,
+                members: Vec::new(),
+            }],
+            members: Vec::new(),
+            messages: HashMap::new(),
+            last_error: None,
+            last_notice: None,
+            files: Vec::new(),
+            quota: None,
+            audit: Vec::new(),
+            history_requested: HashSet::new(),
+            awaiting: VecDeque::new(),
+            outgoing_tx,
+            incoming_rx,
+            pending_downloads: HashMap::new(),
+            chunked_downloads: HashMap::new(),
+        };
+        let id = Uuid::new_v4();
+        self.servers.insert(id, conn);
+        (id, channel, outgoing_rx, Box::new(incoming_tx))
+    }
+
+    /// Test helper: the connection a test set up, to give it members or files.
+    #[cfg(test)]
+    pub(crate) fn server_mut_for_test(&mut self, id: Uuid) -> Option<&mut PartyServerConn> {
+        self.servers.get_mut(&id)
+    }
+
     pub fn server_ids(&self) -> Vec<Uuid> {
         self.servers.keys().copied().collect()
     }
@@ -988,6 +1045,10 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             for th in threads {
                 // Same seq-0 rule as `Message`.
                 let page = items.iter().filter(|e| e.channel == th && e.seq != 0);
+                // Where *this page* ends — not the newest seq in the thread,
+                // which a live broadcast may have pushed far ahead: asking
+                // after that skipped everything in between (APP-08).
+                let page_end = page.clone().map(|e| e.seq).max();
                 let existing = conn.messages.entry(th).or_default();
                 // Merge by seq (pages must not replace each other), keeping
                 // unconfirmed sends; one known-seq set per page keeps it linear
@@ -1004,8 +1065,8 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                     existing.sort_by_key(|e| if e.seq == 0 { u64::MAX } else { e.seq });
                 }
                 if page_was_full {
-                    if let Some(last) = existing.iter().rfind(|e| e.seq > 0) {
-                        let req = history_request(th, dm_peers.get(&th).copied(), last.seq);
+                    if let Some(since_seq) = page_end {
+                        let req = history_request(th, dm_peers.get(&th).copied(), since_seq);
                         let _ = conn.send(req);
                     }
                 }
@@ -1637,6 +1698,33 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Err("unknown file".to_string()));
     }
 
+    /// TUI-08 / APP-10: a server that accepts the connection and then says
+    /// nothing used to hold the caller — the TUI's whole UI loop — for as long
+    /// as the OS cared to wait. The dial gives up after
+    /// `PARTY_CONNECT_TIMEOUT`, with an error that says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_never_answers_is_given_up_on() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (_held, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let key = messenger_core::core::generate_rsa_keypair(messenger_core::RSA_KEY_BITS).unwrap();
+        let started = tokio::time::Instant::now();
+        let err = match PartyManager::dial(&address, &key, None).await {
+            Ok(_) => panic!("a silent server was treated as answering"),
+            Err(e) => e.to_string(),
+        };
+        // Either bound may fire first — the handshake's own or the dial's —
+        // and both are 15 s; what matters is that it ends, and says why.
+        assert!(
+            err.contains("15 seconds") || err.contains("timeout (15s)"),
+            "{err}"
+        );
+        assert!(started.elapsed() <= PARTY_CONNECT_TIMEOUT + std::time::Duration::from_secs(1));
+    }
+
     /// Errors carry no request id; an unrelated one must not fail a download.
     #[test]
     fn an_unrelated_server_error_does_not_fail_a_download() {
@@ -1851,6 +1939,46 @@ mod tests {
             fx.thread(channel).len(),
             MAX_HISTORY_BATCH + 1,
             "a later page must not throw away the earlier one"
+        );
+    }
+
+    /// APP-08: the next page was asked for from the highest seq in the
+    /// *thread*, not the end of the page just received. A message broadcast
+    /// while the first page was on its way (seq 501, say) then made the client
+    /// ask for "everything after 501", and 201..=500 were never fetched —
+    /// silently, on any busy community.
+    #[test]
+    fn a_live_message_arriving_first_does_not_skip_history() {
+        let (mut fx, me) = Fx::joined();
+        let channel = Uuid::new_v4();
+
+        let live = MAX_HISTORY_BATCH as u64 * 2 + 101;
+        fx.tx
+            .send(Incoming::Response(PartyResponse::Message(envelope(
+                channel, me, live, "live",
+            ))))
+            .unwrap();
+        let page: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
+            .map(|seq| envelope(channel, me, seq, &format!("m{seq}")))
+            .collect();
+        fx.tx
+            .send(Incoming::Response(PartyResponse::History(page)))
+            .unwrap();
+        fx.mgr.poll_events();
+
+        let asked: Vec<u64> = std::iter::from_fn(|| fx.out.try_recv().ok())
+            .filter_map(|r| match r {
+                PartyRequest::FetchHistory {
+                    channel: c,
+                    since_seq,
+                } if c == channel => Some(since_seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![MAX_HISTORY_BATCH as u64],
+            "the next page must start where this one ended, not after the live message"
         );
     }
 

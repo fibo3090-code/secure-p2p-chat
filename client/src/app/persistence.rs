@@ -201,7 +201,12 @@ impl ChatManager {
     pub fn load_history_auto(&mut self, encrypted_path: &Path, key: &[u8; 32]) -> Result<bool> {
         let result = self.load_history_auto_inner(encrypted_path, key);
         match &result {
-            Ok(_) => self.history_load_error = None,
+            Ok(_) => {
+                self.history_load_error = None;
+                // The download folder is known now; clear what an earlier
+                // run left in it (APP-07).
+                self.sweep_orphaned_spools();
+            }
             Err(e) => {
                 let reason = format!("{e:#}");
                 tracing::error!(

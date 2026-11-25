@@ -379,6 +379,59 @@ fn presence_can_be_toggled() {
     assert!(state.members()[0].online);
 }
 
+/// QUAL-05: a message whose row could not be written was still appended in
+/// memory and confirmed to the sender — and gone after the next restart, the
+/// server-side twin of "Ok + a toast". Persisting comes first now: a failed
+/// write refuses the post (which `dispatch` answers `ActionFailed`, so the
+/// client takes the row back), leaves nothing in memory, and does not burn a
+/// sequence number.
+#[test]
+fn a_message_the_database_refuses_is_not_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let channel = state.default_channel();
+    let alice = state.join("alice", None, Some("FP-A".to_string())).unwrap();
+    let bob = state.join("bob", None, Some("FP-B".to_string())).unwrap();
+    // Every insert fails from here on, as on a full disk.
+    state
+        .db
+        .as_ref()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_msg BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+             CREATE TRIGGER refuse_dm BEFORE INSERT ON dm_messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+
+    let err = state
+        .post_message(alice, channel, "lost on restart".to_string())
+        .unwrap_err();
+    assert!(err.contains("could not store"), "{err}");
+    assert!(
+        state.history_since(alice, channel, 0).is_empty(),
+        "kept in memory anyway"
+    );
+    assert!(state.post_dm(alice, bob, "lost too".to_string()).is_err());
+    assert!(state
+        .dm_history(messenger_core::party::dm_thread_id(alice, bob), 0)
+        .is_empty());
+
+    // The disk recovers: the next post is stored, numbered as the first.
+    state
+        .db
+        .as_ref()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_msg; DROP TRIGGER refuse_dm;")
+        .unwrap();
+    let posted = state
+        .post_message(alice, channel, "kept".to_string())
+        .unwrap();
+    assert_eq!(posted.seq, 1, "the refused post used up a sequence number");
+    drop(state);
+    let reloaded = PartyState::load("Srv", None, dir.path()).unwrap();
+    assert_eq!(reloaded.history_since(alice, channel, 0).len(), 1);
+}
+
 #[test]
 fn durable_state_persists_and_reloads() {
     let dir = tempfile::tempdir().unwrap();
@@ -1040,6 +1093,9 @@ fn a_guest_cannot_write_anywhere() {
     assert!(state
         .create_channel_of_kind(bob, "mine", ChannelKind::Public, vec![])
         .is_err());
+    // SRV-08: nor a DM — demotion is the only moderation there is, and a Guest
+    // who could still DM everyone was not stopped by it.
+    assert!(state.post_dm(bob, owner, "hi".to_string()).is_err());
     // Reading is still allowed.
     state.post_message(owner, chan, "welcome".into()).unwrap();
     assert_eq!(state.history_since(bob, chan, 0).len(), 1);
@@ -1427,6 +1483,48 @@ fn an_upload_that_exceeds_its_declared_size_is_dropped() {
 
 /// Everything checkable is checked before a byte moves — otherwise the
 /// server spools a hundred megabytes and only then says no.
+/// SRV-07: each chunked upload was checked against the member's allowance on
+/// its own, while its bytes sit in RAM until it finishes — four 100 MiB
+/// uploads each passed a 128 MiB allowance, and nothing bounded the total
+/// across members. What a member already has in flight counts against them,
+/// and the server bounds what all uploads together may hold.
+#[test]
+fn uploads_in_flight_count_against_the_allowance_and_a_server_budget() {
+    let mut state = PartyState::new("Srv", None);
+    let _owner = join_owner(&mut state, "owner");
+    let bob = state.join("bob", None, None).unwrap();
+    let carol = state.join("carol", None, None).unwrap();
+    let channel = state.default_channel();
+    let octet = || "application/octet-stream".to_string();
+    let start = |state: &mut PartyState, who, size| {
+        state.start_upload(
+            who,
+            "f".into(),
+            octet(),
+            size,
+            UploadTarget::Channel(channel),
+        )
+    };
+
+    state.set_max_member_blob_bytes(150);
+    start(&mut state, bob, 100).expect("the first fits");
+    let err = start(&mut state, bob, 100).unwrap_err();
+    assert!(
+        err.contains("allowance"),
+        "a second 100 passed a 150 allowance: {err}"
+    );
+
+    // Across members: the in-flight budget.
+    state.set_max_member_blob_bytes(MAX_MEMBER_BLOB_BYTES);
+    state.set_max_upload_spool_bytes(250);
+    start(&mut state, carol, 100).expect("still room");
+    let err = start(&mut state, carol, 100).unwrap_err();
+    assert!(
+        err.contains("busy"),
+        "past the server's in-flight budget: {err}"
+    );
+}
+
 #[test]
 fn uploads_are_refused_up_front_on_size_quota_and_permission() {
     let mut state = PartyState::new("Srv", None);
@@ -2752,4 +2850,214 @@ fn retention_prunes_in_memory_history_too() {
     let report = s.prune_expired(messenger_core::util::current_timestamp_millis() + 120_000);
     assert_eq!(report.messages, 1);
     assert_eq!(s.history_since(alice, channel, 0).len(), 1);
+}
+
+/// SRV-11: the data directory holds every message and DM in plaintext. It is
+/// owner-only after a load — including one an older version created open.
+#[cfg(unix)]
+#[test]
+fn the_data_directory_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("party-data");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _state = PartyState::load("Srv", None, &dir).unwrap();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "data directory left {mode:o}");
+}
+
+/// #213 review: every load ran `set_permissions(data_dir, 0o700)?`, so a
+/// data directory the server may write but does not own (a root-owned Docker
+/// volume reached through group permissions) answered EPERM and the upgraded
+/// server would not start. It is a warning now. `/proc/self` stands in for
+/// such a directory: `chmod` on it fails even for root.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_data_directory_that_cannot_be_restricted_is_a_warning_not_a_refusal() {
+    assert!(!restrict_data_dir(std::path::Path::new("/proc/self")));
+    let dir = tempfile::tempdir().unwrap();
+    assert!(restrict_data_dir(dir.path()));
+}
+
+/// Review of #213: with QUAL-05 a file message the database refuses is
+/// refused — but the upload had already published the blob and recorded its
+/// reference, and the commit's transaction commits even when it returns Err.
+/// With a full disk the sender was told "try again", the retry was refused as
+/// "that file is already shared there", and the bytes were never collected,
+/// charging the member's quota for a file nobody holds. A refused file
+/// message now leaves no reference and no bytes behind — in memory and in
+/// the database — and the retry succeeds. Same for a share.
+#[test]
+fn a_file_message_the_database_refuses_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let general = state.default_channel();
+    let alice = state.join("alice", None, Some("FP-A".to_string())).unwrap();
+    let bob = state.join("bob", None, Some("FP-B".to_string())).unwrap();
+    state.set_write_rate_limit(None);
+    let refuse = |state: &PartyState| {
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_msg BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+                 CREATE TRIGGER refuse_dm BEFORE INSERT ON dm_messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+    };
+    let recover = |state: &PartyState| {
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_msg; DROP TRIGGER refuse_dm;")
+            .unwrap();
+    };
+    let file_ref_rows = |state: &PartyState| -> i64 {
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM file_refs", [], |r| r.get(0))
+            .unwrap()
+    };
+    let data = b"minutes of the meeting".to_vec();
+
+    refuse(&state);
+    for dm in [false, true] {
+        let err = if dm {
+            state.post_file_dm(
+                alice,
+                bob,
+                "m.txt".into(),
+                "text/plain".into(),
+                data.clone(),
+            )
+        } else {
+            state.post_file(
+                alice,
+                general,
+                "m.txt".into(),
+                "text/plain".into(),
+                data.clone(),
+            )
+        }
+        .unwrap_err();
+        assert!(err.contains("could not store"), "{err}");
+        assert_eq!(
+            state.quota_for(alice).used,
+            0,
+            "the refused file is still charged"
+        );
+        assert_eq!(state.quota_for(alice).server_used, 0);
+        assert!(
+            state.files_for(alice).is_empty(),
+            "a reference was left behind"
+        );
+        assert_eq!(
+            file_ref_rows(&state),
+            0,
+            "a reference row was left in the database"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("blobs"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
+            "the refused file's bytes are still on disk"
+        );
+    }
+
+    // The disk recovers: the retry is stored, once.
+    recover(&state);
+    let posted = state
+        .post_file(
+            alice,
+            general,
+            "m.txt".into(),
+            "text/plain".into(),
+            data.clone(),
+        )
+        .expect("the retry was refused");
+    let hash = match posted.payload {
+        MessagePayload::File(meta) => meta.hash,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(state.files_for(alice).len(), 1);
+
+    // A share into the DM thread, refused, then retried.
+    refuse(&state);
+    let target = UploadTarget::Dm(bob);
+    assert!(state.share_file(alice, &hash, general, target).is_err());
+    assert_eq!(
+        state.files_for(alice).len(),
+        1,
+        "the refused share left a reference"
+    );
+    assert_eq!(file_ref_rows(&state), 1);
+    recover(&state);
+    state
+        .share_file(alice, &hash, general, target)
+        .expect("the retried share was refused as already shared");
+    assert_eq!(state.files_for(alice).len(), 2);
+
+    // Deleting both shares reclaims the bytes: the count was right.
+    let thread = messenger_core::party::dm_thread_id(alice, bob);
+    for location in [general, thread] {
+        state.delete_file(alice, &hash, location).unwrap();
+    }
+    assert_eq!(
+        state.quota_for(alice).server_used,
+        0,
+        "the refcount drifted"
+    );
+}
+
+/// #213 review (open question 3): the in-flight budget counts *declared*
+/// sizes and nothing expired an upload that went quiet, so members who each
+/// offered a large upload and sent nothing blocked chunked uploads for
+/// everyone, for ever. An upload that receives nothing for
+/// `upload_idle_timeout` is dropped when the next one is offered; one that
+/// keeps sending is kept; the quiet sender is told it is gone.
+#[test]
+fn an_upload_that_goes_quiet_stops_holding_the_budget() {
+    let mut state = PartyState::new("Srv", None);
+    let _owner = join_owner(&mut state, "owner");
+    let quiet = state.join("quiet", None, None).unwrap();
+    let busy = state.join("busy", None, None).unwrap();
+    let late = state.join("late", None, None).unwrap();
+    let channel = state.default_channel();
+    let start = |state: &mut PartyState, who, size| {
+        state.start_upload(
+            who,
+            "f".into(),
+            "application/octet-stream".into(),
+            size,
+            UploadTarget::Channel(channel),
+        )
+    };
+    state.set_max_upload_spool_bytes(200);
+    state.set_upload_idle_timeout(std::time::Duration::from_millis(200));
+    let silent = start(&mut state, quiet, 100).unwrap();
+    let active = start(&mut state, busy, 100).unwrap();
+    assert!(
+        start(&mut state, late, 100).unwrap_err().contains("busy"),
+        "the budget was not full to begin with"
+    );
+
+    // The active upload keeps sending; the silent one sends nothing.
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        state.upload_chunk(busy, active, b"x").unwrap();
+    }
+    start(&mut state, late, 100).expect("a quiet upload still held the budget");
+    state
+        .upload_chunk(busy, active, b"y")
+        .expect("an upload that kept sending was dropped");
+    assert_eq!(
+        state.upload_chunk(quiet, silent, b"z").unwrap_err(),
+        "no such upload"
+    );
 }

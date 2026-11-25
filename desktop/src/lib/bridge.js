@@ -48,26 +48,52 @@ export function isOpenableUrl(url) {
   return /^https?:\/\//i.test(String(url ?? "").trim());
 }
 
-/// Extensions the OS would *run* rather than display. Mirrors
-/// `RISKY_EXTENSIONS` in `commands/chats.rs`; kept in sync deliberately, because
-/// the mock's job is to make the confirmation dialog reachable in a browser.
-const RISKY_EXTENSIONS = new Set([
-  // Windows executables, installers and script hosts
+/// Extensions the OS would *run* rather than display, and received content
+/// that opens without asking. Mirror `RISKY_EXTENSIONS` / `INERT_EXTENSIONS`
+/// in `commands/chats.rs` exactly — `bridge.test.js` compares them — because
+/// the mock's job is to make the confirmation dialogs reachable in a browser.
+export const RISKY_EXTENSIONS = new Set([
   "exe", "com", "scr", "pif", "bat", "cmd", "msi", "msp", "msc", "cpl", "hta",
   "vbs", "vbe", "jse", "wsf", "wsh", "ps1", "psm1", "reg", "lnk", "url", "scf",
-  "inf", "chm", "application", "gadget",
-  // Cross-platform runtimes / scripts
-  "jar", "js", "py", "pl", "rb", "php",
-  // Unix shells and launchers
+  "inf", "chm", "application", "gadget", "jar", "js", "py", "pl", "rb", "php",
   "sh", "bash", "zsh", "command", "desktop", "run", "appimage", "app", "pkg",
-  "deb", "rpm",
+  "deb", "rpm", "appref-ms", "settingcontent-ms", "library-ms", "search-ms",
+  "diagcab", "appinstaller", "msix", "msixbundle", "appx", "appxbundle", "xll",
+  "wsc", "sct", "vb", "ws", "ps1xml", "psc1", "jnlp", "website", "mde", "cab",
+  "iso", "img", "vhd", "vhdx", "dmg", "docm", "dotm", "xlsm", "xltm", "xlam",
+  "pptm", "potm", "ppam", "sldm", "html", "htm", "xhtml", "xht", "shtml", "mht",
+  "mhtml", "svg", "svgz",
+  "terminal", "tool", "scpt", "applescript", "workflow", "webloc", "inetloc",
+  "fileloc", "mpkg",
 ]);
+
+export const INERT_EXTENSIONS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif",
+  "avif", "pdf", "txt", "md", "log", "mp3", "wav", "ogg", "oga", "flac",
+  "m4a", "aac", "opus", "mp4", "m4v", "mov", "mkv", "webm", "avi",
+]);
+
+const lastExtension = (filename) => {
+  const name = String(filename ?? "");
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+};
 
 /// The extension that makes `filename` an executable, or null for ordinary
 /// content. Only the *final* extension counts, so `holiday.jpg.exe` is caught.
 export function executionRisk(filename) {
-  const ext = String(filename ?? "").split(".").pop()?.toLowerCase();
+  const ext = lastExtension(filename);
   return ext && RISKY_EXTENSIONS.has(ext) ? ext : null;
+}
+
+/// Whether opening a received `filename` needs the user's say-so, as the
+/// bridge decides it: null for known-inert content, otherwise the extension
+/// (empty when there is none) and whether the OS would run it.
+export function openGate(filename) {
+  const ext = lastExtension(filename);
+  if (RISKY_EXTENSIONS.has(ext)) return { kind: ext, runs: true };
+  if (INERT_EXTENSIONS.has(ext)) return null;
+  return { kind: ext, runs: false };
 }
 
 // ── Error text shown to people ──────────────────────────────────────────────
@@ -208,7 +234,7 @@ function makeMock() {
   const now = new Date().toISOString();
   let authState = new URLSearchParams(location.search).get("mock") || "ready";
   const mockSettings = {
-    download_dir: "~/Downloads", enable_notifications: true,
+    download_dir: "~/Downloads", enable_notifications: true, notification_content: "sender_only",
     enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345, enable_upnp: false,
     auto_accept_files: false, auto_connect: false, enable_mdns: false,
   };
@@ -368,12 +394,12 @@ function makeMock() {
     openFile: async (id, msg, reveal = false, confirm = false) => {
       const m = (chats[id]?.messages || []).find((x) => x.id === msg);
       const filename = m?.content?.filename || null;
-      const risk = m && !m.from_me ? executionRisk(filename) : null;
+      const gate = m && !m.from_me ? openGate(filename) : null;
       // Revealing in the file manager launches nothing, so it is never gated.
-      if (risk && !reveal && !confirm) {
-        return { opened: false, blocked: risk, filename };
+      if (gate && !reveal && !confirm) {
+        return { opened: false, blocked: gate.kind, runs: gate.runs, filename };
       }
-      return { opened: true, blocked: null, filename };
+      return { opened: true, blocked: null, runs: false, filename };
     },
     filePreview: async () => null,
     // The real bridge refuses anything that is not http(s) — `javascript:` and

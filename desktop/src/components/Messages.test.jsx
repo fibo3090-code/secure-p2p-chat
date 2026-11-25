@@ -236,7 +236,7 @@ describe("ChatPane file cards", () => {
   it("turns a blocked open into a question, and only runs it after confirmation", async () => {
     const openFile = vi.fn(async (_id, _msg, _reveal, confirm) =>
       confirm ? { opened: true, blocked: null, filename: "holiday.jpg.exe" }
-              : { opened: false, blocked: "exe", filename: "holiday.jpg.exe" });
+              : { opened: false, blocked: "exe", runs: true, filename: "holiday.jpg.exe" });
     installApi({ openFile });
 
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg()] })} />);
@@ -250,8 +250,37 @@ describe("ChatPane file cards", () => {
     expect(openFile).toHaveBeenLastCalledWith("chat-1", "f1", false, true);
   });
 
+  // TAURI-06: a type not known to be inert asks too, but honestly — a .docx
+  // is not a program, and telling people it is teaches them to click past
+  // the warning that matters.
+  it("asks before opening a type it cannot vouch for, without calling it a program", async () => {
+    const openFile = vi.fn(async (_id, _msg, _reveal, confirm) =>
+      confirm ? { opened: true, blocked: null, runs: false, filename: "report.docx" }
+              : { opened: false, blocked: "docx", runs: false, filename: "report.docx" });
+    installApi({ openFile });
+
+    render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg({ name: "report.docx" })] })} />);
+    await userEvent.click(screen.getByTitle("Open file"));
+    const dialog = await screen.findByRole("dialog", { name: /Open this file/i });
+    expect(dialog.textContent).toMatch(/\.docx/);
+    expect(screen.queryByRole("dialog", { name: /run as a program/i })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: /Open anyway/ }));
+    expect(openFile).toHaveBeenLastCalledWith("chat-1", "f1", false, true);
+  });
+
+  it("holds back a file with no extension — an empty kind is still a refusal", async () => {
+    const openFile = vi.fn(async () => ({ opened: false, blocked: "", runs: false, filename: "README" }));
+    installApi({ openFile });
+
+    render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg({ name: "README" })] })} />);
+    await userEvent.click(screen.getByTitle("Open file"));
+    const dialog = await screen.findByRole("dialog", { name: /Open this file/i });
+    expect(dialog.textContent).toMatch(/no extension/);
+  });
+
   it("lets the user back out of a blocked open without running anything", async () => {
-    const openFile = vi.fn(async () => ({ opened: false, blocked: "exe", filename: "x.exe" }));
+    const openFile = vi.fn(async () => ({ opened: false, blocked: "exe", runs: true, filename: "x.exe" }));
     installApi({ openFile });
 
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg()] })} />);
@@ -349,5 +378,85 @@ describe("ChatPane image previews", () => {
     pending[0]("data:image/png;base64,STALE");
     await new Promise((r) => setTimeout(r, 0));
     expect(screen.queryByAltText("cat.png")).toBeNull();
+  });
+});
+
+// UI-11: message text is the peer's. A right-to-left override inside a URL
+// made `https://evil.example/‮moc.knab` *display* as a bank's address while
+// the link opened the attacker's. A URL now ends at the first format character
+// (bidi controls, zero-width characters), so what the link says is all of what
+// it opens, and nothing invisible is inside it.
+describe("ChatPane links", () => {
+  const base = { draft: "", setDraft: () => {}, onSend: () => {}, transfers: [], onStart: () => {} };
+  const textMsg = (text) => ({ id: "m", ts: Date.now(), from: "them", text, t: "12:00" });
+
+  it("opens a plain link through the bridge, punctuation left outside it", async () => {
+    const openUrl = vi.fn(async () => {});
+    installApi({ openUrl });
+    render(<ChatPane {...base} contact={contactFixture({ messages: [textMsg("see https://example.com/a.")] })} />);
+    const link = screen.getByRole("link");
+    expect(link.textContent).toBe("https://example.com/a");
+    await userEvent.click(link);
+    expect(openUrl).toHaveBeenCalledWith("https://example.com/a");
+  });
+
+  for (const [what, ch] of [["RLO", "‮"], ["RLI", "⁧"], ["zero-width space", "​"]]) {
+    it(`cuts a link at a ${what} so the text shown is the address opened`, async () => {
+      const openUrl = vi.fn(async () => {});
+      installApi({ openUrl });
+      render(<ChatPane {...base} contact={contactFixture({
+        messages: [textMsg(`https://evil.example/${ch}moc.knab`)],
+      })} />);
+      const link = screen.getByRole("link");
+      expect(link.textContent).toBe("https://evil.example/");
+      expect(link.getAttribute("href")).toBe("https://evil.example/");
+      await userEvent.click(link);
+      expect(openUrl).toHaveBeenCalledWith("https://evil.example/");
+    });
+  }
+});
+
+// A listener's thread is where the user goes to find what to give the other
+// person. "Waiting for someone to connect" with no address on it was a dead
+// end; the card shows the addresses the backend reports, copies exactly what
+// it shows, and says plainly when new peers are being refused.
+describe("ChatPane while listening", () => {
+  const base = { draft: "", setDraft: () => {}, onSend: () => {}, transfers: [], onStart: () => {} };
+  const hosting = () => contactFixture({ state: "hosting", placeholder: true, trust: "unverified", messages: [] });
+
+  it("shows where it can be reached, and copies what it shows", async () => {
+    let answer;
+    installApi({
+      myAddresses: () => new Promise((r) => { answer = r; }),
+      myInviteLink: "chat-p2p://invite/v2/abc",
+    });
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const onDelete = vi.fn();
+    render(<ChatPane {...base} contact={hosting()} onDelete={onDelete} />);
+
+    expect(await screen.findByText("Waiting for someone to connect")).toBeTruthy();
+    expect(screen.getByText("Looking up your address…")).toBeTruthy();
+    answer({ local: "192.168.1.20:12345", external: "203.0.113.5:40000" });
+    expect(await screen.findByText("192.168.1.20:12345")).toBeTruthy();
+    expect(screen.getByText("203.0.113.5:40000")).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: "Copy over the internet address" }));
+    expect(writeText).toHaveBeenLastCalledWith("203.0.113.5:40000");
+    await userEvent.click(screen.getByRole("button", { name: /Copy invite link/ }));
+    expect(writeText).toHaveBeenLastCalledWith("chat-p2p://invite/v2/abc");
+
+    await userEvent.click(screen.getByRole("button", { name: /Stop listening/ }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("says it is refusing new peers while the door is closed", async () => {
+    installApi({ myAddresses: { local: "192.168.1.20:12345", external: null }, myInviteLink: "" });
+    render(<ChatPane {...base} contact={hosting()} gateClosed />);
+    expect(await screen.findByText("Paused — not accepting new peers")).toBeTruthy();
+    // Only the address that exists is offered, and no empty invite button.
+    expect(await screen.findByText("192.168.1.20:12345")).toBeTruthy();
+    expect(screen.queryByText("Over the internet")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Copy invite link/ })).toBeNull();
   });
 });

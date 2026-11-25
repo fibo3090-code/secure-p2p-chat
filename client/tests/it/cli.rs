@@ -1,0 +1,126 @@
+//! The terminal client binary's non-interactive modes, on the real binary.
+//! (The TUI itself needs a terminal; its behaviour is covered through
+//! `TuiApp` in the unit tests and `tui.rs` here.)
+
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+fn client() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_p2pem-classic"));
+    cmd.env("RUST_LOG", "info");
+    cmd
+}
+
+/// Stop a long-running binary the way an operator does: SIGTERM on Unix, asserting
+/// it shuts down cleanly (a killed process also never writes its coverage
+/// profile, which is why `main.rs` used to read as untested). Windows has no
+/// SIGTERM to send a console child, so there it is killed.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let sent = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "could not signal the child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for the child") {
+                assert!(
+                    status.success(),
+                    "SIGTERM did not shut it down cleanly: {status}"
+                );
+                return;
+            }
+            assert!(Instant::now() < deadline, "SIGTERM did not stop it");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// The retired `--gui` flag fails with directions to the desktop app rather
+/// than silently starting a different interface than the one asked for.
+#[test]
+fn the_retired_gui_flag_points_to_the_desktop_app() {
+    let out = client()
+        .arg("--gui")
+        .output()
+        .expect("run the client binary");
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("`--gui` has been retired"), "{text}");
+    assert!(text.contains("releases/latest"), "{text}");
+}
+
+/// `--relay-server --port N` serves a real rendezvous: asked for a token
+/// nobody hosts, it answers "unknown" — which only a live relay can.
+#[tokio::test]
+async fn relay_server_mode_serves_a_rendezvous() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    // A token on the command line (meaningless to a relay, but it is what a
+    // user mistypes) must not be echoed into the log.
+    let secret = "relay-token-that-must-not-be-logged";
+    let mut child = client()
+        .args([
+            "--relay-server",
+            "--port",
+            &port.to_string(),
+            "--relay-token",
+            secret,
+        ])
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the relay");
+    let relay = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answer = loop {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_out, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_file, file_rx) = tokio::sync::mpsc::channel(1);
+        let (_confirm, confirm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = messenger_core::network::run_client_session_via_relay(
+            &relay,
+            &messenger_core::network::generate_relay_token(),
+            crate::common::rsa_key(),
+            tx,
+            out_rx,
+            file_rx,
+            confirm_rx,
+            uuid::Uuid::new_v4(),
+            None,
+        )
+        .await;
+        let err = result
+            .expect_err("an unhosted token must not pair")
+            .to_string();
+        if !err.to_lowercase().contains("connection refused") || Instant::now() > deadline {
+            break err;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    stop(&mut child);
+    let output = child.wait_with_output().expect("relay output");
+    assert!(
+        answer.to_lowercase().contains("unknown relay token"),
+        "not a relay answering: {answer}"
+    );
+    // TUI-24: a daemon that logs nowhere cannot be operated. The relay writes
+    // to stderr (the TUI cannot — it owns the screen).
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains(&format!("Relay server listening on port {port}")),
+        "the relay logged nothing useful: {log:?}"
+    );
+    assert!(!log.contains(secret), "the relay token was logged: {log}");
+}

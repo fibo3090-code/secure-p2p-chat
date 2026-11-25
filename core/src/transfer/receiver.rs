@@ -124,6 +124,8 @@ impl IncomingFile {
         let final_path =
             tokio::task::spawn_blocking(move || reserve_unique_path(&dir, &name)).await??;
         tokio::fs::rename(&self.tmp_path, &final_path).await?;
+        crate::util::mark_as_downloaded(&final_path);
+
         tracing::info!("File saved to: {:?}", final_path);
         Ok(final_path)
     }
@@ -221,7 +223,17 @@ impl IncomingFileSync {
     }
 
     /// Flush, verify the size and rename the spool onto a reserved free name.
-    pub fn finalize(mut self) -> Result<PathBuf> {
+    /// Whatever goes wrong, the spool does not stay behind: a short `FileEnd`
+    /// used to leave the partial file in the download folder, invisible to
+    /// the app and outside every cap (APP-03).
+    pub fn finalize(self) -> Result<PathBuf> {
+        let spool = self.tmp_path.clone();
+        self.finish().inspect_err(|_| {
+            std::fs::remove_file(&spool).ok();
+        })
+    }
+
+    fn finish(mut self) -> Result<PathBuf> {
         self.file.flush()?;
         self.file.sync_all()?;
         drop(self.file);
@@ -238,7 +250,13 @@ impl IncomingFileSync {
         // `filename` was sanitised in `new` and `dest_dir` is the caller's, so
         // this join cannot leave the download folder.
         let final_path = reserve_unique_path(&self.dest_dir, &self.filename)?;
-        std::fs::rename(&self.tmp_path, &final_path)?;
+        // Give the reserved name back if the rename fails, or an empty
+        // placeholder is left where the file was meant to be.
+        if let Err(e) = std::fs::rename(&self.tmp_path, &final_path) {
+            std::fs::remove_file(&final_path).ok();
+            return Err(e.into());
+        }
+        crate::util::mark_as_downloaded(&final_path);
         tracing::info!("File saved to: {:?}", final_path);
 
         Ok(final_path)
@@ -256,6 +274,50 @@ impl IncomingFileSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TAURI-06: a received file carries the Internet zone, so SmartScreen
+    /// and Office Protected View apply when it is opened — the in-app
+    /// confirmation is one click, and the OS's own checks are the second line.
+    #[cfg(windows)]
+    #[test]
+    fn a_received_file_is_marked_as_coming_from_the_internet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut incoming = IncomingFileSync::new(dir.path(), "setup.exe", 3).unwrap();
+        incoming.write_chunk(b"MZ!").unwrap();
+        let path = incoming.finalize().unwrap();
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        let zone = std::fs::read_to_string(&stream).expect("no Zone.Identifier stream");
+        assert!(zone.contains("ZoneId=3"), "{zone}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"MZ!",
+            "the tag touched the content"
+        );
+    }
+
+    /// APP-03: a peer that declares N bytes and ends after fewer made finalize
+    /// fail — and leave the partial spool in the download folder, invisible to
+    /// the app and outside every cap once the transfer row was gone. Any
+    /// failure to finalize removes what the transfer put on disk.
+    #[test]
+    fn a_failed_finalize_leaves_nothing_in_the_download_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut incoming = IncomingFileSync::new(dir.path(), "short.bin", 10).unwrap();
+        incoming.write_chunk(b"12345").unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "the spool"
+        );
+        assert!(incoming.finalize().is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
     use tempfile::TempDir;
 
     #[tokio::test]

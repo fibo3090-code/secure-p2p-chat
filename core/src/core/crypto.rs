@@ -64,6 +64,24 @@ const PUBLIC_KEY_END: &str = "-----END PUBLIC KEY-----";
 /// which can carry a second block that a marker scan would read instead; every
 /// peer-supplied key passes through here, so a preamble or trailing text is refused.
 pub fn pem_decode_public(pem: &str) -> Result<RsaPublicKey> {
+    let key = parse_public_block(pem)?;
+    // A floor, not only the crate's ceiling (CRYPTO-14): a contact's 1024-bit
+    // key is one anyone who factors it can later impersonate. Every key this
+    // app generates is `RSA_KEY_BITS`, so nothing genuine is refused.
+    let bits = rsa::traits::PublicKeyParts::size(&key) * 8;
+    if bits < crate::RSA_KEY_BITS {
+        return Err(anyhow!(
+            "RSA key is {bits} bits; identity keys must be at least {} bits",
+            crate::RSA_KEY_BITS
+        ));
+    }
+    Ok(key)
+}
+
+/// The strict single-block parse behind [`pem_decode_public`], without the
+/// strength floor: a fingerprint *describes* a key, it does not accept one as
+/// an identity, and the frozen history-key vector is a 1024-bit key.
+fn parse_public_block(pem: &str) -> Result<RsaPublicKey> {
     let trimmed = pem.trim();
     let single_block = trimmed.starts_with(PUBLIC_KEY_BEGIN)
         && trimmed.ends_with(PUBLIC_KEY_END)
@@ -109,7 +127,7 @@ pub fn fingerprint_public_key(key: &RsaPublicKey) -> Result<String> {
 /// and a malformed PEM is an error rather than a fingerprint of its bytes.
 pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> Result<String> {
     let pem = std::str::from_utf8(pem_bytes).map_err(|e| anyhow!("PEM is not UTF-8: {}", e))?;
-    fingerprint_public_key(&pem_decode_public(pem)?)
+    fingerprint_public_key(&parse_public_block(pem)?)
 }
 
 /// Sign data with RSA-PSS (SHA-256, randomized), returning the raw signature bytes.
@@ -255,9 +273,11 @@ pub fn verify_ed25519(
     data: &[u8],
     signature: &Signature,
 ) -> Result<()> {
-    use ed25519_dalek::Verifier as Ed25519VerifierTrait;
+    // `verify_strict`, not `verify`: the permissive check accepts weak
+    // (small-order) keys and malleable signatures — with the identity point as
+    // the key, one signature verifies every message (CRYPTO-14).
     verifying_key
-        .verify(data, signature)
+        .verify_strict(data, signature)
         .map_err(|e| anyhow!("Ed25519 signature verification failed: {}", e))
 }
 
@@ -334,19 +354,39 @@ pub fn derive_session_key(
     salt: Option<&[u8]>,
     info: &[u8],
 ) -> Result<[u8; AES_KEY_SIZE]> {
+    let shared_secret = contributory_shared_secret(our_secret, their_public)?;
+    Ok(derive_from_shared(shared_secret.as_bytes(), salt, info))
+}
+
+/// The X25519 agreement, refusing a non-contributory exchange (RFC 7748 §6.1).
+/// Shared by [`derive_session_key`] and the session's handshake, which derives
+/// its keys from the shared secret in one testable step.
+pub(crate) fn contributory_shared_secret(
+    our_secret: EphemeralSecret,
+    their_public: &X25519PublicKey,
+) -> Result<x25519_dalek::SharedSecret> {
     let shared_secret = our_secret.diffie_hellman(their_public);
     if !shared_secret.was_contributory() {
         return Err(anyhow!(
             "peer sent a low-order X25519 public key (non-contributory key exchange refused)"
         ));
     }
+    Ok(shared_secret)
+}
 
-    let hkdf = Hkdf::<Sha256>::new(salt, shared_secret.as_bytes());
+/// The HKDF-SHA256 half of [`derive_session_key`], split out so the binding
+/// of the key to its salt (the transcript hash) and info can be tested
+/// against a fixed shared secret — an `EphemeralSecret` cannot be reused.
+pub(crate) fn derive_from_shared(
+    shared: &[u8],
+    salt: Option<&[u8]>,
+    info: &[u8],
+) -> [u8; AES_KEY_SIZE] {
+    let hkdf = Hkdf::<Sha256>::new(salt, shared);
     let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
-
-    Ok(session_key)
+    session_key
 }
 
 /// Derive the next session key from the current one and a random nonce (HKDF-SHA256,
@@ -670,23 +710,34 @@ mod tests {
         assert_eq!(public1.as_bytes().len(), 32);
     }
 
+    /// The session key is bound to the handshake transcript (the salt) and to
+    /// the protocol context (the info): change either and the key changes, so
+    /// a MITM's two handshakes, or a downgrade to another context, cannot meet
+    /// on one key. The known answer pins the derivation itself, which both
+    /// peers compute independently — computed with an independent HKDF-SHA256.
     #[test]
-    fn test_ecdh_different_secrets_give_different_keys() {
-        let (alice, _) = generate_ephemeral_keypair();
-        let (alice2, _) = generate_ephemeral_keypair();
-        let (_, bob_public) = generate_ephemeral_keypair();
-        let key1 = derive_session_key(alice, &bob_public, None, b"context1").unwrap();
-        let key2 = derive_session_key(alice2, &bob_public, None, b"context2").unwrap();
-        assert_ne!(key1, key2);
+    fn the_session_key_is_bound_to_its_transcript_and_context() {
+        let shared = [0x33u8; 32];
+        let key = derive_from_shared(&shared, Some(b"transcript"), b"p2p-messenger-v2");
+        assert_eq!(
+            hex::encode(key),
+            "06a9df96d6be81c3e817eeba6458cb680c50ed66b19c6e3bc9e66a6f847d452b"
+        );
+        assert_ne!(
+            key,
+            derive_from_shared(&shared, Some(b"transcripu"), b"p2p-messenger-v2")
+        );
+        assert_ne!(key, derive_from_shared(&shared, None, b"p2p-messenger-v2"));
+        assert_ne!(
+            key,
+            derive_from_shared(&shared, Some(b"transcript"), b"p2p-messenger-v3")
+        );
     }
 
     #[test]
-    fn test_x25519_public_key_parsing() {
-        let (_, public) = generate_ephemeral_keypair();
-        let parsed = parse_x25519_public(public.as_bytes()).unwrap();
-        assert_eq!(parsed.as_bytes(), public.as_bytes());
-        assert!(parse_x25519_public(&[0u8; 16]).is_err());
-        assert!(parse_x25519_public(&[0u8; 32]).is_err());
+    fn test_x25519_invalid_length() {
+        let invalid = vec![0u8; 16]; // Wrong length
+        assert!(parse_x25519_public(&invalid).is_err());
     }
 
     #[test]
@@ -736,51 +787,48 @@ mod tests {
         assert_eq!(alice_key, bob_key);
         assert_eq!(alice_key.len(), AES_KEY_SIZE);
 
-        let encrypted = AesCipher::new(&alice_key)
-            .unwrap()
-            .encrypt(b"Forward secrecy test message", None);
-        let decrypted = AesCipher::new(&bob_key)
-            .unwrap()
-            .decrypt(&encrypted, None)
-            .unwrap();
-        assert_eq!(decrypted, b"Forward secrecy test message");
+        // 6. Use keys for encryption
+        let alice_cipher = AesCipher::new(&alice_key).unwrap();
+        let bob_cipher = AesCipher::new(&bob_key).unwrap();
+
+        let plaintext = b"Forward secrecy test message";
+        let encrypted = alice_cipher.encrypt(plaintext, None);
+        let decrypted = bob_cipher.decrypt(&encrypted, None).unwrap();
+
+        assert_eq!(plaintext, &decrypted[..]);
     }
 
-    #[test]
-    fn test_rekey_derivation() {
-        let current_key: [u8; AES_KEY_SIZE] = rand::random();
-        let nonce1 = generate_rekey_nonce();
-        let nonce2 = generate_rekey_nonce();
-        assert_ne!(nonce1, nonce2);
+    // ========== Key Rotation (Rekeying) Tests ==========
 
-        let next = rekey_session_key(&current_key, &nonce1);
-        assert_ne!(next, current_key);
-        assert_eq!(next, rekey_session_key(&current_key, &nonce1));
-        assert_ne!(next, rekey_session_key(&current_key, &nonce2));
+    /// The rekey derivation is a wire contract, like the SAS: both peers
+    /// derive the next key independently, so two builds that disagree on the
+    /// salt, the info string or the KDF desynchronise on the hundredth message.
+    /// Random-input tests ("same input, same output") pass for any such change;
+    /// a known answer — computed with an independent HKDF-SHA256 — does not.
+    #[test]
+    fn rekey_derivation_matches_its_known_answer() {
+        let next = rekey_session_key(&[0x11; AES_KEY_SIZE], &[0x22; 16]);
+        assert_eq!(
+            hex::encode(next),
+            "5f1e2782c6a5e7d582b30428aa7cb0e8a6eeae8c6f4c7627024e1dc9943883b7"
+        );
     }
 
-    /// Rekeying yields a working cipher, and the old one still opens its own frames.
+    /// Every input contributes: a different nonce or a different current key
+    /// gives a different next key, and the next key is never the current one.
     #[test]
-    fn test_rekey_encryption_flow() {
-        let current_key: [u8; AES_KEY_SIZE] = rand::random();
-        let cipher1 = AesCipher::new(&current_key).unwrap();
-        let encrypted = cipher1.encrypt(b"Message before rekeying", None);
-        assert_eq!(
-            cipher1.decrypt(&encrypted, None).unwrap(),
-            b"Message before rekeying"
-        );
-
-        let next_key = rekey_session_key(&current_key, &generate_rekey_nonce());
-        let cipher2 = AesCipher::new(&next_key).unwrap();
-        let encrypted2 = cipher2.encrypt(b"Message after rekeying", None);
-        assert_eq!(
-            cipher2.decrypt(&encrypted2, None).unwrap(),
-            b"Message after rekeying"
-        );
-        assert_eq!(
-            cipher1.decrypt(&encrypted, None).unwrap(),
-            b"Message before rekeying"
-        );
+    fn rekey_depends_on_both_the_key_and_the_nonce() {
+        let key: [u8; AES_KEY_SIZE] = rand::random();
+        let nonce = generate_rekey_nonce();
+        assert_ne!(nonce, generate_rekey_nonce(), "rekey nonces must be fresh");
+        let mut other_nonce = nonce;
+        other_nonce[0] ^= 1;
+        let mut other_key = key;
+        other_key[0] ^= 1;
+        let next = rekey_session_key(&key, &nonce);
+        assert_ne!(next, key);
+        assert_ne!(next, rekey_session_key(&key, &other_nonce));
+        assert_ne!(next, rekey_session_key(&other_key, &nonce));
     }
 
     #[test]
@@ -871,6 +919,33 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_identity_key_under_2048_bits_is_refused() {
+        // CRYPTO-14: the rsa crate caps key size from above, not below, so a
+        // contact's 512- or 1024-bit key was taken as an identity — one anyone
+        // who factors it can later impersonate.
+        let weak = generate_rsa_keypair(1024).unwrap();
+        let pem = pem_encode_public(&RsaPublicKey::from(&weak)).unwrap();
+        let err = pem_decode_public(&pem).unwrap_err().to_string();
+        assert!(err.contains("1024") && err.contains("2048"), "{err}");
+        let ok = generate_rsa_keypair(crate::RSA_KEY_BITS).unwrap();
+        assert!(pem_decode_public(&pem_encode_public(&RsaPublicKey::from(&ok)).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn ed25519_verification_rejects_a_small_order_key() {
+        // CRYPTO-14: with the identity point as the public key, R = identity
+        // and s = 0 satisfy the plain verification equation for *any*
+        // message. `verify_strict` refuses weak keys and such signatures.
+        let mut key = [0u8; 32];
+        key[0] = 1;
+        let weak = Ed25519VerifyingKey::from_bytes(&key).unwrap();
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let forged = Signature::from_bytes(&sig);
+        assert!(verify_ed25519(&weak, b"anything at all", &forged).is_err());
+    }
+
+    #[test]
     fn test_ed25519_sign_verify() {
         let (signing_key, verifying_key) = generate_ed25519_keypair();
         let (_, other_key) = generate_ed25519_keypair();
@@ -889,6 +964,19 @@ mod tests {
         let hex_str = ed25519_public_to_hex(&vkey_orig);
         assert_eq!(hex_str.len(), 64);
         assert_eq!(ed25519_public_from_hex(&hex_str).unwrap(), vkey_orig);
+
+        // The private key, against RFC 8032 §7.1 test 1 (an independent known
+        // answer, so an export that returns anything but the key's bytes fails).
+        let secret = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        let public = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let skey = ed25519_private_from_hex(secret).unwrap();
+        assert_eq!(ed25519_private_to_hex(&skey), secret);
+        assert_eq!(ed25519_public_to_hex(&skey.verifying_key()), public);
+        assert!(
+            ed25519_private_from_hex(&secret[..62]).is_err(),
+            "31 bytes accepted"
+        );
+        assert!(ed25519_private_from_hex("zz").is_err());
     }
 
     #[test]

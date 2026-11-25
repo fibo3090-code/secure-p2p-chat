@@ -120,8 +120,8 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 - all cryptography stays in Rust; the React webview only calls `#[tauri::command]`s and never handles key material
 - `tauri.conf.json` sets a restrictive **CSP** (`default-src 'self'`; no external hosts, scripts, or fonts) and disables the global Tauri injection (`withGlobalTauri: false`)
 - the desktop app uses its **own** data directory (`ProjectDirs "P2PEM"`), distinct from the terminal client's, so the two are separate identities rather than sharing one keystore
-- the bridge is covered by an IPC-level integration suite (`desktop/src-tauri/src/tests.rs`, 16 tests) that drives the real command handlers through Tauri's mock runtime. It asserts the **auth barrier** holds — no state-mutating command runs before unlock/set-password — that the password floor is enforced by the core rather than the UI, and that every frontend payload key still binds to its command parameter. CI runs it on Linux and macOS; it is skipped on Windows, where a Rust test-harness executable linking Tauri aborts at startup (`STATUS_ENTRYPOINT_NOT_FOUND`), not because the suite is platform-specific
-- the React layer is covered by unit tests (`npm test`) over its pure logic — password policy, safety-grid rendering, unread accounting, design-token drift. Behaviour that only exists inside a live webview is **not** automatically tested; treat rendering as build-verified rather than test-covered
+- the bridge is covered by an IPC-level integration suite (`desktop/src-tauri/src/tests.rs`) that drives the real command handlers through Tauri's mock runtime. It asserts the **auth barrier** holds — no state-mutating command runs before unlock/set-password — that the password floor is enforced by the core rather than the UI, and that every frontend payload key still binds to its command parameter. CI runs it on Linux and macOS; it is skipped on Windows, where a Rust test-harness executable linking Tauri aborts at startup (`STATUS_ENTRYPOINT_NOT_FOUND`), not because the suite is platform-specific
+- the React layer is tested in three layers: vitest unit tests over its pure logic (password policy, safety grid, unread accounting, design-token and CSP drift), React component tests in jsdom against a bridge stub built from the real `api` object, and Playwright smoke tests that load the dev and the built app in headless Chromium and fail on any CSP violation or console error. What jsdom and a headless browser cannot see — native dialogs, OS notifications, the real Tauri webview — is not automatically tested
 
 ## Current Limits and Open Risks
 
@@ -132,7 +132,8 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   simultaneous open from the reused source port), so most sessions go direct
   and the relay only bridges when punching fails (symmetric NAT, CGNAT,
   filtered networks). The punch hello tag is derived from the rendezvous
-  token and is pairing hygiene only — authentication is still the v3
+  token and the sender's role (so a stranger cannot reflect a peer's hello
+  back to claim the punched socket) and is pairing hygiene only — authentication is still the v3
   handshake + TOFU on whichever socket wins. `P2PEM_NO_HOLEPUNCH=1` forces
   the bridged path. Punching also reveals each peer's public *and* LAN
   endpoint to the other (the relay already saw both source addresses)
@@ -177,9 +178,15 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
     shipped binary. The input is neither peer-controlled nor present at
     runtime. The app's *own* Tauri path resolves `quick-xml` 0.41.0, which is
     already fixed.
-  - **Unmaintained GTK3 bindings** (`gtk`, `gdk`, `atk`, `glib`, … 0.18):
-    Tauri's Linux backend (`muda`, `tao` → `tauri-runtime-wry`) until it moves
-    off GTK3. Not something this project can resolve independently.
+  - **`proc-macro-error` 1.0.4 unmaintained** (RUSTSEC-2024-0370): a proc
+    macro of `glib-macros`, reached through Tauri's Linux GTK3 backend
+    (`muda`/`tao` → `gtk` → `glib`). Build-time only, never linked into the
+    binary. (The GTK3 bindings' own unmaintained advisories were withdrawn
+    upstream in August 2026; this one was not.)
+  - **`paste` 1.0.15 unmaintained** (RUSTSEC-2024-0436): a proc macro, reached
+    via `natpmp → netdev → netlink-packet-utils` (Linux NAT-PMP). Build-time
+    only. (It used to arrive through `image`'s AVIF/EXR codecs too; `image` is
+    now built PNG-only.)
   - **`bincode` 1.3.3 unmaintained** (RUSTSEC-2025-0141): a direct `core`
     dependency used for the relay control protocol. Migration is tracked; the
     frames it decodes are length-bounded by `MAX_PACKET_SIZE` before parsing.

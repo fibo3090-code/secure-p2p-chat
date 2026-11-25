@@ -1,7 +1,10 @@
 //! Community (Party server) commands: bodies of `TuiApp::execute_command`.
 
 use super::*;
+use crate::app::party_manager::PartyStatus;
+use crate::app::saved_parties::{load_saved_parties, upsert_saved_party, SavedParty};
 use messenger_core::party::{ChannelKind, Role};
+use tokio::sync::oneshot::{self, error::TryRecvError};
 
 /// A readable thread in a community: a channel or a DM with one member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,9 +23,55 @@ impl TuiApp {
         let Some(privkey) = self.unlocked_private_key() else {
             return;
         };
-        // No expected fingerprint yet: this stops before the credentials are
-        // sent and returns the server's fingerprint for the user to check.
-        self.start_party_dial(address, username, password, privkey, None);
+        // A community joined before is held to the fingerprint pinned then: a
+        // different key at that address is refused before anything is sent.
+        // The TUI kept no pins, so every join was a first contact, and users
+        // learn to type `:party-trust` without looking (TUI-17).
+        let pinned = match load_saved_parties(&self.parties_path()) {
+            Ok(list) => list
+                .into_iter()
+                .find(|p| p.address.eq_ignore_ascii_case(&address) && !p.fingerprint.is_empty())
+                .map(|p| p.fingerprint),
+            Err(e) => {
+                // The file holds every pin; a damaged one stops the join
+                // rather than quietly downgrading it to a first contact.
+                self.toast(ToastLevel::Error, e);
+                return;
+            }
+        };
+        // Without a pin this stops before the credentials are sent and returns
+        // the server's fingerprint for the user to check; `:party-trust` then
+        // passes back exactly that fingerprint.
+        self.start_party_dial(address, username, password, privkey, pinned);
+    }
+
+    /// `parties.json`, beside the history.
+    pub(super) fn parties_path(&self) -> std::path::PathBuf {
+        self.history_path.with_file_name("parties.json")
+    }
+
+    /// Pin each community's fingerprint once it has really joined — not at
+    /// connect time, or a mistyped address would leave a pin for a community
+    /// nobody joined (the desktop's rule).
+    pub(super) fn pin_joined_parties(&mut self) {
+        let path = self.parties_path();
+        for sid in self.party_manager.server_ids() {
+            let Some(conn) = self.party_manager.server(sid) else {
+                continue;
+            };
+            if conn.status != PartyStatus::Joined || !self.pinned_parties.insert(sid) {
+                continue;
+            }
+            upsert_saved_party(
+                &path,
+                SavedParty {
+                    address: conn.address.clone(),
+                    username: conn.username.clone(),
+                    name: conn.server_name.clone(),
+                    fingerprint: conn.server_fingerprint.clone(),
+                },
+            );
+        }
     }
 
     pub(super) async fn cmd_party_trust(&mut self) {
@@ -343,19 +392,17 @@ impl TuiApp {
             .unwrap_or("file")
             .to_string();
         let mime = crate::util::guess_mime(p).to_string();
-        let data = match std::fs::read(p) {
-            Ok(data) => data,
-            Err(e) => {
-                self.toast(ToastLevel::Error, format!("Could not read {path}: {e}"));
-                return;
+        match read_party_upload(p) {
+            Ok(data) => {
+                match self
+                    .party_manager
+                    .send_file(server_id, channel, name.clone(), mime, data)
+                {
+                    Ok(()) => self.toast(ToastLevel::Info, format!("Sharing '{name}'…")),
+                    Err(e) => self.toast(ToastLevel::Error, format!("Share failed: {e}")),
+                }
             }
-        };
-        match self
-            .party_manager
-            .send_file(server_id, channel, name.clone(), mime, data)
-        {
-            Ok(()) => self.toast(ToastLevel::Info, format!("Sharing '{name}'…")),
-            Err(e) => self.toast(ToastLevel::Error, format!("Share failed: {e}")),
+            Err(e) => self.toast(ToastLevel::Error, format!("Could not share {path}: {e}")),
         }
     }
 
@@ -557,5 +604,50 @@ impl TuiApp {
             }
             None => self.toast(ToastLevel::Error, format!("No channel called '#{channel}'")),
         }
+    }
+}
+
+/// Read a file to share in a community, refusing one over the server's limit
+/// **before** reading it (TUI-13). `send_file` refuses it too, but only once
+/// the whole file is in memory: naming a 10 GB file meant a 10 GB allocation
+/// and a frozen terminal, for an answer that was known from its size.
+fn read_party_upload(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use messenger_core::party::MAX_PARTY_FILE_BYTES;
+    use messenger_core::util::format_size;
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".to_string());
+    }
+    if meta.len() > MAX_PARTY_FILE_BYTES {
+        return Err(format!(
+            "it is {}, and a community accepts files up to {}",
+            format_size(meta.len()),
+            format_size(MAX_PARTY_FILE_BYTES)
+        ));
+    }
+    std::fs::read(path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::read_party_upload;
+    use messenger_core::party::MAX_PARTY_FILE_BYTES;
+
+    #[test]
+    fn an_oversized_file_is_refused_from_its_size_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.iso");
+        // Sparse: the size is real, the bytes never touch the disk.
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_PARTY_FILE_BYTES + 1)
+            .unwrap();
+        let err = read_party_upload(&big).unwrap_err();
+        assert!(err.contains("accepts files up to"), "{err}");
+
+        let ok = dir.path().join("ok.txt");
+        std::fs::write(&ok, b"hello").unwrap();
+        assert_eq!(read_party_upload(&ok).unwrap(), b"hello");
+        assert_eq!(read_party_upload(dir.path()).unwrap_err(), "not a file");
     }
 }

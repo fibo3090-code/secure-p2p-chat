@@ -66,7 +66,9 @@ Oversized packets are rejected.
 
 ### Protocol generation
 
-Current peers announce version **4** and accept `>= 3`. v4 adds the
+Current peers announce version **5** and accept `>= 3`. v5 changes only the
+connection-password gate (below): the client proves the password instead of
+sending it. v4 adds the
 ephemeral-key commitment (step 2 below); with a v3 peer on either side it is
 skipped, the handshake otherwise proceeds as before, and both apps warn that
 the safety code is a weak check for that peer and the fingerprint should be
@@ -124,14 +126,27 @@ the established, transcript-bound tunnel *after* identity verification and *befo
 the peer is surfaced for fingerprint confirmation:
 
 - The host sends an encrypted one-byte flag indicating whether a password is required.
-- The client replies with the (encrypted) password, or an empty payload when none is
-  required.
-- The host compares the supplied password to the expected one in constant time; a
-  mismatch (or a missing password) aborts the session before any TOFU prompt.
+- A **v5** client replies with a *proof*, never the password:
+  `HKDF-SHA256(salt = "p2pem-v5-connection-password-proof" || transport_aad,
+  ikm = password, info = "client", L = 32)` — an HMAC keyed by the transcript
+  (`session::password_proof`, pinned by a known-answer test). An empty payload
+  when no password is required.
+- The host compares in constant time: against the proof for a v5+ client, against
+  the password itself for an older one. A mismatch (or a missing password) aborts
+  the session before any TOFU prompt.
 
-Both frames are encrypted with the session cipher and bound to the transport AAD, so
-the password is never exposed and is replay-protected by the session's nonces. When
-the host has no password configured, the flag is `0` and the exchange is a no-op.
+The gate runs before the user has compared the safety code, so the peer may be
+posing as the host. Sending the password there — as every client before v5 did —
+handed it to anyone who could impersonate the host (a malicious relay, a spoofed
+invite address, a LAN attacker), who then used it on the real one (audit
+CRYPTO-05). The proof is bound to this handshake's transcript, which a man in the
+middle cannot share with the real host (it runs two handshakes), so it cannot be
+relayed; a fake host can only try guesses offline, which a strong password
+defeats. **Downgrade:** a fake host could simply announce v4 to be sent the
+password, so a v5 client never sends it to a host older than v5 — it sends an
+empty reply and reports that the host must be updated. A v5 host still admits a
+v4 client's plaintext answer: that exposes only the old client. When the host has
+no password configured, the flag is `0` and the exchange is a no-op.
 
 ### Transcript binding
 
@@ -341,9 +356,9 @@ Requests (client → server): `Host { token }` / `Join { token }` (legacy,
 always bridged) and `HostV2 { token, punch }` / `JoinV2 { token, punch }`
 (punch-capable; `punch.local_addrs` lists LAN candidates as `ip:port`,
 already carrying the punch source port). Responses (server → client):
-`Waiting`, `Paired`, `Error(String)`, and `PunchStart { peer_public,
-peer_locals }`. After a `PunchStart`, each client answers with a
-`PunchOutcome { success }` report.
+`Waiting`, `Paired`, `Error(String)`, `PunchStart { peer_public,
+peer_locals }` and `PunchConfirmed` (appended last). After a `PunchStart`,
+each client answers with a `PunchOutcome { success }` report.
 
 Flow:
 
@@ -352,20 +367,37 @@ Flow:
    it is never self-reported.
 2. If **both** registered punch-capable, the server sends each side a
    `PunchStart` with the other's observed public endpoint and LAN candidates,
-   then waits (bounded) for both `PunchOutcome`s.
+   then waits (bounded) for both `PunchOutcome`s. Peer-listed LAN
+   candidates that no other machine could have — loopback, unspecified,
+   link-local, broadcast — are never dialled (audit NET-16). An IPv4-mapped
+   IPv6 candidate (`::ffff:a.b.c.d`) is judged and dialled as the IPv4
+   address it names: a dual-stack socket would reach `::ffff:127.0.0.1` on
+   the host's own loopback.
 3. Each peer re-binds the control connection's local port
    (`SO_REUSEADDR`/`SO_REUSEPORT`; the control connection itself is dialed
    from a reuse-enabled socket), listens on it, and dials every candidate in
    parallel with retries — a TCP simultaneous open. Every established socket
-   is validated by exchanging a 25-byte hello: magic `P2PPNCH1` (8) + role
+   is validated by exchanging a 25-byte hello: magic `P2PPNCH2` (8) + role
    byte (1; host=0, joiner=1; must differ) + tag (16, first 16 bytes of
-   SHA-256 of the token). The host then sends `0xA5` (SELECT) on its chosen
+   `SHA-256("p2pem-punch-v2|" || role byte || "|" || token)`, the **sender's**
+   role). Each side checks the tag for the other role, so a hello echoed back
+   by a stranger who connected first does not validate (v1 sent one tag both
+   ways and could be reflected — audit NET-08). A v1 peer fails on the magic
+   and the pair is bridged. The host then sends `0xA5` (SELECT) on its chosen
    socket and the joiner confirms with `0x5A` (ACK), so both ends provably
    settle on one connection.
-4. Both reports `success: true` → the server drops both control connections;
-   the session runs on the punched socket (peer label `p2p:<addr>`).
-   Anything else → the server sends `Paired` to both and bridges bytes
-   (`copy_bidirectional`; peer label `relay:<server>`).
+4. **The server's verdict decides, not either side's own result.** Both
+   reports `success: true` → the server sends `PunchConfirmed` to both and
+   drops the control connections; the session runs on the punched socket
+   (peer label `p2p:<addr>`). Anything else → `Paired` to both and the bytes
+   are bridged (`copy_bidirectional`; peer label `relay:<server>`). A client
+   whose own punch succeeded therefore waits for the verdict and, on
+   `Paired`, drops its direct socket and takes the bridge: over a slow link
+   one side's selection can time out after the other's completed, and a
+   client that left on its own success stranded the other bridged to a
+   closed connection (audit NET-15). A server from before `PunchConfirmed`
+   closes the control connection after a two-sided success, which a client
+   reads the same way.
 
 The punch hello tag is rendezvous pairing, not authentication: whichever
 socket wins carries the full v3 handshake (ECDH, identity proof, TOFU).

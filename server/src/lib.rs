@@ -2,7 +2,7 @@
 //!
 //! `main.rs` only parses arguments, loads state and identity, binds, and hands
 //! everything to [`run_accept_loop`] — so a test can stand the real server up
-//! in process (`client/tests/party_e2e.rs`).
+//! in process (`client/tests/it/party.rs`).
 
 pub mod connection;
 pub mod dispatch;
@@ -141,7 +141,11 @@ pub async fn run_accept_loop_with(
 
     loop {
         let (mut stream, addr) = match listener.accept().await {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                // Frames are small and latency-bound: no Nagle (audit NET-04).
+                accepted.0.set_nodelay(true).ok();
+                accepted
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "accept failed; continuing to listen");
                 tokio::time::sleep(Duration::from_millis(50)).await;
