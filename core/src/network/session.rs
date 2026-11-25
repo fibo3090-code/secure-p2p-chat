@@ -2530,7 +2530,10 @@ mod tests {
     /// no password, nothing it can replay to the real host.
     #[tokio::test]
     async fn a_host_nobody_has_verified_never_receives_the_password() {
-        let password = "a password worth stealing";
+        // Generated, not written out: a literal password in a test reads as
+        // a hard-coded credential to code scanning. ('static: it moves into
+        // the client task.)
+        let password: &'static str = format!("pw-{}", uuid::Uuid::new_v4()).leak();
         let v = PROTOCOL_VERSION as u32;
         let ((fake, mut fake_stream), (client, mut client_stream)) =
             tunnels_with_streams(v, v).await;
@@ -2572,13 +2575,14 @@ mod tests {
                 &client.cipher,
                 &client.transport_aad,
                 client.peer_version,
-                Some("secret-secret"),
+                Some(format!("pw-{}", uuid::Uuid::new_v4()).as_str()),
             )
             .await
         });
         let got = ask_for_password(&old_host, &mut host_stream).await;
         let err = gate.await.unwrap().unwrap_err().to_string();
-        assert!(got.is_empty(), "something was sent: {got:?}");
+        // The length, never the bytes: a failure must not print a secret.
+        assert!(got.is_empty(), "{} bytes were sent", got.len());
         assert!(err.contains("Update the app on the host"), "{err}");
     }
 
@@ -2587,17 +2591,18 @@ mod tests {
     /// refused.
     #[tokio::test]
     async fn the_host_admits_the_right_password_from_old_and_new_clients_only() {
-        let password = "the right password";
+        let password = format!("pw-{}", uuid::Uuid::new_v4());
+        let password = password.as_str();
         for (client_version, right, wrong) in [
             (
                 PROTOCOL_VERSION as u32,
-                None,                           // the proof, computed below from the transcript
-                b"the right password".to_vec(), // plaintext is not a proof
+                None,                         // the proof, computed below from the transcript
+                password.as_bytes().to_vec(), // plaintext is not a proof
             ),
             (
                 4,
                 Some(password.as_bytes().to_vec()),
-                b"a wrong password".to_vec(),
+                format!("{password}-wrong").into_bytes(),
             ),
         ] {
             for answer_right in [true, false] {

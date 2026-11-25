@@ -2947,17 +2947,22 @@ mod tests {
                 .len(),
             16
         );
-        for secret in [
+        for (i, secret) in [
             "the secret text",
             peer_fp.as_str(),
             app.identity.fingerprint.as_str(),
             "hunter2-connection-secret",
             "PRIVATE KEY",
             private_key.lines().nth(1).unwrap(),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Which one, never the value: a failure must not print a secret.
             assert!(
                 !everything.contains(secret),
-                "the bundle leaked {secret:.24}…"
+                "the bundle leaked secret #{}",
+                i + 1
             );
         }
     }

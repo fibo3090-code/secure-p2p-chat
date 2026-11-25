@@ -1314,8 +1314,9 @@ mod tests {
     fn protecting_an_identity_derives_once_and_stays_unlocked() {
         let mut identity = Identity::new_with_plaintext("Setup".to_string()).unwrap();
         let history_key = identity.history_key().unwrap();
+        let password = test_password();
         derivations::reset();
-        identity.protect("a-long-enough-password").unwrap();
+        identity.protect(&password).unwrap();
         assert_eq!(derivations::count(), 1, "Argon2 ran more than once");
         assert!(identity.is_encrypted());
         assert!(!identity.is_locked(), "setup left the identity locked");
@@ -1331,12 +1332,14 @@ mod tests {
         );
         let mut reopened = Identity::load(&path).unwrap();
         assert!(reopened.is_locked());
-        reopened.decrypt("a-long-enough-password").unwrap();
+        reopened.decrypt(&password).unwrap();
         assert_eq!(reopened.history_key().unwrap(), history_key);
 
         // Same floor as `encrypt`, and a refusal changes nothing.
         let mut fresh = Identity::new_with_plaintext("Short".to_string()).unwrap();
-        assert!(fresh.protect("short").is_err());
+        assert!(fresh
+            .protect(&"s".repeat(crate::MIN_PASSWORD_LEN - 1))
+            .is_err());
         assert!(!fresh.is_encrypted() && !fresh.is_locked());
     }
 

@@ -602,15 +602,21 @@ mod tests {
             )
             .await
         });
-        // Open silent connections while the listener is up.
+        // Open silent connections while the listener is up, and only then:
+        // on Windows a connect to a closed port retries for about two seconds
+        // instead of failing at once, so attempts made after the listener
+        // closed ran this test past the CI time limit. Each connect is
+        // bounded, and so is the loop, by the attempt's own budget.
         let mut silent = Vec::new();
-        for _ in 0..200 {
-            if silent.len() == 40 {
-                break;
-            }
-            match TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(s) => silent.push(s),
-                Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+        while silent.len() < 40 && started.elapsed() < budget {
+            match timeout(
+                Duration::from_millis(100),
+                TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => silent.push(s),
+                _ => tokio::time::sleep(Duration::from_millis(5)).await,
             }
         }
         assert!(!silent.is_empty(), "the punch listener never came up");
