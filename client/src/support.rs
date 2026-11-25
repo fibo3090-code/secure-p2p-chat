@@ -136,19 +136,101 @@ pub fn export_diagnostics_bundle(
         &readme_path,
         b"Diagnostics bundle for support.\n\
           Share diagnostics.json and logs.txt when reporting a bug.\n\
-          Private keys and message text are not included. Relay tokens, IP addresses\n\
-          and long fingerprints in the logs are replaced with <hex> / <ip>, but file\n\
-          names and contact names may remain: read logs.txt before sharing it.\n",
+          Private keys and message text are not included. Relay tokens, long\n\
+          fingerprints, IP addresses (IPv4 and IPv6) and server host names in the\n\
+          logs are replaced with <hex> / <ip> / <host>, but file names and contact\n\
+          names may remain: read logs.txt before sharing it.\n",
     )?;
 
     Ok(bundle_dir)
 }
 
 /// Scrub what must not leave the machine from text meant to be shared: runs of
-/// 32+ hex digits (relay tokens, fingerprints, hashes) become `<hex>` and IPv4
-/// addresses `<ip>`. Best effort by shape — a short fingerprint prefix, which
-/// identifies nothing alone, is kept, and names are not recognised.
+/// 32+ hex digits (relay tokens, fingerprints, hashes) become `<hex>`, IP
+/// addresses — IPv4 and IPv6, bracketed or not, v4-mapped included — `<ip>`,
+/// and a host name that names a server (followed by `:port`, or after a
+/// `relay:` label) `<host>`. Best effort by shape: a short fingerprint prefix,
+/// which identifies nothing alone, is kept, names are not recognised, and a
+/// bare dotted name with no port is kept, because it cannot be told from a
+/// file name (`report.pdf`).
 pub fn redact_for_sharing(text: &str) -> String {
+    redact_hex_and_ipv4(&redact_network_names(text))
+}
+
+/// The address half of [`redact_for_sharing`]: IPv6 (which the word-based pass
+/// cannot see — `:` splits it) and server host names. Tokens are runs between
+/// whitespace and `()[]{},;"'<>=`, so `[2001:db8::5]:12345` yields `2001:db8::5`.
+fn redact_network_names(text: &str) -> String {
+    const DELIMITERS: &[char] = &[
+        '(', ')', '[', ']', '{', '}', ',', ';', '"', '\'', '<', '>', '=',
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        out.push_str(&redact_address_token(token));
+        token.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() || DELIMITERS.contains(&c) {
+            flush(&mut token, &mut out);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+fn redact_address_token(token: &str) -> String {
+    let core = token.trim_end_matches(['.', ':']);
+    let tail = &token[core.len()..];
+    // The labels the apps print before an address: `p2p:` (hole punched) and
+    // `relay:` (bridged through a relay server named by host).
+    let (label, rest) = match core.split_once(':') {
+        Some((l @ ("p2p" | "relay"), rest)) => (Some(l), rest),
+        _ => (None, core),
+    };
+    let redacted = if rest.parse::<std::net::IpAddr>().is_ok() {
+        Some("<ip>".to_string())
+    } else if rest.parse::<std::net::SocketAddr>().is_ok() {
+        rest.rsplit_once(':')
+            .map(|(_, port)| format!("<ip>:{port}"))
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() && is_host_name(host) => {
+                Some(format!("<host>:{port}"))
+            }
+            _ if label == Some("relay") && is_host_name(rest) => Some("<host>".to_string()),
+            _ => None,
+        }
+    };
+    match redacted {
+        Some(r) => format!(
+            "{}{r}{tail}",
+            label.map(|l| format!("{l}:")).unwrap_or_default()
+        ),
+        None => token.to_string(),
+    }
+}
+
+/// A DNS name with at least two labels and an alphabetic top level.
+fn is_host_name(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !l.starts_with('-')
+        })
+        && labels
+            .last()
+            .is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// The word-based half of [`redact_for_sharing`]: long hex runs and IPv4.
+fn redact_hex_and_ipv4(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut word = String::new();
     let flush = |word: &mut String, out: &mut String| {
@@ -318,6 +400,41 @@ mod tests {
         );
         // Short hex (an 8-char fingerprint prefix) is kept: it identifies nothing alone.
         assert_eq!(redact_for_sharing("fp abcd1234"), "fp abcd1234");
+    }
+
+    /// #213 review: only dotted-quad IPv4 was matched, so IPv6 addresses
+    /// ("dialled [2001:db8::5]:12345") and relay host names went out in the
+    /// "scrubbed" bundle untouched.
+    #[test]
+    fn redaction_removes_ipv6_addresses_and_server_names() {
+        for (raw, scrubbed) in [
+            ("dialled [2001:db8::5]:12345 ok", "dialled [<ip>]:12345 ok"),
+            ("peer fd00::1 left", "peer <ip> left"),
+            ("from [::ffff:203.0.113.7]:40000", "from [<ip>]:40000"),
+            ("label p2p:[2001:db8::9]:7", "label p2p:[<ip>]:7"),
+            ("label p2p:198.51.100.2:7", "label p2p:<ip>:7"),
+            (
+                "via relay:relay.example.com:9000.",
+                "via relay:<host>:9000.",
+            ),
+            ("via relay:relay.example.org", "via relay:<host>"),
+            (
+                "connect to chat.example.net:443 failed",
+                "connect to <host>:443 failed",
+            ),
+            ("addr=203.0.113.7:12345", "addr=<ip>:12345"),
+        ] {
+            assert_eq!(redact_for_sharing(raw), scrubbed, "{raw}");
+        }
+        // Not addresses: times, Rust paths, file names, versions.
+        for kept in [
+            "at 2026-11-24T19:56:54.568Z",
+            "p2pem_classic::app::chat_manager::events",
+            "saved report.pdf",
+            "v1.2.3 and 12:34:56",
+        ] {
+            assert_eq!(redact_for_sharing(kept), kept);
+        }
     }
 
     /// What leaves the machine is scrubbed, fields included.
