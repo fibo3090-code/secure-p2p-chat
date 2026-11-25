@@ -2581,8 +2581,12 @@ mod tests {
         });
         let got = ask_for_password(&old_host, &mut host_stream).await;
         let err = gate.await.unwrap().unwrap_err().to_string();
-        // The length, never the bytes: a failure must not print a secret.
-        assert!(got.is_empty(), "{} bytes were sent", got.len());
+        // Says what went wrong without printing anything derived from what was
+        // received: a failure must not put a secret in the log.
+        assert!(
+            got.is_empty(),
+            "the client answered a pre-v5 host's password request"
+        );
         assert!(err.contains("Update the app on the host"), "{err}");
     }
 
