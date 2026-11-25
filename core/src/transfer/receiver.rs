@@ -504,4 +504,50 @@ mod tests {
         assert!(spooled[0].ends_with("_photo.png"), "{:?}", spooled[0]);
         drop(incoming);
     }
+
+    /// A received file keeps its own name when that name is free, and takes the
+    /// next free `_N` (before the extension, if it has one) when it is not.
+    #[test]
+    fn a_name_already_taken_gets_the_next_free_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let receive = |name: &str| {
+            let mut incoming = IncomingFileSync::new(dir.path(), name, 1).unwrap();
+            incoming.write_chunk(b"x").unwrap();
+            incoming.finalize().unwrap()
+        };
+        let names: Vec<String> = ["photo.jpg", "photo.jpg", "photo.jpg", "README", "README"]
+            .iter()
+            .map(|n| {
+                receive(n)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "photo.jpg",
+                "photo_1.jpg",
+                "photo_2.jpg",
+                "README",
+                "README_1"
+            ]
+        );
+    }
+
+    /// Only "already exists" means "try the next number"; any other error is
+    /// reported as itself at once, not after a thousand doomed attempts as
+    /// "no free filename".
+    #[test]
+    fn a_folder_that_cannot_be_written_is_reported_as_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-there");
+        let err = reserve_unique_path(&missing, "a.txt").unwrap_err();
+        assert!(
+            !err.to_string().contains("free filename"),
+            "the real error was replaced: {err}"
+        );
+    }
 }

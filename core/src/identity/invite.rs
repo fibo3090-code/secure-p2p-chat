@@ -344,4 +344,31 @@ mod tests {
         };
         assert!(decode_unsigned(&encode_unsigned(&v1).unwrap()).is_err());
     }
+
+    /// The validity window includes both of its edges, and the public decoder
+    /// judges against the real clock: a link made now is valid, one made at
+    /// the epoch has expired.
+    #[test]
+    fn the_validity_window_includes_its_edges_and_uses_the_real_clock() {
+        let key = generate_rsa_keypair(2048).unwrap();
+        let now = 1_000_000_000;
+        for ts in [
+            now - crate::INVITE_MAX_AGE_SECS,
+            now + crate::INVITE_TIMESTAMP_SKEW_SECS,
+        ] {
+            let link = encode_signed(payload(&key, ts), &key).unwrap();
+            assert!(
+                decode_signed_at(&link, now).is_ok(),
+                "refused at the edge {ts}"
+            );
+        }
+
+        let fresh = encode_signed(payload(&key, now_secs()), &key).unwrap();
+        assert!(decode_signed(&fresh).is_ok());
+        let ancient = encode_signed(payload(&key, 1_000), &key).unwrap();
+        assert!(decode_signed(&ancient)
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+    }
 }

@@ -831,4 +831,26 @@ mod tests {
         assert!(host.is_err());
         assert!(joiner.is_err());
     }
+
+    /// The listener is the other half of a punch: when this side's own dials
+    /// go nowhere, a peer dialling in must still be accepted on the punch
+    /// port. (Over loopback the dialers usually win by simultaneous open,
+    /// which hid a listener that was never bound.)
+    #[tokio::test]
+    async fn a_peer_that_can_only_dial_in_is_accepted_by_the_listener() {
+        let (port_a, port_b, dead) = (free_port(), free_port(), free_port());
+        let budget = Duration::from_secs(5);
+        let host = tokio::spawn(async move {
+            let nowhere = format!("127.0.0.1:{dead}").parse().unwrap();
+            attempt_punch_with_timeout(PunchRole::Host, port_a, &[nowhere], "cafebabe", budget)
+                .await
+        });
+        let joiner = tokio::spawn(async move {
+            let host = format!("127.0.0.1:{port_a}").parse().unwrap();
+            attempt_punch_with_timeout(PunchRole::Joiner, port_b, &[host], "cafebabe", budget).await
+        });
+        let (host, joiner) = (host.await.unwrap(), joiner.await.unwrap());
+        host.expect("the host's listener accepted nothing");
+        joiner.expect("the joiner was not accepted");
+    }
 }

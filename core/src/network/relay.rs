@@ -1150,4 +1150,50 @@ mod tests {
         assert!(matches!(join, RelayStream::Relayed(_)));
         exchange_ping_pong(host, join).await;
     }
+
+    /// A token is exactly `2 × RELAY_TOKEN_BYTES` hex digits; anything else is
+    /// refused before it reaches the pairing table.
+    #[test]
+    fn only_a_full_length_hex_token_is_accepted() {
+        let good = "ab".repeat(RELAY_TOKEN_BYTES);
+        assert!(validate_token(&good).is_ok());
+        assert!(validate_token(&good.to_uppercase()).is_ok());
+        for bad in [
+            String::new(),
+            good[1..].to_string(),
+            format!("{good}a"),
+            format!("{}zz", &good[2..]),
+            format!("{}--", &good[2..]),
+        ] {
+            assert!(validate_token(&bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// Candidates the relay forwards are bounded in length and in number.
+    #[test]
+    fn forwarded_candidates_are_bounded() {
+        let at_limit = "1".repeat(MAX_CANDIDATE_CHARS);
+        let caps = sanitize_caps(PunchCaps {
+            local_addrs: std::iter::once("2".repeat(MAX_CANDIDATE_CHARS + 1))
+                .chain(std::iter::repeat_n(at_limit.clone(), 20))
+                .collect(),
+        });
+        assert_eq!(
+            caps.local_addrs,
+            vec![at_limit; crate::network::punch::MAX_PUNCH_CANDIDATES]
+        );
+    }
+
+    /// Bridged sockets carry TCP keepalive, so a peer that vanished without a
+    /// FIN does not hold its half of the bridge for ever.
+    #[tokio::test]
+    async fn bridged_sockets_have_keepalive_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(!socket2::SockRef::from(&stream).keepalive().unwrap());
+        enable_keepalive(&stream, "test");
+        assert!(socket2::SockRef::from(&stream).keepalive().unwrap());
+    }
 }

@@ -707,6 +707,73 @@ mod tests {
         assert_eq!(format_host_port("::1", 12345), "[::1]:12345");
         assert_eq!(format_host_port("127.0.0.1", 12345), "127.0.0.1:12345");
     }
+
+    #[test]
+    fn the_small_helpers_do_what_they_say() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ts = current_timestamp_millis();
+        assert!(ts >= before && ts < before + 60_000, "{ts} vs {before}");
+
+        let (a, b) = (random_bytes(32), random_bytes(32));
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b, "two random draws were equal");
+
+        assert_eq!(to_hex(&[0x00, 0xab, 0xff]), "00abff");
+
+        assert_eq!(format_fingerprint_short(&"a".repeat(16)), "a".repeat(16));
+        assert_eq!(
+            format_fingerprint_short("0123456789abcdefX"),
+            "01234567...9abcdefX"
+        );
+
+        if let Some(ip) = primary_local_ipv4() {
+            assert!(ip.parse::<std::net::Ipv4Addr>().is_ok(), "{ip:?}");
+        }
+    }
+
+    /// Sizes stay in the largest unit there is, however large.
+    #[test]
+    fn format_size_tops_out_at_gigabytes() {
+        assert_eq!(format_size(1023), "1023.00 B");
+        assert_eq!(format_size(1024), "1.00 KB");
+        assert_eq!(format_size(5 * 1024 * 1024 * 1024 * 1024), "5120.00 GB");
+    }
+
+    #[test]
+    fn guess_mime_knows_the_common_types() {
+        use std::path::Path;
+        for (name, mime) in [
+            ("a.png", "image/png"),
+            ("a.JPG", "image/jpeg"),
+            ("a.jpeg", "image/jpeg"),
+            ("a.gif", "image/gif"),
+            ("a.webp", "image/webp"),
+            ("a.svg", "image/svg+xml"),
+            ("a.pdf", "application/pdf"),
+            ("a.txt", "text/plain"),
+            ("a.log", "text/plain"),
+            ("a.md", "text/plain"),
+            ("a.json", "application/json"),
+            ("a.zip", "application/zip"),
+            ("a.mp4", "video/mp4"),
+            ("a.mp3", "audio/mpeg"),
+            ("a.exe", "application/octet-stream"),
+            ("noext", "application/octet-stream"),
+        ] {
+            assert_eq!(guess_mime(Path::new(name)), mime, "{name}");
+        }
+    }
+
+    /// A long name is cut to the whole byte budget, keeping its extension.
+    #[test]
+    fn a_long_name_is_cut_to_the_whole_budget_keeping_its_extension() {
+        let cut = sanitize_filename(&format!("{}.txt", "a".repeat(400)));
+        assert_eq!(cut.len(), MAX_FILENAME_BYTES);
+        assert!(cut.ends_with(".txt") && cut.starts_with("aaa"), "{cut}");
+    }
 }
 
 /// Resolves when the process is asked to stop: Ctrl+C (SIGINT) anywhere, and

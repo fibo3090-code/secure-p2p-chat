@@ -187,6 +187,14 @@ mod tests {
         IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, last])
     }
 
+    /// A different /64 per index — a different limiter entry each. (`ip6`
+    /// varies only the host bits, which the limiter deliberately ignores: two
+    /// tests used it for "fresh addresses" and so never grew the table, and
+    /// could not fail with eviction switched off.)
+    fn net6(i: u16) -> IpAddr {
+        IpAddr::from([0x2001, 0xdb8, i, 0, 0, 0, 0, 1])
+    }
+
     fn parse(s: &str) -> IpAddr {
         s.parse().expect("valid address")
     }
@@ -253,7 +261,7 @@ mod tests {
         let mut rl = RateLimiter::with_limits(MAX_CONNECTIONS, WINDOW).with_max_tracked(64);
         let now = Instant::now();
         for i in 0..10_000u16 {
-            rl.check_at(ip6(i), now + Duration::from_millis(u64::from(i)));
+            rl.check_at(net6(i), now + Duration::from_millis(u64::from(i)));
         }
         assert!(
             rl.tracked_addresses() <= 64,
@@ -276,7 +284,7 @@ mod tests {
         // Fresh addresses overflow the table while the flooder keeps knocking.
         for i in 0..40u16 {
             let t = now + Duration::from_millis(u64::from(i) + 1);
-            rl.check_at(ip6(i), t);
+            rl.check_at(net6(i), t);
             rl.check_at(ip(1), t);
         }
 
@@ -344,5 +352,52 @@ mod tests {
         assert!(!rl.check_at(ip(1), now));
         assert!(!rl.check_at(ip(1), now));
         assert!(rl.check_at(ip(1), now), "third connection is over the cap");
+    }
+
+    /// The window is half-open: an attempt exactly one window old no longer
+    /// counts, for the budget and for the table.
+    #[test]
+    fn an_attempt_exactly_one_window_old_has_expired() {
+        let window = Duration::from_secs(10);
+        let mut rl = RateLimiter::with_limits(1, window);
+        let now = Instant::now();
+        assert!(!rl.check_at(ip(1), now));
+        assert!(rl.check_at(ip(1), now));
+        assert!(
+            !rl.check_at(ip(1), now + window),
+            "still counted at the edge"
+        );
+
+        let mut rl = RateLimiter::with_limits(1, window);
+        rl.check_at(ip(1), now);
+        rl.check_at(ip(2), now + window);
+        assert_eq!(rl.tracked_addresses(), 1, "kept past its window");
+    }
+
+    /// An address refused a moment ago is still known, even once its last
+    /// *admitted* attempt has aged out: knocking is contact.
+    #[test]
+    fn a_refused_knock_keeps_the_address_known() {
+        let window = Duration::from_secs(10);
+        let mut rl = RateLimiter::with_limits(1, window);
+        let now = Instant::now();
+        rl.check_at(ip(1), now);
+        assert!(rl.check_at(ip(1), now + Duration::from_secs(5)));
+        rl.check_at(ip(2), now + Duration::from_secs(12));
+        assert_eq!(rl.tracked_addresses(), 2);
+    }
+
+    /// A full table evicts a batch — 1/16 of its size — not one entry, and not
+    /// all of them.
+    #[test]
+    fn a_full_table_evicts_a_sixteenth_at_a_time() {
+        let mut rl = RateLimiter::with_limits(MAX_CONNECTIONS, WINDOW).with_max_tracked(32);
+        let now = Instant::now();
+        for i in 0..32u16 {
+            rl.check_at(net6(i), now + Duration::from_millis(u64::from(i)));
+        }
+        assert_eq!(rl.tracked_addresses(), 32);
+        rl.check_at(net6(100), now + Duration::from_millis(100));
+        assert_eq!(rl.tracked_addresses(), 31, "two evicted, one added");
     }
 }
