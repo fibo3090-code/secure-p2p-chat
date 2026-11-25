@@ -151,6 +151,11 @@ pub(crate) fn parse_candidates(peer_public: &str, peer_locals: &[String]) -> Vec
         let Ok(addr) = raw.parse::<SocketAddr>() else {
             continue;
         };
+        // An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) *is* that IPv4
+        // address: a dual-stack socket dials it as IPv4. Judged as IPv6,
+        // `[::ffff:127.0.0.1]` is neither `::1` nor `::`, so it slipped past
+        // every check below and the host probed its own loopback (NET-16).
+        let addr = canonical(addr);
         if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
             continue;
         }
@@ -170,17 +175,36 @@ pub(crate) fn parse_candidates(peer_public: &str, peer_locals: &[String]) -> Vec
     out
 }
 
-/// Could another machine on the LAN have this address? Not loopback, not
-/// link-local (which also needs an interface the peer cannot name), not
-/// broadcast.
+/// `addr` with an IPv4-mapped IPv6 address replaced by the IPv4 address it
+/// names, so every IPv4 rule applies to it (and it is dialled as IPv4).
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => addr,
+        },
+        v4 => v4,
+    }
+}
+
+/// Could another machine on the LAN have this address? Not loopback, not the
+/// unspecified address (which a dial sends to this host), not link-local
+/// (which also needs an interface the peer cannot name), not broadcast. An
+/// IPv4-mapped address is judged as the IPv4 address it is.
 fn is_lan_reachable(ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    };
     match ip {
-        std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_link_local() || v4.is_broadcast()),
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_broadcast())
+        }
         std::net::IpAddr::V6(v6) => {
             // fe80::/10, written out: `Ipv6Addr::is_unicast_link_local` is
             // newer than the MSRV.
             let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-            !(v6.is_loopback() || link_local)
+            !(v6.is_loopback() || v6.is_unspecified() || link_local)
         }
     }
 }
@@ -521,6 +545,16 @@ mod tests {
                 "10.0.0.9:4000".into(),
                 "[fd00::5]:4000".into(),
                 "[2001:db8::5]:4000".into(),
+                // The same refusals written as IPv4-mapped IPv6: a
+                // dual-stack socket dials these as the IPv4 address.
+                "[::ffff:127.0.0.1]:6379".into(),
+                "[::ffff:0.0.0.0]:22".into(),
+                "[::ffff:169.254.1.2]:80".into(),
+                "[::ffff:255.255.255.255]:9".into(),
+                "[::ffff:224.0.0.1]:9".into(),
+                // A mapped LAN address is dialled, as IPv4, and only once.
+                "[::ffff:192.168.1.5]:4000".into(),
+                "[::ffff:192.168.1.6]:4000".into(),
             ],
         );
         let dialled: Vec<String> = dialled.iter().map(ToString::to_string).collect();
@@ -531,9 +565,13 @@ mod tests {
                 "192.168.1.5:4000",
                 "10.0.0.9:4000",
                 "[fd00::5]:4000",
-                "[2001:db8::5]:4000"
+                "[2001:db8::5]:4000",
+                "192.168.1.6:4000"
             ]
         );
+        // The relay-observed address is canonicalised too, so a mapped
+        // unspecified one cannot pass the unspecified check either.
+        assert!(parse_candidates("[::ffff:0.0.0.0]:5000", &[]).is_empty());
         assert_eq!(
             parse_candidates("127.0.0.1:5000", &[]),
             ["127.0.0.1:5000".parse::<SocketAddr>().unwrap()],

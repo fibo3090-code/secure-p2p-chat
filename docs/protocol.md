@@ -368,8 +368,11 @@ Flow:
 2. If **both** registered punch-capable, the server sends each side a
    `PunchStart` with the other's observed public endpoint and LAN candidates,
    then waits (bounded) for both `PunchOutcome`s. Peer-listed LAN
-   candidates that no other machine could have — loopback, link-local,
-   broadcast — are never dialled (audit NET-16).
+   candidates that no other machine could have — loopback, unspecified,
+   link-local, broadcast — are never dialled (audit NET-16). An IPv4-mapped
+   IPv6 candidate (`::ffff:a.b.c.d`) is judged and dialled as the IPv4
+   address it names: a dual-stack socket would reach `::ffff:127.0.0.1` on
+   the host's own loopback.
 3. Each peer re-binds the control connection's local port
    (`SO_REUSEADDR`/`SO_REUSEPORT`; the control connection itself is dialed
    from a reuse-enabled socket), listens on it, and dials every candidate in
