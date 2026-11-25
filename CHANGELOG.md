@@ -51,6 +51,11 @@ predate tagged releases.
 
 ### Fixed
 
+- Relay with hole punching on Windows: a failed punch attempt ran about
+  1.5 s past its time limit before falling back to the relay, because a
+  connection attempt still in flight at the deadline was waited out. It now
+  stops at the deadline.
+
 - Community server: a member who started a large upload and then sent
   nothing kept holding the server's upload budget, so a few such uploads
   blocked everyone else's. An upload that sends nothing for two minutes is

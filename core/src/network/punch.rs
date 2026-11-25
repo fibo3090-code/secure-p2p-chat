@@ -303,7 +303,17 @@ pub(crate) async fn attempt_punch_with_timeout(
         let tx = validated_tx.clone();
         workers.spawn(async move {
             while Instant::now() < deadline {
-                match connect_once(local_port, dest).await {
+                // Bounded by the attempt's deadline too, not only by the
+                // per-dial timeout: the host's selection waits until every
+                // worker has let go of `tx`, so a dial still in flight at the
+                // deadline held the whole attempt open for the rest of its
+                // 1.5 s. Where a dial to a dead address fails at once (Linux)
+                // nobody noticed; on Windows, where it retries, every failed
+                // punch overran its budget.
+                match timeout_at(deadline, connect_once(local_port, dest))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("punch deadline reached")))
+                {
                     Ok(stream) => match validate(stream, role, tag).await {
                         Ok(valid) => {
                             let _ = tx.send(valid).await;
@@ -646,6 +656,54 @@ mod tests {
             validated <= MAX_PENDING_VALIDATIONS,
             "{validated} connections validated at once"
         );
+    }
+
+    /// A dial still in flight at the deadline must not hold the attempt open.
+    /// The host's selection waits for every worker to let go of its sender,
+    /// and a dialer checked the deadline only between dials, so one stuck in
+    /// a connect kept the attempt alive for the rest of its 1.5 s. On Linux a
+    /// dead address refuses at once, so only Windows CI (where a refused
+    /// connect retries) showed it. Here the dial hangs for real: the target
+    /// is a listener whose accept queue is full, so its SYNs are dropped.
+    #[tokio::test]
+    async fn a_dial_in_flight_at_the_deadline_does_not_hold_the_attempt_open() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let full = socket.listen(1).unwrap();
+        let target = full.local_addr().unwrap();
+        // Fill the accept queue (never accepted) so later SYNs go unanswered.
+        let mut fillers = Vec::new();
+        for _ in 0..8 {
+            if let Ok(Ok(s)) = timeout(Duration::from_millis(100), TcpStream::connect(target)).await
+            {
+                fillers.push(s);
+            }
+        }
+        let hangs = timeout(Duration::from_millis(300), TcpStream::connect(target))
+            .await
+            .is_err();
+        if !hangs {
+            eprintln!("skipped: this kernel answers a full accept queue, so no dial hangs");
+            return;
+        }
+
+        let budget = Duration::from_millis(400);
+        let started = std::time::Instant::now();
+        let result = attempt_punch_with_timeout(
+            PunchRole::Host,
+            free_port(),
+            &[target],
+            "the-rendezvous-token",
+            budget,
+        )
+        .await;
+        assert!(result.is_err());
+        let took = started.elapsed();
+        assert!(
+            took < budget + Duration::from_millis(600),
+            "a dial in flight held the attempt open for {took:?}"
+        );
+        drop((full, fillers));
     }
 
     /// NET-08: whoever connects to the host's punch port first is sent the
