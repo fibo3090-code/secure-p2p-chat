@@ -40,6 +40,7 @@ pub(crate) const FILE_LANE_CAPACITY: usize = 8;
 
 impl SessionHandle {
     /// Test-support constructor whose bulk file lane is inert (receiver dropped).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test_control(from_app_tx: mpsc::UnboundedSender<ProtocolMessage>) -> Self {
         let (file_tx, _file_rx) = mpsc::channel(1);
         Self {
@@ -97,6 +98,10 @@ pub enum FingerprintWarning {
     KeyChanged {
         /// The fingerprint the conversation stored.
         previous: String,
+        /// The contact this session was dialled as, when the new key also
+        /// contradicts that contact's invite: accepting repoints the contact
+        /// to the new key, and the prompt must say so before the user agrees.
+        repoints: Option<String>,
     },
     /// The peer was dialled as a contact whose invite named a different key.
     ///
@@ -107,6 +112,19 @@ pub enum FingerprintWarning {
         contact_id: Uuid,
         contact_name: String,
         /// The fingerprint the contact's invite named.
+        expected: String,
+    },
+    /// Listener side (no invite to compare with): the connection comes from
+    /// the address of exactly one saved contact, but presents a key that
+    /// contact does not hold and nothing here trusts. It may be their new
+    /// device; it is also what someone intercepting them looks like. Unlike
+    /// an invite mismatch, accepting it does **not** repoint the contact: an
+    /// address is weaker evidence than an invite, and the session keeps its
+    /// own conversation.
+    ContactAddressMismatch {
+        contact_id: Uuid,
+        contact_name: String,
+        /// The fingerprint the contact holds.
         expected: String,
     },
 }
@@ -444,6 +462,7 @@ impl ChatManager {
     }
 
     /// Test helper: a local chat without a network session.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_local_chat_for_test(&mut self, id: Uuid, title: String) {
         self.chats
             .insert(id, Chat::new(id, title, ChatKind::Dm, Transport::Direct));
@@ -452,16 +471,19 @@ impl ChatManager {
     /// Test helper: record (or replace, by id) a transfer, as if its frames had
     /// arrived. Lets a front-end test check what it does with a transfer in
     /// each state without streaming one over a real session.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn insert_transfer_for_test(&mut self, transfer: FileTransferState) {
         self.active_transfers.insert(transfer.id, transfer);
     }
 
     /// Test helper: inject a mock session.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn add_session_for_test(&mut self, chat_id: Uuid, handle: SessionHandle) {
         self.sessions.insert(chat_id, handle);
     }
 
     /// Test helper: inject a fingerprint-confirmation channel.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn add_fingerprint_confirm_sender_for_test(
         &mut self,
         chat_id: Uuid,
@@ -470,7 +492,15 @@ impl ChatManager {
         self.fingerprint_confirm_senders.insert(chat_id, tx);
     }
 
+    /// Test helper: deliver a session event as if the session layer had sent
+    /// it (for tests outside this crate; `inject_session_event` is internal).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn handle_session_event_for_test(&mut self, session_id: Uuid, event: SessionEvent) {
+        self.handle_session_event(session_id, event);
+    }
+
     /// Test helper: queue a TOFU prompt the way a handshake would.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn queue_fingerprint_prompt_for_test(&mut self, prompt: PendingFingerprint) {
         self.queue_fingerprint_request(prompt);
     }

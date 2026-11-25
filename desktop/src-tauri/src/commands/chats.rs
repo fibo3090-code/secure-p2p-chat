@@ -219,8 +219,13 @@ pub(crate) async fn get_conversation(
     ensure_ready(&state)?;
     let uuid = parse_id(&id)?;
     let mgr = state.manager.lock().await;
+    // A fingerprint prompt names its *session*. On the listener side that is
+    // the listener's id, whose placeholder is gone by the time the dialog
+    // looks it up; the conversation it serves is found through the
+    // session-to-chat mapping. Without this the dialog's "key changed" check
+    // never ran for an incoming peer.
     let chat = mgr
-        .get_chat(uuid)
+        .get_chat(mgr.resolve_display_chat_id(uuid))
         .ok_or_else(|| "No such conversation".to_string())?;
     let mut value = serde_json::to_value(chat).map_err(|e| e.to_string())?;
     if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {

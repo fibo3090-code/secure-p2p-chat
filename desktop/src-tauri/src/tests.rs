@@ -891,6 +891,28 @@ fn pending_fingerprint_carries_the_invite_mismatch_warning() {
         json!({ "kind": "invite_mismatch", "contact": "Alice", "expected": "aa".repeat(32) })
     );
 
+    // The listener-side warning, and a key change that repoints a contact.
+    pending.lock().unwrap().as_mut().unwrap().warning =
+        Some(FingerprintWarning::ContactAddressMismatch {
+            contact_id: uuid::Uuid::new_v4(),
+            contact_name: "Carol".into(),
+            expected: "cc".repeat(32),
+        });
+    let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
+    assert_eq!(
+        prompt["warning"],
+        json!({ "kind": "contact_address_mismatch", "contact": "Carol", "expected": "cc".repeat(32) })
+    );
+    pending.lock().unwrap().as_mut().unwrap().warning = Some(FingerprintWarning::KeyChanged {
+        previous: "dd".repeat(32),
+        repoints: Some("Alice".into()),
+    });
+    let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
+    assert_eq!(
+        prompt["warning"],
+        json!({ "kind": "key_changed", "previous": "dd".repeat(32), "repoints": "Alice" })
+    );
+
     // An ordinary first use carries an explicit null, not a missing key.
     pending.lock().unwrap().as_mut().unwrap().warning = None;
     let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
@@ -3007,4 +3029,37 @@ fn unlocking_hosts_on_startup_only_when_the_setting_is_on() {
             tauri::async_runtime::block_on(manager.lock()).stop_hosting();
         }
     }
+}
+
+/// Review of #207/#210: a fingerprint prompt names its *session*, and on the
+/// listener side that is the listener's id — whose placeholder is gone by the
+/// time `Verify` looks it up. `get_conversation` follows the session to the
+/// conversation it serves, so the dialog's own "key changed" check runs for
+/// incoming peers too.
+#[test]
+fn get_conversation_follows_a_session_id_to_its_conversation() {
+    let h = ready_harness();
+    let manager = h.bridge().manager.clone();
+    let listener = uuid::Uuid::new_v4();
+    let offered = uuid::Uuid::new_v4();
+    tauri::async_runtime::block_on(async {
+        let mut m = manager.lock().await;
+        m.create_local_chat_for_test(listener, "Host on :12345".into());
+        m.chats.get_mut(&listener).unwrap().is_host_placeholder = true;
+        m.handle_session_event_for_test(
+            listener,
+            messenger_core::types::SessionEvent::NewConnection {
+                peer_addr: "198.51.100.9:50000".into(),
+                fingerprint: "ab".repeat(32),
+                sas: "123456".into(),
+                chat_id: offered,
+            },
+        );
+        m.get_chat_mut(offered).unwrap().peer_fingerprint = Some("ee".repeat(32));
+    });
+    let conv = h
+        .ipc("get_conversation", json!({ "id": listener.to_string() }))
+        .expect("the session id did not resolve");
+    assert_eq!(conv["id"], offered.to_string());
+    assert_eq!(conv["peer_fingerprint"], "ee".repeat(32));
 }

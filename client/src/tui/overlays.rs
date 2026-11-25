@@ -296,10 +296,18 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
 /// The text the fingerprint prompt leads with when it is not a first use.
 pub(crate) fn fingerprint_warning_text(warning: &FingerprintWarning) -> String {
     match warning {
-        FingerprintWarning::KeyChanged { previous } => format!(
-            "⚠ WARNING: this conversation's key has CHANGED (was {}…). It may be a new device — or someone intercepting the connection. Reject unless the codes match.",
-            short_fingerprint(previous)
-        ),
+        FingerprintWarning::KeyChanged { previous, repoints } => {
+            let mut text = format!(
+                "⚠ WARNING: this conversation's key has CHANGED (was {}…). It may be a new device — or someone intercepting the connection. Reject unless the codes match.",
+                short_fingerprint(previous)
+            );
+            if let Some(contact) = repoints {
+                text.push_str(&format!(
+                    " It is not the key in {contact}'s invite either: accepting replaces the key saved for {contact}."
+                ));
+            }
+            text
+        }
         FingerprintWarning::InviteMismatch {
             contact_name,
             expected,
@@ -308,6 +316,16 @@ pub(crate) fn fingerprint_warning_text(warning: &FingerprintWarning) -> String {
             "⚠ WARNING: this is NOT the key in {}'s invite (expected {}…). Someone may be intercepting the connection. Reject unless the codes match.",
             contact_name,
             short_fingerprint(expected)
+        ),
+        FingerprintWarning::ContactAddressMismatch {
+            contact_name,
+            expected,
+            ..
+        } => format!(
+            "⚠ WARNING: this connection comes from {}'s address but does NOT present their key (expected {}…). It may be their new device — or someone intercepting them. Reject unless the codes match; accepting does not change {}'s saved key.",
+            contact_name,
+            short_fingerprint(expected),
+            contact_name
         ),
     }
 }

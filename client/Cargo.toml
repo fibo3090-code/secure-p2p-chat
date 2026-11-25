@@ -67,7 +67,16 @@ image = { workspace = true }
 arboard = { workspace = true }
 unicode-width = { workspace = true }
 
+[features]
+# Test hooks (`ChatManager::*_for_test`, `SessionHandle::for_test_control`)
+# for tests in *other* crates and in this crate's `tests/` directory, which do
+# not see `cfg(test)`. Off in every shipped build: nothing but a
+# dev-dependency enables it.
+test-support = []
+
 [dev-dependencies]
+# This crate's own integration tests (`tests/it`) use the test hooks.
+p2pem-classic = { path = ".", features = ["test-support"] }
 # The Community server, so `tests/it/party.rs` can stand a real one up in
 # process. Acyclic: the server depends only on messenger-core.
 messenger-server = { workspace = true }

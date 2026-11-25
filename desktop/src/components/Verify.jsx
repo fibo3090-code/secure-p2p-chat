@@ -50,15 +50,23 @@ export function warningText(warning) {
         "Someone may be intercepting the connection.";
     case "key_changed":
       return `This conversation's key has changed (was ${short(warning.previous)}…). ` +
-        "It may be a new device — or someone intercepting the connection.";
+        "It may be a new device — or someone intercepting the connection." +
+        (warning.repoints
+          ? ` It is not the key in ${warning.repoints}'s invite either: trusting it replaces the key saved for ${warning.repoints}.`
+          : "");
+    case "contact_address_mismatch":
+      return `This connection comes from ${warning.contact}'s address, but it is not their key ` +
+        `(expected ${short(warning.expected)}…). It may be their new device — or someone ` +
+        `intercepting them. Trusting it does not change the key saved for ${warning.contact}.`;
     default:
       return "This is not the key this peer was expected to present.";
   }
 }
 
-function subtitle(changed, warning, first) {
+function subtitle(changed, warning, unknown, first) {
   if (changed) return "This could be a new device — or someone intercepting";
   if (warning) return "Unexpected key — do not trust it unless the codes match";
+  if (unknown) return "Couldn't check this conversation's history";
   return `Check it's really ${first}`;
 }
 
@@ -85,20 +93,36 @@ export function Verify({ req, onClose }) {
   // must never appear under a cursor already on the button. Bounded, so a hung
   // call cannot trap the user in an unanswerable prompt.
   const [settled, setSettled] = useState(false);
+  // The lookup failed, timed out or found nothing: what this conversation
+  // trusted before is *unknown*, which is not the same as "first use". Read
+  // as first use, an incoming peer (whose lookup used to fail every time)
+  // was shown the calm first-contact dialog even when its key had changed.
+  const [unknownHistory, setUnknownHistory] = useState(false);
   const rejectRef = useRef(null);
   useEffect(() => {
     setKnown(null);
     setSettled(false);
+    setUnknownHistory(false);
     if (!req?.chat_id) { setSettled(true); return undefined; }
     let live = true;
-    const done = () => live && setSettled(true);
+    let found = false;
+    const done = () => {
+      if (!live) return;
+      setSettled(true);
+      if (!found) setUnknownHistory(true);
+    };
     const timer = setTimeout(done, LOOKUP_TIMEOUT_MS);
     api.getConversation(req.chat_id)
-      .then((chat) => live && chat && setKnown({
-        fingerprint: chat.peer_fingerprint || null,
-        // The Rust enum serialises as "Direct"/"Relay"; compare normalised.
-        transport: chat.transport ? normalizeTransport(chat.transport) : null,
-      }))
+      .then((chat) => {
+        if (!live || !chat) return;
+        found = true;
+        setUnknownHistory(false);
+        setKnown({
+          fingerprint: chat.peer_fingerprint || null,
+          // The Rust enum serialises as "Direct"/"Relay"; compare normalised.
+          transport: chat.transport ? normalizeTransport(chat.transport) : null,
+        });
+      })
       .catch(() => {})
       .finally(done);
     return () => { live = false; clearTimeout(timer); };
@@ -109,9 +133,11 @@ export function Verify({ req, onClose }) {
   // the dialled contact's invite, or when the conversation's key changed. It
   // is authoritative and needs no lookup, so it leads whenever it is present.
   const warning = warningText(req?.warning);
+  const unknown = unknownHistory && !warning && !changed;
   // Either way the user is being asked to trust a key that contradicts what
-  // they had: trusting must be deliberate.
-  const alarm = changed || !!warning;
+  // they had, or that cannot be checked against it: trusting must be
+  // deliberate.
+  const alarm = changed || !!warning || unknown;
   // The lookup resolves after the dialog opened, so focus moves when the
   // changed-key state is known, not only on mount.
   useEffect(() => { if (alarm) rejectRef.current?.focus(); }, [alarm]);
@@ -144,7 +170,7 @@ export function Verify({ req, onClose }) {
       title={changed ? `${first}'s safety code changed` : `Verify ${req.peer_name}`}
       icon={alarm ? "alert" : "fingerprint"} tone={alarm ? "warn" : undefined}
       dismissable={false}
-      sub={subtitle(changed, warning, first)}>
+      sub={subtitle(changed, warning, unknown, first)}>
       <div className="verify-body">
         {/* One warning, never two: the backend's verdict when it gave one
             (it covers both a changed key and an invite mismatch), otherwise
@@ -153,10 +179,15 @@ export function Verify({ req, onClose }) {
           <div className="verify-changed" role="alert">
             {warning} Reject unless the codes match exactly.
           </div>
-        ) : changed && (
+        ) : changed ? (
           <div className="verify-changed" role="alert">
             You verified {first} before, and this is a different key. Only trust it if
             {" "}{first} tells you — by voice or in person — that they reinstalled or changed devices.
+          </div>
+        ) : unknown && (
+          <div className="verify-changed" role="status">
+            This app couldn't check whether you have talked to {first} before, so don't
+            assume this is a first connection. Trust it only if the codes match exactly.
           </div>
         )}
         {/* The route reassures; on an unexpected key it is the wrong moment to. */}

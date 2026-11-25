@@ -297,7 +297,13 @@ impl ChatManager {
         contact.fingerprint = Some(fingerprint.to_string());
         // The public key the invite carried belongs to the old fingerprint.
         contact.public_key = None;
-        contact.trust_state = TrustState::Unverified;
+        // The user just compared the safety code for the new key, so a
+        // contact they had marked Trusted stays Trusted; anything else goes
+        // back to Unverified for `promote_contact_verified` to record the
+        // acceptance. (Resetting Trusted demoted it to Verified on accept.)
+        if contact.trust_state != TrustState::Trusted {
+            contact.trust_state = TrustState::Unverified;
+        }
     }
 
     /// Associate a contact with a one-to-one chat.

@@ -54,6 +54,8 @@ base64 = { workspace = true }
 # windowing), so Linux/macOS coverage in CI loses nothing.
 [target.'cfg(not(windows))'.dev-dependencies]
 tauri = { version = "2.11.3", features = ["test"] }
+# The ChatManager test hooks, for the bridge tests only; never in the app.
+p2pem-classic = { path = "../../client", features = ["test-support"] }
 tempfile = { workspace = true }
 # A real Community server in process, so the `party_*` commands are driven
 # end to end — the two-step join, the pin written only after a real join, and

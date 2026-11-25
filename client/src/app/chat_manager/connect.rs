@@ -58,7 +58,9 @@ impl ChatManager {
                     .get(&chat_id)
                     .filter(|e| !e.fingerprint.eq_ignore_ascii_case(&fp))
                     .map(|e| e.contact_id),
-                None => None,
+                // An address is a hint, not an identity claim: the contact
+                // keeps its key, and this session keeps its own conversation.
+                Some(FingerprintWarning::ContactAddressMismatch { .. }) | None => None,
             };
             if let Some(contact_id) = rebind {
                 self.rebind_contact_fingerprint(contact_id, &fp);

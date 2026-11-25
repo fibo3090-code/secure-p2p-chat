@@ -51,6 +51,16 @@ predate tagged releases.
 
 ### Fixed
 
+- Hosting: a saved contact who connected to you with a different key — a new
+  device, or someone intercepting them — got a fresh conversation and a
+  prompt that looked like a stranger's first connection. When the connection
+  comes from that contact's address, the prompt now warns that it is not
+  their key. Accepting does not change the key saved for them. The desktop
+  verification dialog no longer treats "could not look this conversation up"
+  as a first meeting, and a contact you marked Trusted stays Trusted when you
+  accept their new key. A key change that also contradicts a contact's invite
+  now says, before you accept, that the contact will be moved to the new key.
+
 - A file still arriving when the sender started another one used to vanish
   from the transfer list without a word. It still stops — one file at a time
   per sender — but a warning now names the file that was interrupted.

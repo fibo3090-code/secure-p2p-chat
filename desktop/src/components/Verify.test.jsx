@@ -165,6 +165,35 @@ describe("Verify", () => {
     expect(screen.queryByText(/safety code changed/)).toBeNull();
   });
 
+  // Review of #207/#210: a lookup that failed or timed out left the dialog
+  // reading "first use". On the listener side it always failed, so an
+  // incoming peer whose key had changed got the calm first-contact dialog.
+  // Unknown history is not first use.
+  it.each([
+    ["fails", () => Promise.reject(new Error("No such conversation"))],
+    ["finds nothing", async () => null],
+    ["never answers", () => new Promise(() => {})],
+  ])("does not call it a first connection when the lookup %s", async (_how, lookup) => {
+    installApi({ getConversation: lookup });
+    render(<Verify req={req} onClose={() => {}} />);
+    expect(await screen.findByText(/couldn't check whether you have talked to Alice before/i,
+      {}, { timeout: 2000 })).toBeTruthy();
+    expect(screen.getByText("Couldn't check this conversation's history")).toBeTruthy();
+    expect(screen.queryByText(/Check it's really Alice/)).toBeNull();
+    // Deliberate, like any other alarm: trust is not the primary action.
+    expect(screen.getByRole("button", { name: "Codes match — trust this new key" })).toBeTruthy();
+  });
+
+  it("names the contact an accept would repoint, and the listener-side mismatch", () => {
+    const changed = warningText({ kind: "key_changed", previous: "ef".repeat(32), repoints: "Bob" });
+    expect(changed).toMatch(/replaces the key saved for Bob/);
+    expect(warningText({ kind: "key_changed", previous: "ef".repeat(32), repoints: null }))
+      .not.toMatch(/replaces/);
+    const fromAddress = warningText({ kind: "contact_address_mismatch", contact: "Carol", expected: "cd".repeat(32) });
+    expect(fromAddress).toMatch(/comes from Carol's address, but it is not their key \(expected cdcdcdcdcdcdcdcd…\)/);
+    expect(fromAddress).toMatch(/does not change the key saved for Carol/);
+  });
+
   it("holds the trust button until the lookup has settled", async () => {
     let resolve;
     installApi({ getConversation: () => new Promise((r) => { resolve = r; }) });

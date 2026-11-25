@@ -3528,6 +3528,7 @@ dependencies = [
  "messenger-core",
  "messenger-server",
  "notify-rust",
+ "p2pem-classic",
  "proptest",
  "qrcode",
  "rand 0.8.7",

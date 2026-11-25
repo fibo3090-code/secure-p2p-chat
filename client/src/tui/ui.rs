@@ -740,8 +740,24 @@ mod tests {
             (
                 FingerprintWarning::KeyChanged {
                     previous: "cd".repeat(32),
+                    repoints: None,
                 },
                 "key has CHANGED (was cdcdcdcdcdcdcdcd…)",
+            ),
+            (
+                FingerprintWarning::KeyChanged {
+                    previous: "cd".repeat(32),
+                    repoints: Some("Bob".into()),
+                },
+                "key saved for Bob",
+            ),
+            (
+                FingerprintWarning::ContactAddressMismatch {
+                    contact_id: Uuid::new_v4(),
+                    contact_name: "Carol".into(),
+                    expected: "ab".repeat(32),
+                },
+                "from Carol's address",
             ),
             (
                 FingerprintWarning::InviteMismatch {

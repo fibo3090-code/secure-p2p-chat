@@ -722,7 +722,10 @@ async fn accepting_a_changed_key_that_also_contradicts_the_invite_rebinds_the_co
     assert_eq!(
         mgr.pending_fingerprint().unwrap().warning,
         Some(FingerprintWarning::KeyChanged {
-            previous: previous_fp.clone()
+            previous: previous_fp.clone(),
+            // The new key contradicts Alice's invite too, and the prompt says
+            // that accepting repoints her.
+            repoints: Some("Alice".into()),
         })
     );
 
@@ -779,7 +782,8 @@ fn a_changed_key_prompt_carries_the_previous_fingerprint() {
     assert_eq!(
         mgr.pending_fingerprint().unwrap().warning,
         Some(FingerprintWarning::KeyChanged {
-            previous: "OLD-FP".into()
+            previous: "OLD-FP".into(),
+            repoints: None,
         })
     );
     assert!(rx.try_recv().is_err());
@@ -2940,4 +2944,163 @@ async fn a_port_mapping_result_is_applied_on_the_next_poll() {
         "a vanished attempt raised {:?}",
         mgr.toasts
     );
+}
+
+/// An incoming connection arriving at a listener, as the session layer
+/// reports it: returns the listener's session id and the conversation id the
+/// caller offered.
+fn incoming(
+    mgr: &mut ChatManager,
+    peer_addr: &str,
+    fingerprint: &str,
+) -> (Uuid, Uuid, mpsc::UnboundedReceiver<bool>) {
+    let listener = Uuid::new_v4();
+    mgr.create_local_chat_for_test(listener, "Host on :12345".into());
+    mgr.chats.get_mut(&listener).unwrap().is_host_placeholder = true;
+    let (tx, rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(listener, tx);
+    let offered = Uuid::new_v4();
+    mgr.handle_session_event(
+        listener,
+        SessionEvent::NewConnection {
+            peer_addr: peer_addr.into(),
+            fingerprint: fingerprint.into(),
+            sas: "123456 🎃🎈🎁".into(),
+            chat_id: offered,
+        },
+    );
+    (listener, offered, rx)
+}
+
+/// Review of #209: on the listener side the only binding was the key itself,
+/// so a saved contact arriving with another key — MITM or new device — got a
+/// fresh "Peer xxxx" conversation and a prompt identical to a stranger's first
+/// connection. When the connection comes from the address of exactly one
+/// saved contact, and its key is neither that contact's nor one already
+/// trusted, the prompt now leads with a warning naming the contact. Accepting
+/// does not repoint the contact (an address is a hint, not an invite), and the
+/// accepted key is not warned about again.
+#[test]
+fn an_incoming_key_that_is_not_the_contacts_from_their_address_warns() {
+    let carol_fp = "aa".repeat(32);
+    let other_fp = "bb".repeat(32);
+    let mut mgr = ChatManager::default();
+    let carol = mgr.add_contact(
+        "Carol".into(),
+        Some("192.0.2.7:12345".into()),
+        Some(carol_fp.clone()),
+        None,
+    );
+    let (listener, offered, _answers) = incoming(&mut mgr, "192.0.2.7:51000", &other_fp);
+    assert_eq!(
+        mgr.pending_fingerprint().unwrap().warning,
+        Some(FingerprintWarning::ContactAddressMismatch {
+            contact_id: carol,
+            contact_name: "Carol".into(),
+            expected: carol_fp.clone(),
+        })
+    );
+    assert!(mgr.toasts.iter().any(|t| t
+        .message
+        .contains("from Carol's address presented a key that is not theirs")));
+
+    mgr.confirm_fingerprint(listener, true).unwrap();
+    assert_eq!(
+        mgr.get_contact(carol).unwrap().fingerprint.as_deref(),
+        Some(carol_fp.as_str()),
+        "an address hint repointed the contact"
+    );
+    assert_eq!(
+        mgr.get_chat(offered).unwrap().peer_fingerprint.as_deref(),
+        Some(other_fp.as_str())
+    );
+
+    // The same key again is a key this app now trusts: no repeat warning.
+    let mut mgr2 = mgr;
+    mgr2.handle_session_event(listener, SessionEvent::Disconnected);
+    let _ = incoming(&mut mgr2, "192.0.2.7:51001", &other_fp);
+    assert!(
+        mgr2.pending_fingerprint()
+            .is_none_or(|p| p.warning.is_none()),
+        "an accepted key warned again"
+    );
+}
+
+/// The address hint fires only where it means something: a direct or
+/// hole-punched source (a relayed connection comes from the relay), an IPv4
+/// address however the listener reports it, one contact at that address, and
+/// a key that contact does not already hold.
+#[test]
+fn the_address_hint_stays_quiet_where_it_proves_nothing() {
+    let carol_fp = "aa".repeat(32);
+    let other_fp = "bb".repeat(32);
+    let warned = |contacts: &[(&str, &str)], peer_addr: &str, fp: &str| {
+        let mut mgr = ChatManager::default();
+        for (name, addr) in contacts {
+            mgr.add_contact(
+                (*name).into(),
+                Some((*addr).into()),
+                Some(carol_fp.clone()),
+                None,
+            );
+        }
+        let _ = incoming(&mut mgr, peer_addr, fp);
+        matches!(
+            mgr.pending_fingerprint().and_then(|p| p.warning.clone()),
+            Some(FingerprintWarning::ContactAddressMismatch { .. })
+        )
+    };
+    let carol = [("Carol", "192.0.2.7:12345")];
+    assert!(warned(&carol, "192.0.2.7:51000", &other_fp), "direct");
+    assert!(
+        warned(&carol, "p2p:192.0.2.7:51000", &other_fp),
+        "hole punched"
+    );
+    assert!(
+        warned(&carol, "[::ffff:192.0.2.7]:51000", &other_fp),
+        "dual-stack listener"
+    );
+    assert!(
+        !warned(&carol, "relay:relay.example:9000", &other_fp),
+        "relayed"
+    );
+    assert!(
+        !warned(&carol, "192.0.2.8:51000", &other_fp),
+        "another address"
+    );
+    assert!(
+        !warned(&carol, "192.0.2.7:51000", &carol_fp),
+        "the contact's own key"
+    );
+    let shared = [("Carol", "192.0.2.7:12345"), ("Dave", "192.0.2.7:23456")];
+    assert!(
+        !warned(&shared, "192.0.2.7:51000", &other_fp),
+        "two contacts behind one address"
+    );
+}
+
+/// Review of #209: accepting a key change for a contact the user had marked
+/// Trusted demoted it to Verified. The user compared the new code; their
+/// trust in the person carries over.
+#[tokio::test]
+async fn a_trusted_contact_stays_trusted_when_its_new_key_is_accepted() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some("aa".repeat(32)),
+        None,
+    );
+    mgr.contacts.get_mut(&contact_id).unwrap().trust_state = TrustState::Trusted;
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+    let presented = "bb".repeat(32);
+    mgr.handle_tofu_verification(chat_id, &presented, "127.0.0.1:1", "123456 🎃🎈🎁");
+    mgr.confirm_fingerprint(chat_id, true).unwrap();
+    let contact = mgr.get_contact(contact_id).unwrap();
+    assert_eq!(contact.fingerprint.as_deref(), Some(presented.as_str()));
+    assert_eq!(contact.trust_state, TrustState::Trusted);
 }

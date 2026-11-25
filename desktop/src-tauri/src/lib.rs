@@ -976,16 +976,19 @@ impl PollContext {
 /// The shape the frontend expects for a TOFU prompt (event and poll alike).
 ///
 /// `warning` is `null` for an ordinary first use, otherwise
-/// `{ kind: "key_changed", previous }` or
-/// `{ kind: "invite_mismatch", contact, expected }` (CRYPTO-04). `Verify`
-/// leads with it, so a key that is not the invite's never reads as a first
-/// contact.
+/// `{ kind: "key_changed", previous, repoints }` (`repoints`: the contact an
+/// accept moves to the new key, or null), `{ kind: "invite_mismatch",
+/// contact, expected }` (CRYPTO-04), or `{ kind: "contact_address_mismatch",
+/// contact, expected }` (listener side: a saved contact's address, another
+/// key). `Verify` leads with it, so none of them reads as a first contact.
 fn fingerprint_prompt_json(prompt: &PendingFingerprint) -> serde_json::Value {
     let warning = match &prompt.warning {
         None => serde_json::Value::Null,
-        Some(FingerprintWarning::KeyChanged { previous }) => serde_json::json!({
+        Some(FingerprintWarning::KeyChanged { previous, repoints }) => serde_json::json!({
             "kind": "key_changed",
             "previous": previous,
+            // The contact an accept repoints to the new key, or null.
+            "repoints": repoints,
         }),
         Some(FingerprintWarning::InviteMismatch {
             contact_name,
@@ -993,6 +996,15 @@ fn fingerprint_prompt_json(prompt: &PendingFingerprint) -> serde_json::Value {
             ..
         }) => serde_json::json!({
             "kind": "invite_mismatch",
+            "contact": contact_name,
+            "expected": expected,
+        }),
+        Some(FingerprintWarning::ContactAddressMismatch {
+            contact_name,
+            expected,
+            ..
+        }) => serde_json::json!({
+            "kind": "contact_address_mismatch",
             "contact": contact_name,
             "expected": expected,
         }),
