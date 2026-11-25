@@ -3328,6 +3328,23 @@ fn accepting_a_key_promotes_only_the_contact_of_that_conversation() {
     );
     assert_eq!(mgr.contacts[&bound].trust_state, TrustState::Verified);
     assert_eq!(mgr.contacts[&keyless].fingerprint, None);
+
+    // No contact bound to the conversation: the contact holding the accepted
+    // key is the one promoted, and only that one.
+    let (mut mgr, unbound) = manager_with_chat("Unbound");
+    let holder = mgr
+        .import_contact(contact_with("Holder", &key, TrustState::Unverified))
+        .unwrap();
+    let stranger = mgr
+        .import_contact(contact_with(
+            "Stranger",
+            &"cd".repeat(32),
+            TrustState::Unverified,
+        ))
+        .unwrap();
+    mgr.promote_contact_verified(unbound, &key);
+    assert_eq!(mgr.contacts[&holder].trust_state, TrustState::Verified);
+    assert_eq!(mgr.contacts[&stranger].trust_state, TrustState::Unverified);
 }
 
 /// Associating twice does not list the contact twice.
