@@ -465,9 +465,12 @@ fn unlocking_does_not_hold_the_identity_while_the_key_is_derived() {
     let elapsed = started.elapsed();
     assert!(!shared.lock().unwrap().is_locked());
     let free = watcher.join().unwrap();
+    // Holding the mutex for the whole derivation (the bug) gives zero samples;
+    // any is the property. A count threshold was a speed test: a fast machine
+    // finishes Argon2 in ~75 ms and fell under it (flaky on macOS CI).
     assert!(
-        free >= 20,
-        "the identity mutex was free for only {free} samples of a {elapsed:?} unlock"
+        free >= 1,
+        "the identity mutex was never free during a {elapsed:?} unlock"
     );
 }
 

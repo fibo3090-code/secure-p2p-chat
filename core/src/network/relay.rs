@@ -972,6 +972,14 @@ mod tests {
     /// registering fresh tokens could fill the table and every honest host
     /// got "at capacity". One address now has a bounded share of it — and the
     /// cap is per address, so it does not lock everyone else out.
+    // It simulates several source addresses by binding 127.0.0.2, 127.0.0.3, …,
+    // which Linux routes on loopback and macOS does not configure (bind fails
+    // with EADDRNOTAVAIL). Linux CI runs it; elsewhere it is reported ignored
+    // rather than passing without checking anything.
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS only configures 127.0.0.1 on loopback"
+    )]
     #[tokio::test]
     async fn one_address_cannot_hold_more_than_its_share_of_waiting_slots() {
         let relay_addr = start_relay().await;
