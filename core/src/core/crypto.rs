@@ -354,20 +354,34 @@ pub fn derive_session_key(
     salt: Option<&[u8]>,
     info: &[u8],
 ) -> Result<[u8; AES_KEY_SIZE]> {
+    let shared_secret = contributory_shared_secret(our_secret, their_public)?;
+    Ok(derive_from_shared(shared_secret.as_bytes(), salt, info))
+}
+
+/// The X25519 agreement, refusing a non-contributory exchange (RFC 7748 §6.1).
+/// Shared by [`derive_session_key`] and the session's handshake, which derives
+/// its keys from the shared secret in one testable step.
+pub(crate) fn contributory_shared_secret(
+    our_secret: EphemeralSecret,
+    their_public: &X25519PublicKey,
+) -> Result<x25519_dalek::SharedSecret> {
     let shared_secret = our_secret.diffie_hellman(their_public);
     if !shared_secret.was_contributory() {
         return Err(anyhow!(
             "peer sent a low-order X25519 public key (non-contributory key exchange refused)"
         ));
     }
-
-    Ok(derive_from_shared(shared_secret.as_bytes(), salt, info))
+    Ok(shared_secret)
 }
 
 /// The HKDF-SHA256 half of [`derive_session_key`], split out so the binding
 /// of the key to its salt (the transcript hash) and info can be tested
 /// against a fixed shared secret — an `EphemeralSecret` cannot be reused.
-fn derive_from_shared(shared: &[u8], salt: Option<&[u8]>, info: &[u8]) -> [u8; AES_KEY_SIZE] {
+pub(crate) fn derive_from_shared(
+    shared: &[u8],
+    salt: Option<&[u8]>,
+    info: &[u8],
+) -> [u8; AES_KEY_SIZE] {
     let hkdf = Hkdf::<Sha256>::new(salt, shared);
     let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)

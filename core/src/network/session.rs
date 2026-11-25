@@ -12,7 +12,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 use zeroize::Zeroizing;
 
 use crate::core::{
-    cross_sign_ed25519, derive_ed25519_subkey, derive_session_key, ed25519_public_from_bytes,
+    cross_sign_ed25519, derive_ed25519_subkey, ed25519_public_from_bytes,
     ed25519_signature_from_bytes, fingerprint_pubkey, generate_ephemeral_keypair,
     negotiate_signature_scheme, parse_x25519_public, pem_decode_public, pem_encode_public,
     recv_packet, rsa_sign_pss, rsa_verify_pss, send_packet, sign_ed25519, verify_ed25519,
@@ -651,6 +651,32 @@ fn derive_tunnel_keys(
     client_ephemeral: &[u8],
     us: NonceRole,
 ) -> Result<TunnelKeys> {
+    let shared = crate::core::crypto::contributory_shared_secret(our_secret, their_public)?;
+    let keys = tunnel_keys_from_shared(
+        shared.as_bytes(),
+        host_version,
+        client_version,
+        host_ephemeral,
+        client_ephemeral,
+        us,
+    )?;
+    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
+    Ok(keys)
+}
+
+/// Everything [`derive_tunnel_keys`] does after the X25519 agreement: the
+/// transcript hash (salt), the session key (HKDF-SHA256 with [`HKDF_INFO`]),
+/// and the two labelled AADs. A separate step so it can be pinned by a known
+/// answer on a fixed shared secret — an `EphemeralSecret` cannot be fixed, and
+/// both peers computing the same wrong thing passes every other test.
+fn tunnel_keys_from_shared(
+    shared: &[u8],
+    host_version: &[u8],
+    client_version: &[u8],
+    host_ephemeral: &[u8],
+    client_ephemeral: &[u8],
+    us: NonceRole,
+) -> Result<TunnelKeys> {
     let mut transcript = Vec::with_capacity(
         host_version.len() + client_version.len() + host_ephemeral.len() + client_ephemeral.len(),
     );
@@ -660,19 +686,16 @@ fn derive_tunnel_keys(
     transcript.extend_from_slice(client_ephemeral);
     let salt = Sha256::digest(&transcript);
 
-    let aes_key = Zeroizing::new(derive_session_key(
-        our_secret,
-        their_public,
+    let aes_key = Zeroizing::new(crate::core::crypto::derive_from_shared(
+        shared,
         Some(&salt),
         HKDF_INFO,
-    )?);
-    let keys = TunnelKeys {
+    ));
+    Ok(TunnelKeys {
         cipher: AesCipher::new_with_role(&aes_key[..], us)?,
         identity_proof_aad: labeled_aad(b"identity-proof", &salt),
         transport_aad: labeled_aad(b"transport", &salt),
-    };
-    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
-    Ok(keys)
+    })
 }
 
 /// Sign our ephemeral key with our identity and send the proof, encrypted.
@@ -1656,11 +1679,60 @@ fn duration_from_env(var: &str, default: std::time::Duration) -> std::time::Dura
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{generate_rsa_keypair, IdentityProof};
+    use crate::core::{derive_session_key, generate_rsa_keypair, IdentityProof};
     use crate::RSA_KEY_BITS;
 
     fn pem_of(key: &RsaPrivateKey) -> String {
         pem_encode_public(&RsaPublicKey::from(key)).unwrap()
+    }
+
+    /// The production tunnel derivation, pinned end to end on a fixed shared
+    /// secret: transcript order (host version, client version, host
+    /// ephemeral, client ephemeral), SHA-256 salt, HKDF-SHA256 with the real
+    /// `HKDF_INFO`, and the `label || 0 || salt` AADs. The expected values were
+    /// computed with Python's hashlib/hmac, not with the crates under test.
+    /// Two peers built from the same code agree on any change to these, so
+    /// only a known answer can catch one (#213 review: the crypto.rs KAT used
+    /// another info string and no transcript).
+    #[test]
+    fn the_tunnel_keys_are_pinned_by_a_known_answer() {
+        let keys = tunnel_keys_from_shared(
+            &[0x33; 32],
+            &[0, 0, 0, 5],
+            &[0, 0, 0, 4],
+            &[0x11; 32],
+            &[0x22; 32],
+            NonceRole::Host,
+        )
+        .unwrap();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let salt = "0ea5d6c6ba86e73b050d50bae96cd5c9ad6d5a19ca0ea9a8e6212e528d0c1f9c";
+        assert_eq!(
+            hex(&keys.cipher.get_current_key()),
+            "4601cd53641bf59f0cf97ace5265af30f261ea6cc4f0dc48836f8f39d81acac2"
+        );
+        assert_eq!(
+            hex(&keys.transport_aad),
+            format!("{}00{salt}", hex(b"transport"))
+        );
+        assert_eq!(
+            hex(&keys.identity_proof_aad),
+            format!("{}00{salt}", hex(b"identity-proof"))
+        );
+        // Both roles hold the same key; only the nonce space differs.
+        let client = tunnel_keys_from_shared(
+            &[0x33; 32],
+            &[0, 0, 0, 5],
+            &[0, 0, 0, 4],
+            &[0x11; 32],
+            &[0x22; 32],
+            NonceRole::Client,
+        )
+        .unwrap();
+        assert_eq!(
+            client.cipher.get_current_key(),
+            keys.cipher.get_current_key()
+        );
     }
 
     /// The version goes on the wire as a plaintext big-endian u32, and it is
