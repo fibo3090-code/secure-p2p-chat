@@ -164,6 +164,10 @@ predate tagged releases.
 
 ### Changed
 
+- The community server and the relay server shut down cleanly on Ctrl+C or
+  SIGTERM (what `docker stop` and systemd send), logging that a stop was
+  requested, instead of being killed mid-write.
+
 - **Desktop app redesign.** The shell, conversation list and thread, every
   full-width page and the main dialogs were reworked against today's best chat
   apps:

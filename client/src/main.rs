@@ -104,7 +104,12 @@ async fn main() -> anyhow::Result<()> {
 
     if args.relay_server {
         tracing::info!("Starting relay server mode");
-        network::run_relay_server(args.port).await?;
+        tokio::select! {
+            served = network::run_relay_server(args.port) => served?,
+            () = messenger_core::util::shutdown_signal() => {
+                tracing::info!("shutting down: stop requested");
+            }
+        }
         return Ok(());
     }
 

@@ -708,3 +708,30 @@ mod tests {
         assert_eq!(format_host_port("127.0.0.1", 12345), "127.0.0.1:12345");
     }
 }
+
+/// Resolves when the process is asked to stop: Ctrl+C (SIGINT) anywhere, and
+/// SIGTERM on Unix (what `docker stop`, systemd and `kill` send). The server
+/// and the relay select on it, so they log and return instead of dying
+/// mid-write — and so an instrumented test binary writes its coverage on the
+/// way out, which a killed one never did.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}

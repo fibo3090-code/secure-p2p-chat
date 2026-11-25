@@ -24,6 +24,38 @@ fn server() -> Command {
     cmd
 }
 
+/// Stop a server binary the way an operator does: SIGTERM on Unix, asserting
+/// it shuts down cleanly (a killed process also never writes its coverage
+/// profile, which is why `main.rs` used to read as untested). Windows has no
+/// SIGTERM to send a console child, so there it is killed.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let sent = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "could not signal the child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for the child") {
+                assert!(
+                    status.success(),
+                    "SIGTERM did not shut it down cleanly: {status}"
+                );
+                return;
+            }
+            assert!(Instant::now() < deadline, "SIGTERM did not stop it");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn run_to_exit(cmd: &mut Command) -> (bool, String) {
     let out = cmd.output().expect("run the server binary");
     let text =
@@ -89,8 +121,7 @@ fn an_open_server_starts_and_prints_its_fingerprint_and_claim_token() {
             open_warning |= line.contains("this server is OPEN");
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    stop(&mut child);
     assert!(
         fingerprint,
         "the fingerprint members verify was not printed"
@@ -164,8 +195,7 @@ fn retention_prunes_old_history_at_start_up() {
             }
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    stop(&mut child);
     let pruned = pruned.expect("no pruning at start-up");
     assert!(pruned.contains("messages=2"), "{pruned}");
     assert_eq!(

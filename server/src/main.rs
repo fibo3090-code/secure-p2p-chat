@@ -155,5 +155,11 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    run_accept_loop(listener, state, privkey, hub).await
+    tokio::select! {
+        served = run_accept_loop(listener, state, privkey, hub) => served,
+        () = messenger_core::util::shutdown_signal() => {
+            tracing::info!("shutting down: stop requested");
+            Ok(())
+        }
+    }
 }

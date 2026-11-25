@@ -11,6 +11,38 @@ fn client() -> Command {
     cmd
 }
 
+/// Stop a long-running binary the way an operator does: SIGTERM on Unix, asserting
+/// it shuts down cleanly (a killed process also never writes its coverage
+/// profile, which is why `main.rs` used to read as untested). Windows has no
+/// SIGTERM to send a console child, so there it is killed.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let sent = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "could not signal the child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for the child") {
+                assert!(
+                    status.success(),
+                    "SIGTERM did not shut it down cleanly: {status}"
+                );
+                return;
+            }
+            assert!(Instant::now() < deadline, "SIGTERM did not stop it");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// The retired `--gui` flag fails with directions to the desktop app rather
 /// than silently starting a different interface than the one asked for.
 #[test]
@@ -77,7 +109,7 @@ async fn relay_server_mode_serves_a_rendezvous() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let _ = child.kill();
+    stop(&mut child);
     let output = child.wait_with_output().expect("relay output");
     assert!(
         answer.to_lowercase().contains("unknown relay token"),
