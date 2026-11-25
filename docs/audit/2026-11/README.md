@@ -451,9 +451,43 @@ deliberate break of the code it covers:
 - Reconnect choosing the right saved contact;
 - the listener card and every Settings switch's wiring.
 
+**Mutation testing** (`cargo-mutants`, core crate tests only) on the five
+security-critical files: `crypto.rs`, `session.rs`, `protocol.rs`,
+`identity/mod.rs`, `framing.rs`. 475 mutants; 354 caught, 66 that do not
+compile, 5 that hang a test (caught), 50 missed. Each miss was settled one
+of three ways:
+- **A real gap, closed with a test that fails under that mutant.** Examples:
+  - the Ed25519 private-key export (pinned to RFC 8032);
+  - each Argon2 cost cap on its own, so an edited `identity.json` cannot hang
+    the unlock;
+  - every wire-size cap at its exact edge (framing, legacy text, file size,
+    number fields, scheme list);
+  - the per-address connection limit actually being consulted;
+  - the version on the wire and the v3 downgrade floor;
+  - the weak-code warning reaching only uncommitted peers (CRYPTO-02);
+  - when a rekey is due, and what counts toward it;
+  - delivery-receipt sequence reporting;
+  - bounded reading while a write blocks.
+
+  Two existing tests were found unable to fail:
+  - `test_framing_recv_reject_oversized_header` passed on end-of-stream;
+  - `idle_session_survives_past_the_idle_timeout` never reached the short
+    idle timer.
+- **Equivalent**: no input can tell the mutant apart. Examples: `|` versus
+  `^` on disjoint bits in `derive_sas` and the nonce role, and the read chunk
+  size.
+- **Not worth a test:** a constant whose test would only restate it (the
+  30-minute verification window, the first keep-alive tick), an invite
+  version field the parser never reads, and the memory and time Argon2 caps
+  at exactly their limit (a 1 GiB / 16-pass derivation per run).
+
+  Also untested: `migrate_legacy_plaintext` and the Ed25519 hex helpers, which
+  have no caller (see below).
+
 **Left open on purpose.** QUAL-10 (the async `IncomingFile` receiver has no
-caller in this workspace) is public API of `messenger-core`, and the agent CLI
-lives in a sibling repository this pass could not inspect. Deleting it, and its
+caller in this workspace), `Identity::migrate_legacy_plaintext` and the
+Ed25519 hex helpers are public API of `messenger-core`, and the agent CLI
+lives in a sibling repository this pass could not inspect. Deleting them, and their
 test, waits on checking that repository.
 
 ## Method and limits
