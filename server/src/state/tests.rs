@@ -3144,9 +3144,10 @@ fn file_operations_act_on_the_share_named_not_a_neighbour() {
     );
     let there = put_file_hash(&mut state, owner, other, "there.txt", b"in other".to_vec());
 
-    // `there` is not shared in #general.
+    // `there` is not shared in #general — whichever channel it is offered to.
+    let third = new_channel(&mut state, owner, "third", ChannelKind::Public);
     assert!(state
-        .share_file(owner, &there, general, UploadTarget::Channel(other))
+        .share_file(owner, &there, general, UploadTarget::Channel(third))
         .is_err());
     let shared = state
         .share_file(owner, &here, general, UploadTarget::Channel(other))
@@ -3224,11 +3225,17 @@ fn idle_expiry_counts_what_it_dropped_and_a_short_finish_says_what_is_missing() 
     let err = state.finish_upload(owner, short).unwrap_err();
     assert!(err.contains("6.00 B still missing"), "got: {err}");
 
-    start(&mut state, owner, "a", 5, target).unwrap();
-    start(&mut state, owner, "b", 5, target).unwrap();
-    state.set_upload_idle_timeout(Duration::ZERO);
+    let a = start(&mut state, owner, "a", 5, target).unwrap();
+    let b = start(&mut state, owner, "b", 5, target).unwrap();
+    let c = start(&mut state, owner, "c", 5, target).unwrap();
+    state.set_upload_idle_timeout(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(400));
+    // Only `c` has sent anything lately.
+    state.upload_chunk(owner, c, b"x").unwrap();
     assert_eq!(state.expire_idle_uploads(), 2);
-    assert_eq!(state.uploads_in_flight(owner), 0);
+    assert_eq!(state.uploads_in_flight(owner), 1);
+    assert!(state.upload_chunk(owner, a, b"x").is_err());
+    assert!(state.upload_chunk(owner, b, b"x").is_err());
 }
 
 /// Disk reads work from a single-threaded runtime (the `#[tokio::test]`
@@ -3244,4 +3251,9 @@ async fn disk_reads_work_on_a_single_threaded_runtime() {
         state.blob_bytes_for(owner, &hash).as_deref(),
         Some(&b"on disk"[..])
     );
+    // The two paths that go through `blocking_io`: the raw read, and removing
+    // the bytes when the last share goes.
+    assert_eq!(state.blob_bytes(&hash).as_deref(), Some(&b"on disk"[..]));
+    state.delete_file(owner, &hash, general).unwrap();
+    assert_eq!(state.blob_bytes(&hash), None);
 }

@@ -576,6 +576,39 @@ model (question 2) beyond the address hint added here.
   - **Noted:** the desktop app does not handle SIGTERM (no close-time flush);
     history survived because the poll loop had already saved it.
 
+- **Mutation testing beyond the crypto files.** The same method over the
+  trust and access-control code: client `chat_manager/events.rs` and
+  `contacts.rs` (119 mutants) and server `dispatch.rs` and `state/blobs.rs`
+  (269). 56 survived the first run. Re-checked after the new tests: every
+  survivor is now caught except these, each settled:
+  - **Equivalent or log-only:** `blocking_io` never using `block_in_place`
+    (only frees a worker; nothing observable), the idle-expiry `<`/`<=` and
+    its log `!`, the `offset > 0` before a seek, two "not found" log
+    branches, and `files_page`'s progress guard, which only matters for a
+    listing entry larger than the page budget (unreachable with names capped).
+  - **Dead field:** `FileTransferState.seq` is written and never read.
+
+  Real gaps closed, each with a test seen failing under its mutant:
+  - **One caller hanging up dropped another session's unverified
+    conversation and mapping.**
+  - **A reconnect could fold into an unrelated conversation, or swallow a
+    dial that already held messages.**
+  - **Contacts:** a contact could follow the wrong chat; blocking or deleting
+    one contact could affect another; a key could be promoted onto the wrong
+    contact (both the bound and the by-key path).
+  - **Delivery and connection labels:** several messages awaiting receipts at
+    once, and a hole-punched connection labelled Direct.
+  - **Sharing files:** `share_file` and `set_file_permissions` could act on a
+    neighbouring share, and another member's in-flight upload counted against
+    your allowance.
+  - **File limits:** every file size cap at its exact edge, and a chunk read
+    past the end of a file panicking (memory store).
+  - **Uploads:** per-connection upload tracking and its release on
+    disconnect, rate-limited upload offers as retractable failed sends, disk
+    I/O on a single-threaded runtime, and idle-expiry counting.
+  - **Governance and identity:** governance replies and broadcasts, a join
+    bound to the handshake fingerprint, and DM file labels.
+
 ## Method and limits
 
 - Static reading of every file in each area, by thirteen auditors in parallel
