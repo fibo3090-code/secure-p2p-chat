@@ -1196,4 +1196,33 @@ mod tests {
         enable_keepalive(&stream, "test");
         assert!(socket2::SockRef::from(&stream).keepalive().unwrap());
     }
+
+    /// A relay that answered and then dropped the connection is a failure, not
+    /// an old relay: only silence before any answer means "retry without
+    /// punching". Retrying on any drop re-registered with a server that had
+    /// already understood the request.
+    #[tokio::test]
+    async fn a_relay_that_answered_then_dropped_is_not_retried_as_legacy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = recv_packet(&mut stream).await;
+                let _ = send_relay_message(&mut stream, &RelayResponse::Waiting).await;
+                // ... and hang up.
+            }
+        });
+        let token = "ab".repeat(RELAY_TOKEN_BYTES);
+        let result = connect_to_relay_with(&addr.to_string(), &token, true, true).await;
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the client retried a relay that had answered"
+        );
+    }
 }
